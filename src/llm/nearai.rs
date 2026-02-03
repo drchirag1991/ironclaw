@@ -3,6 +3,8 @@
 //! This provider uses the NEAR AI chat-api which provides a unified interface
 //! to multiple LLM models (OpenAI, Anthropic, etc.) with user authentication.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use reqwest::Client;
 use rust_decimal::Decimal;
@@ -16,23 +18,28 @@ use crate::llm::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, Role, ToolCall,
     ToolCompletionRequest, ToolCompletionResponse,
 };
+use crate::llm::session::SessionManager;
 
 /// NEAR AI Chat API provider.
 pub struct NearAiProvider {
     client: Client,
     config: NearAiConfig,
+    session: Arc<SessionManager>,
 }
 
 impl NearAiProvider {
-    /// Create a new NEAR AI provider.
-    pub fn new(config: NearAiConfig) -> Self {
-        // Create client with reasonable timeout
+    /// Create a new NEAR AI provider with a session manager.
+    pub fn new(config: NearAiConfig, session: Arc<SessionManager>) -> Self {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(120)) // 2 minute timeout for LLM calls
+            .timeout(std::time::Duration::from_secs(120))
             .build()
             .unwrap_or_else(|_| Client::new());
 
-        Self { client, config }
+        Self {
+            client,
+            config,
+            session,
+        }
     }
 
     fn api_url(&self, path: &str) -> String {
@@ -43,12 +50,32 @@ impl NearAiProvider {
         )
     }
 
+    /// Send a request with automatic session renewal on 401.
     async fn send_request<T: Serialize + std::fmt::Debug, R: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         body: &T,
     ) -> Result<R, LlmError> {
+        // Try the request, handling session expiration
+        match self.send_request_inner(path, body).await {
+            Ok(result) => Ok(result),
+            Err(LlmError::SessionExpired { .. }) => {
+                // Session expired, attempt renewal and retry once
+                self.session.handle_auth_failure().await?;
+                self.send_request_inner(path, body).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Inner request implementation without retry logic.
+    async fn send_request_inner<T: Serialize + std::fmt::Debug, R: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<R, LlmError> {
         let url = self.api_url(path);
+        let token = self.session.get_token().await?;
 
         tracing::debug!("Sending request to NEAR AI: {}", url);
         tracing::debug!("Request body: {:?}", body);
@@ -56,10 +83,7 @@ impl NearAiProvider {
         let response = self
             .client
             .post(&url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.config.session_token.expose_secret()),
-            )
+            .header("Authorization", format!("Bearer {}", token.expose_secret()))
             .header("Content-Type", "application/json")
             .json(body)
             .send()
@@ -76,6 +100,24 @@ impl NearAiProvider {
         tracing::debug!("NEAR AI response body: {}", response_text);
 
         if !status.is_success() {
+            // Check for session expiration (401 with specific message patterns)
+            if status.as_u16() == 401 {
+                let is_session_expired = response_text.to_lowercase().contains("session")
+                    && (response_text.to_lowercase().contains("expired")
+                        || response_text.to_lowercase().contains("invalid"));
+
+                if is_session_expired {
+                    return Err(LlmError::SessionExpired {
+                        provider: "nearai".to_string(),
+                    });
+                }
+
+                // Generic 401 without session expiration indication
+                return Err(LlmError::AuthFailed {
+                    provider: "nearai".to_string(),
+                });
+            }
+
             // Try to parse as JSON error
             if let Ok(error) = serde_json::from_str::<NearAiErrorResponse>(&response_text) {
                 if status.as_u16() == 429 {

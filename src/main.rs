@@ -11,7 +11,7 @@ use near_agent::{
     cli::{Cli, Command, run_tool_command},
     config::Config,
     history::Store,
-    llm::create_llm_provider,
+    llm::{SessionConfig, create_llm_provider, create_session_manager},
     safety::SafetyLayer,
     tools::{
         ToolRegistry,
@@ -79,8 +79,20 @@ async fn main() -> anyhow::Result<()> {
         Some(Arc::new(store))
     };
 
+    // Initialize session manager for NEAR AI authentication
+    let session_config = SessionConfig {
+        auth_base_url: config.llm.nearai.auth_base_url.clone(),
+        session_path: config.llm.nearai.session_path.clone(),
+        ..Default::default()
+    };
+    let session = create_session_manager(session_config).await;
+
+    // Ensure we're authenticated before proceeding (may trigger login flow)
+    session.ensure_authenticated().await?;
+    tracing::info!("NEAR AI session authenticated");
+
     // Initialize LLM provider
-    let llm = create_llm_provider(&config.llm)?;
+    let llm = create_llm_provider(&config.llm, session)?;
     tracing::info!("LLM provider initialized: {}", llm.model_name());
 
     // Initialize safety layer

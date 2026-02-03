@@ -67,6 +67,12 @@ dirs = "6"
 # Secrecy for sensitive values
 secrecy = { version = "0.10", features = ["serde"] }
 
+# URL encoding for OAuth flow
+urlencoding = "2"
+
+# Open URLs in browser
+open = "5"
+
 # Vector embeddings for semantic search
 # The postgres feature provides ToSql/FromSql for postgres-types (shared by tokio-postgres)
 pgvector = { version = "0.4", features = ["postgres"] }

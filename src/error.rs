@@ -140,11 +140,20 @@ pub enum LlmError {
     #[error("Authentication failed for provider {provider}")]
     AuthFailed { provider: String },
 
+    #[error("Session expired for provider {provider}")]
+    SessionExpired { provider: String },
+
+    #[error("Session renewal failed for provider {provider}: {reason}")]
+    SessionRenewalFailed { provider: String, reason: String },
+
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Tool execution errors.

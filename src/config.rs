@@ -76,28 +76,40 @@ pub struct LlmConfig {
 /// NEAR AI chat-api configuration.
 #[derive(Debug, Clone)]
 pub struct NearAiConfig {
-    /// Session token for authentication (format: sess_xxx)
-    pub session_token: SecretString,
     /// Model to use (e.g., "claude-3-5-sonnet-20241022", "gpt-4o")
     pub model: String,
     /// Base URL for the NEAR AI chat-api (default: https://api.near.ai)
     pub base_url: String,
+    /// Base URL for auth/refresh endpoints (default: https://private.near.ai)
+    pub auth_base_url: String,
+    /// Path to session file (default: ~/.near-agent/session.json)
+    pub session_path: PathBuf,
 }
 
 impl LlmConfig {
     fn from_env() -> Result<Self, ConfigError> {
-        let session_token = required_env("NEARAI_SESSION_TOKEN")?;
-
         Ok(Self {
             nearai: NearAiConfig {
-                session_token: SecretString::from(session_token),
                 model: optional_env("NEARAI_MODEL")?
                     .unwrap_or_else(|| "claude-3-5-sonnet-20241022".to_string()),
                 base_url: optional_env("NEARAI_BASE_URL")?
                     .unwrap_or_else(|| "https://api.near.ai".to_string()),
+                auth_base_url: optional_env("NEARAI_AUTH_URL")?
+                    .unwrap_or_else(|| "https://private.near.ai".to_string()),
+                session_path: optional_env("NEARAI_SESSION_PATH")?
+                    .map(PathBuf::from)
+                    .unwrap_or_else(default_session_path),
             },
         })
     }
+}
+
+/// Get the default session file path (~/.near-agent/session.json).
+fn default_session_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".near-agent")
+        .join("session.json")
 }
 
 /// Channel configurations.
