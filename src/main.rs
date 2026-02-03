@@ -164,18 +164,23 @@ async fn main() -> anyhow::Result<()> {
                 http_config.port
             );
         }
-
-        // TODO: Add Slack and Telegram channels when implemented
-        if config.channels.slack.is_some() {
-            tracing::warn!("Slack channel configured but not yet implemented");
-        }
-        if config.channels.telegram.is_some() {
-            tracing::warn!("Telegram channel configured but not yet implemented");
-        }
     }
 
+    // Create workspace for agent (shared with memory tools)
+    let workspace = store
+        .as_ref()
+        .map(|s| Arc::new(Workspace::new("default", s.pool())));
+
     // Create and run the agent
-    let agent = Agent::new(config.agent.clone(), store, llm, safety, tools, channels);
+    let agent = Agent::new(
+        config.agent.clone(),
+        store,
+        llm,
+        safety,
+        tools,
+        channels,
+        workspace,
+    );
 
     tracing::info!("Agent initialized, starting main loop...");
 

@@ -6,6 +6,59 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Parses user input into Submission types.
+pub struct SubmissionParser;
+
+impl SubmissionParser {
+    /// Parse message content into a Submission.
+    pub fn parse(content: &str) -> Submission {
+        let trimmed = content.trim();
+        let lower = trimmed.to_lowercase();
+
+        // Control commands (exact match or prefix)
+        if lower == "/undo" {
+            return Submission::Undo;
+        }
+        if lower == "/redo" {
+            return Submission::Redo;
+        }
+        if lower == "/interrupt" || lower == "/stop" {
+            return Submission::Interrupt;
+        }
+        if lower == "/compact" {
+            return Submission::Compact;
+        }
+        if lower == "/clear" {
+            return Submission::Clear;
+        }
+        if lower == "/thread new" || lower == "/new" {
+            return Submission::NewThread;
+        }
+
+        // /thread <uuid> - switch thread
+        if let Some(rest) = lower.strip_prefix("/thread ") {
+            let rest = rest.trim();
+            if rest != "new" {
+                if let Ok(id) = Uuid::parse_str(rest) {
+                    return Submission::SwitchThread { thread_id: id };
+                }
+            }
+        }
+
+        // /resume <uuid> - resume from checkpoint
+        if let Some(rest) = lower.strip_prefix("/resume ") {
+            if let Ok(id) = Uuid::parse_str(rest.trim()) {
+                return Submission::Resume { checkpoint_id: id };
+            }
+        }
+
+        // Default: user input
+        Submission::UserInput {
+            content: content.to_string(),
+        }
+    }
+}
+
 /// A submission to the agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Submission {
@@ -199,5 +252,85 @@ mod tests {
         let undo = Submission::undo();
         assert!(!undo.starts_turn());
         assert!(undo.is_control());
+    }
+
+    #[test]
+    fn test_parser_user_input() {
+        let submission = SubmissionParser::parse("Hello, how are you?");
+        assert!(
+            matches!(submission, Submission::UserInput { content } if content == "Hello, how are you?")
+        );
+    }
+
+    #[test]
+    fn test_parser_undo() {
+        let submission = SubmissionParser::parse("/undo");
+        assert!(matches!(submission, Submission::Undo));
+
+        let submission = SubmissionParser::parse("/UNDO");
+        assert!(matches!(submission, Submission::Undo));
+    }
+
+    #[test]
+    fn test_parser_redo() {
+        let submission = SubmissionParser::parse("/redo");
+        assert!(matches!(submission, Submission::Redo));
+    }
+
+    #[test]
+    fn test_parser_interrupt() {
+        let submission = SubmissionParser::parse("/interrupt");
+        assert!(matches!(submission, Submission::Interrupt));
+
+        let submission = SubmissionParser::parse("/stop");
+        assert!(matches!(submission, Submission::Interrupt));
+    }
+
+    #[test]
+    fn test_parser_compact() {
+        let submission = SubmissionParser::parse("/compact");
+        assert!(matches!(submission, Submission::Compact));
+    }
+
+    #[test]
+    fn test_parser_clear() {
+        let submission = SubmissionParser::parse("/clear");
+        assert!(matches!(submission, Submission::Clear));
+    }
+
+    #[test]
+    fn test_parser_new_thread() {
+        let submission = SubmissionParser::parse("/thread new");
+        assert!(matches!(submission, Submission::NewThread));
+
+        let submission = SubmissionParser::parse("/new");
+        assert!(matches!(submission, Submission::NewThread));
+    }
+
+    #[test]
+    fn test_parser_switch_thread() {
+        let uuid = Uuid::new_v4();
+        let submission = SubmissionParser::parse(&format!("/thread {}", uuid));
+        assert!(matches!(submission, Submission::SwitchThread { thread_id } if thread_id == uuid));
+    }
+
+    #[test]
+    fn test_parser_resume() {
+        let uuid = Uuid::new_v4();
+        let submission = SubmissionParser::parse(&format!("/resume {}", uuid));
+        assert!(
+            matches!(submission, Submission::Resume { checkpoint_id } if checkpoint_id == uuid)
+        );
+    }
+
+    #[test]
+    fn test_parser_invalid_commands_become_user_input() {
+        // Invalid UUID should become user input
+        let submission = SubmissionParser::parse("/thread not-a-uuid");
+        assert!(matches!(submission, Submission::UserInput { .. }));
+
+        // Unknown command should become user input
+        let submission = SubmissionParser::parse("/unknown");
+        assert!(matches!(submission, Submission::UserInput { content } if content == "/unknown"));
     }
 }

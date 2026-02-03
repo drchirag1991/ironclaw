@@ -1,18 +1,14 @@
 //! Multi-channel input system.
 //!
-//! Channels receive messages from external sources (CLI, Slack, Telegram, HTTP)
+//! Channels receive messages from external sources (CLI, HTTP, etc.)
 //! and convert them to a unified message format for the agent to process.
 
 mod channel;
 pub mod cli;
 mod http;
 mod manager;
-mod slack;
-mod telegram;
 
 pub use channel::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 pub use cli::TuiChannel;
 pub use http::HttpChannel;
 pub use manager::ChannelManager;
-pub use slack::SlackChannel;
-pub use telegram::TelegramChannel;

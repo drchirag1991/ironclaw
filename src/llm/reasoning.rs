@@ -39,6 +39,12 @@ impl ReasoningContext {
         self
     }
 
+    /// Set messages directly (for session-based context).
+    pub fn with_messages(mut self, messages: Vec<ChatMessage>) -> Self {
+        self.messages = messages;
+        self
+    }
+
     /// Set available tools.
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.available_tools = tools;

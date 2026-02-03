@@ -230,6 +230,38 @@ impl Thread {
             }
         }
     }
+
+    /// Restore thread state from a checkpoint's messages.
+    ///
+    /// Clears existing turns and rebuilds from message pairs.
+    /// Messages should alternate: user, assistant, user, assistant...
+    pub fn restore_from_messages(&mut self, messages: Vec<ChatMessage>) {
+        self.turns.clear();
+        self.state = ThreadState::Idle;
+
+        // Messages alternate: user, assistant, user, assistant...
+        let mut iter = messages.into_iter().peekable();
+        let mut turn_number = 0;
+
+        while let Some(msg) = iter.next() {
+            if msg.role == crate::llm::Role::User {
+                let mut turn = Turn::new(turn_number, &msg.content);
+
+                // Check if next is assistant response
+                if let Some(next) = iter.peek() {
+                    if next.role == crate::llm::Role::Assistant {
+                        let response = iter.next().expect("peeked");
+                        turn.complete(&response.content);
+                    }
+                }
+
+                self.turns.push(turn);
+                turn_number += 1;
+            }
+        }
+
+        self.updated_at = Utc::now();
+    }
 }
 
 /// State of a turn.
@@ -386,5 +418,49 @@ mod tests {
 
         assert_eq!(turn.tool_calls.len(), 1);
         assert!(turn.tool_calls[0].result.is_some());
+    }
+
+    #[test]
+    fn test_restore_from_messages() {
+        let mut thread = Thread::new(Uuid::new_v4());
+
+        // First add some turns
+        thread.start_turn("Original message");
+        thread.complete_turn("Original response");
+
+        // Now restore from different messages
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there!"),
+            ChatMessage::user("How are you?"),
+            ChatMessage::assistant("I'm good!"),
+        ];
+
+        thread.restore_from_messages(messages);
+
+        assert_eq!(thread.turns.len(), 2);
+        assert_eq!(thread.turns[0].user_input, "Hello");
+        assert_eq!(thread.turns[0].response, Some("Hi there!".to_string()));
+        assert_eq!(thread.turns[1].user_input, "How are you?");
+        assert_eq!(thread.turns[1].response, Some("I'm good!".to_string()));
+        assert_eq!(thread.state, ThreadState::Idle);
+    }
+
+    #[test]
+    fn test_restore_from_messages_incomplete_turn() {
+        let mut thread = Thread::new(Uuid::new_v4());
+
+        // Messages with incomplete last turn (no assistant response)
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there!"),
+            ChatMessage::user("How are you?"),
+        ];
+
+        thread.restore_from_messages(messages);
+
+        assert_eq!(thread.turns.len(), 2);
+        assert_eq!(thread.turns[1].user_input, "How are you?");
+        assert!(thread.turns[1].response.is_none());
     }
 }

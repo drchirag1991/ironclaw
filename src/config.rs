@@ -104,26 +104,12 @@ impl LlmConfig {
 #[derive(Debug, Clone)]
 pub struct ChannelsConfig {
     pub cli: CliConfig,
-    pub slack: Option<SlackConfig>,
-    pub telegram: Option<TelegramConfig>,
     pub http: Option<HttpConfig>,
 }
 
 #[derive(Debug, Clone)]
 pub struct CliConfig {
     pub enabled: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct SlackConfig {
-    pub bot_token: SecretString,
-    pub app_token: SecretString,
-    pub signing_secret: SecretString,
-}
-
-#[derive(Debug, Clone)]
-pub struct TelegramConfig {
-    pub bot_token: SecretString,
 }
 
 #[derive(Debug, Clone)]
@@ -135,29 +121,6 @@ pub struct HttpConfig {
 
 impl ChannelsConfig {
     fn from_env() -> Result<Self, ConfigError> {
-        let slack = match (
-            optional_env("SLACK_BOT_TOKEN")?,
-            optional_env("SLACK_APP_TOKEN")?,
-            optional_env("SLACK_SIGNING_SECRET")?,
-        ) {
-            (Some(bot_token), Some(app_token), Some(signing_secret)) => Some(SlackConfig {
-                bot_token: SecretString::from(bot_token),
-                app_token: SecretString::from(app_token),
-                signing_secret: SecretString::from(signing_secret),
-            }),
-            (None, None, None) => None,
-            _ => {
-                return Err(ConfigError::InvalidValue {
-                    key: "SLACK_*".to_string(),
-                    message: "all Slack environment variables must be set together".to_string(),
-                });
-            }
-        };
-
-        let telegram = optional_env("TELEGRAM_BOT_TOKEN")?.map(|token| TelegramConfig {
-            bot_token: SecretString::from(token),
-        });
-
         let http = if optional_env("HTTP_PORT")?.is_some() || optional_env("HTTP_HOST")?.is_some() {
             Some(HttpConfig {
                 host: optional_env("HTTP_HOST")?.unwrap_or_else(|| "0.0.0.0".to_string()),
@@ -177,8 +140,6 @@ impl ChannelsConfig {
 
         Ok(Self {
             cli: CliConfig { enabled: true },
-            slack,
-            telegram,
             http,
         })
     }
