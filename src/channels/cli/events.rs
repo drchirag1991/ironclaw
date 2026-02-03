@@ -26,8 +26,13 @@ pub fn run_event_loop(
         // Render
         terminal.draw(|f| render::render(f, app))?;
 
-        // Check for quit
+        // Check for quit - send shutdown signal and exit
         if app.should_quit {
+            // Send a shutdown message so the agent loop knows to exit
+            let shutdown_msg = IncomingMessage::new("tui", "system", "/shutdown");
+            let _ = msg_tx.blocking_send(shutdown_msg);
+            // Explicitly drop to close the channel
+            drop(msg_tx);
             return Ok(());
         }
 

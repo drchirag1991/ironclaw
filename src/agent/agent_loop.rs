@@ -84,14 +84,25 @@ impl Agent {
         tracing::info!("Agent {} ready and listening", self.config.name);
 
         while let Some(message) = message_stream.next().await {
-            if let Err(e) = self.handle_message(&message).await {
-                tracing::error!("Error handling message: {}", e);
-
-                // Try to send error response
-                let _ = self
-                    .channels
-                    .respond(&message, OutgoingResponse::text(format!("Error: {}", e)))
-                    .await;
+            match self.handle_message(&message).await {
+                Ok(Some(response)) => {
+                    let _ = self
+                        .channels
+                        .respond(&message, OutgoingResponse::text(response))
+                        .await;
+                }
+                Ok(None) => {
+                    // Shutdown signal received
+                    tracing::info!("Shutdown signal received, exiting...");
+                    break;
+                }
+                Err(e) => {
+                    tracing::error!("Error handling message: {}", e);
+                    let _ = self
+                        .channels
+                        .respond(&message, OutgoingResponse::text(format!("Error: {}", e)))
+                        .await;
+                }
             }
         }
 
@@ -104,7 +115,7 @@ impl Agent {
         Ok(())
     }
 
-    async fn handle_message(&self, message: &IncomingMessage) -> Result<(), Error> {
+    async fn handle_message(&self, message: &IncomingMessage) -> Result<Option<String>, Error> {
         tracing::debug!(
             "Received message from {} on {}: {}",
             message.user_id,
@@ -122,33 +133,30 @@ impl Agent {
                 title,
                 description,
                 category,
-            } => self.handle_create_job(title, description, category).await?,
+            } => Some(self.handle_create_job(title, description, category).await?),
 
-            MessageIntent::CheckJobStatus { job_id } => self.handle_check_status(job_id).await?,
+            MessageIntent::CheckJobStatus { job_id } => {
+                Some(self.handle_check_status(job_id).await?)
+            }
 
-            MessageIntent::CancelJob { job_id } => self.handle_cancel_job(&job_id).await?,
+            MessageIntent::CancelJob { job_id } => Some(self.handle_cancel_job(&job_id).await?),
 
-            MessageIntent::ListJobs { filter } => self.handle_list_jobs(filter).await?,
+            MessageIntent::ListJobs { filter } => Some(self.handle_list_jobs(filter).await?),
 
-            MessageIntent::HelpJob { job_id } => self.handle_help_job(&job_id).await?,
+            MessageIntent::HelpJob { job_id } => Some(self.handle_help_job(&job_id).await?),
 
-            MessageIntent::Chat { content } => self.handle_chat(message, &content).await?,
+            MessageIntent::Chat { content } => Some(self.handle_chat(message, &content).await?),
 
             MessageIntent::Command { command, args } => {
                 self.handle_command(&command, &args).await?
             }
 
-            MessageIntent::Unknown => {
-                "I'm not sure what you're asking. Try '/help' for available commands.".to_string()
-            }
+            MessageIntent::Unknown => Some(
+                "I'm not sure what you're asking. Try '/help' for available commands.".to_string(),
+            ),
         };
 
-        // Send response
-        self.channels
-            .respond(message, OutgoingResponse::text(response))
-            .await?;
-
-        Ok(())
+        Ok(response)
     }
 
     async fn handle_create_job(
@@ -300,32 +308,44 @@ impl Agent {
         Ok(response)
     }
 
-    async fn handle_command(&self, command: &str, _args: &[String]) -> Result<String, Error> {
+    async fn handle_command(
+        &self,
+        command: &str,
+        _args: &[String],
+    ) -> Result<Option<String>, Error> {
         match command {
-            "help" => Ok(r#"Available commands:
+            "help" => Ok(Some(
+                r#"Available commands:
   /job <description>  - Create a new job
   /status [job_id]    - Check job status
   /cancel <job_id>    - Cancel a job
   /list               - List all jobs
   /help <job_id>      - Help a stuck job
+  /quit               - Exit the agent
 
 Or just chat naturally and I'll try to understand what you need!"#
-                .to_string()),
+                    .to_string(),
+            )),
 
-            "ping" => Ok("pong!".to_string()),
+            "ping" => Ok(Some("pong!".to_string())),
 
-            "version" => Ok(format!(
+            "version" => Ok(Some(format!(
                 "{} v{}",
                 env!("CARGO_PKG_NAME"),
                 env!("CARGO_PKG_VERSION")
-            )),
+            ))),
 
             "tools" => {
                 let tools = self.tools.list().await;
-                Ok(format!("Available tools: {}", tools.join(", ")))
+                Ok(Some(format!("Available tools: {}", tools.join(", "))))
             }
 
-            _ => Ok(format!("Unknown command: {}. Try /help", command)),
+            "quit" | "exit" | "shutdown" => {
+                // Signal shutdown - return None to indicate no response needed
+                Ok(None)
+            }
+
+            _ => Ok(Some(format!("Unknown command: {}. Try /help", command))),
         }
     }
 }
