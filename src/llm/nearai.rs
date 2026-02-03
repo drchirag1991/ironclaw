@@ -121,13 +121,23 @@ impl LlmProvider for NearAiProvider {
         tracing::debug!("NEAR AI response: {:?}", response);
 
         // Extract text from response output
+        // Try multiple formats since API response shape may vary
         let text = response
             .output
             .iter()
             .filter_map(|item| {
-                tracing::debug!("Processing output item: type={}", item.item_type);
+                tracing::debug!(
+                    "Processing output item: type={}, text={:?}",
+                    item.item_type,
+                    item.text
+                );
                 if item.item_type == "message" {
-                    item.content.as_ref().and_then(|contents| {
+                    // First check for direct text field on item
+                    if let Some(ref text) = item.text {
+                        return Some(text.clone());
+                    }
+                    // Then check content array
+                    item.content.as_ref().map(|contents| {
                         contents
                             .iter()
                             .filter_map(|c| {
@@ -136,13 +146,14 @@ impl LlmProvider for NearAiProvider {
                                     c.content_type,
                                     c.text
                                 );
-                                if c.content_type == "output_text" {
-                                    c.text.clone()
-                                } else {
-                                    None
+                                // Accept various content types that might contain text
+                                match c.content_type.as_str() {
+                                    "output_text" | "text" => c.text.clone(),
+                                    _ => None,
                                 }
                             })
-                            .next()
+                            .collect::<Vec<_>>()
+                            .join("")
                     })
                 } else {
                     None
@@ -315,6 +326,9 @@ struct NearAiOutputItem {
     item_type: String,
     #[serde(default)]
     content: Option<Vec<NearAiContent>>,
+    // Direct text field (some response formats)
+    #[serde(default)]
+    text: Option<String>,
     // For function calls
     #[serde(default)]
     name: Option<String>,
