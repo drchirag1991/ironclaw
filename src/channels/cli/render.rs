@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use crate::channels::cli::app::{AppState, InputMode, MessageRole, MessageStatus};
@@ -34,35 +34,72 @@ pub fn render(frame: &mut Frame, app: &AppState) {
 
 /// Render the message history.
 fn render_messages(frame: &mut Frame, app: &AppState, area: Rect) {
-    let items: Vec<ListItem> = app
-        .messages
-        .iter()
-        .map(|msg| {
-            let (prefix, style) = match msg.role {
-                MessageRole::User => ("You: ", Style::default().fg(Color::Cyan)),
-                MessageRole::Agent => ("Agent: ", Style::default().fg(Color::Green)),
-                MessageRole::System => (
-                    "",
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            };
+    // Build all lines from all messages
+    let mut lines: Vec<Line> = Vec::new();
 
-            let status_indicator = match msg.status {
-                Some(MessageStatus::Pending) => " ⏳",
-                Some(MessageStatus::InProgress) => " ⚙️",
-                Some(MessageStatus::Complete) => " ✓",
-                Some(MessageStatus::Error) => " ✗",
-                None => "",
-            };
+    for msg in &app.messages {
+        let (prefix, style) = match msg.role {
+            MessageRole::User => ("You: ", Style::default().fg(Color::Cyan)),
+            MessageRole::Agent => ("Agent: ", Style::default().fg(Color::Green)),
+            MessageRole::System => (
+                "",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        };
 
-            let content = format!("{}{}{}", prefix, msg.content, status_indicator);
-            ListItem::new(Text::styled(content, style))
-        })
-        .collect();
+        let status_indicator = match msg.status {
+            Some(MessageStatus::Pending) => " ⏳",
+            Some(MessageStatus::InProgress) => " ⚙️",
+            Some(MessageStatus::Complete) => " ✓",
+            Some(MessageStatus::Error) => " ✗",
+            None => "",
+        };
 
-    let messages = List::new(items).block(Block::default().borders(Borders::ALL).title("Chat"));
+        // Split content by newlines and create a line for each
+        let content_lines: Vec<&str> = msg.content.lines().collect();
+        for (i, line_text) in content_lines.iter().enumerate() {
+            if i == 0 {
+                // First line gets the prefix
+                let line_content = if status_indicator.is_empty() {
+                    format!("{}{}", prefix, line_text)
+                } else if content_lines.len() == 1 {
+                    format!("{}{}{}", prefix, line_text, status_indicator)
+                } else {
+                    format!("{}{}", prefix, line_text)
+                };
+                lines.push(Line::styled(line_content, style));
+            } else if i == content_lines.len() - 1 && !status_indicator.is_empty() {
+                // Last line gets status indicator
+                lines.push(Line::styled(
+                    format!("{}{}", line_text, status_indicator),
+                    style,
+                ));
+            } else {
+                // Middle lines just get the content
+                lines.push(Line::styled(line_text.to_string(), style));
+            }
+        }
+
+        // Add empty line between messages for readability
+        lines.push(Line::from(""));
+    }
+
+    // Calculate scroll - show most recent messages
+    let visible_height = area.height.saturating_sub(2) as usize; // Account for borders
+    let total_lines = lines.len();
+    let scroll_offset = if total_lines > visible_height {
+        total_lines - visible_height
+    } else {
+        0
+    };
+
+    let text = Text::from(lines);
+    let messages = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title("Chat"))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset as u16, 0));
 
     frame.render_widget(messages, area);
 }
