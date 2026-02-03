@@ -43,7 +43,7 @@ impl NearAiProvider {
         )
     }
 
-    async fn send_request<T: Serialize, R: for<'de> Deserialize<'de>>(
+    async fn send_request<T: Serialize + std::fmt::Debug, R: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         body: &T,
@@ -51,6 +51,7 @@ impl NearAiProvider {
         let url = self.api_url(path);
 
         tracing::debug!("Sending request to NEAR AI: {}", url);
+        tracing::debug!("Request body: {:?}", body);
 
         let response = self
             .client
@@ -69,11 +70,14 @@ impl NearAiProvider {
             })?;
 
         let status = response.status();
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
+        let response_text = response.text().await.unwrap_or_default();
 
+        tracing::debug!("NEAR AI response status: {}", status);
+        tracing::debug!("NEAR AI response body: {}", response_text);
+
+        if !status.is_success() {
             // Try to parse as JSON error
-            if let Ok(error) = serde_json::from_str::<NearAiErrorResponse>(&error_text) {
+            if let Ok(error) = serde_json::from_str::<NearAiErrorResponse>(&response_text) {
                 if status.as_u16() == 429 {
                     return Err(LlmError::RateLimited {
                         provider: "nearai".to_string(),
@@ -88,17 +92,18 @@ impl NearAiProvider {
 
             return Err(LlmError::RequestFailed {
                 provider: "nearai".to_string(),
-                reason: format!("HTTP {}: {}", status, error_text),
+                reason: format!("HTTP {}: {}", status, response_text),
             });
         }
 
-        response
-            .json()
-            .await
-            .map_err(|e| LlmError::InvalidResponse {
+        serde_json::from_str(&response_text).map_err(|e| {
+            tracing::error!("Failed to parse NEAR AI response: {}", e);
+            tracing::error!("Response was: {}", response_text);
+            LlmError::InvalidResponse {
                 provider: "nearai".to_string(),
-                reason: e.to_string(),
-            })
+                reason: format!("JSON parse error: {}", e),
+            }
+        })
     }
 }
 
@@ -266,9 +271,13 @@ impl LlmProvider for NearAiProvider {
 
 // NEAR AI API types
 
+/// Request format for NEAR AI Responses API.
+/// See: https://docs.near.ai/api
 #[derive(Debug, Serialize)]
 struct NearAiRequest {
+    /// Model identifier (e.g., "fireworks::accounts/fireworks/models/llama-v3p1-405b-instruct")
     model: String,
+    /// Input messages - can be a string or array of message objects
     input: Vec<NearAiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
