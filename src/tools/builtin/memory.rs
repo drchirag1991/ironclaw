@@ -316,39 +316,94 @@ impl Tool for MemoryReadTool {
     }
 }
 
-/// Tool for listing workspace files.
+/// Tool for viewing workspace structure as a tree.
 ///
-/// Use this to explore the workspace structure.
-pub struct MemoryListTool {
+/// Returns a hierarchical view of files and directories with configurable depth.
+pub struct MemoryTreeTool {
     workspace: Arc<Workspace>,
 }
 
-impl MemoryListTool {
-    /// Create a new memory list tool.
+impl MemoryTreeTool {
+    /// Create a new memory tree tool.
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
+    }
+
+    /// Recursively build tree structure.
+    async fn build_tree(
+        &self,
+        path: &str,
+        current_depth: usize,
+        max_depth: usize,
+    ) -> Result<Vec<serde_json::Value>, ToolError> {
+        if current_depth > max_depth {
+            return Ok(Vec::new());
+        }
+
+        let entries = self
+            .workspace
+            .list(path)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("List failed: {}", e)))?;
+
+        let mut result = Vec::new();
+        for entry in entries {
+            let mut node = serde_json::json!({
+                "name": entry.name(),
+                "path": entry.path,
+                "is_directory": entry.is_directory,
+            });
+
+            if entry.is_directory && current_depth < max_depth {
+                // Recurse into directory
+                let children =
+                    Box::pin(self.build_tree(&entry.path, current_depth + 1, max_depth)).await?;
+                if !children.is_empty() {
+                    node["children"] = serde_json::Value::Array(children);
+                }
+            } else if !entry.is_directory {
+                // Include file metadata
+                if let Some(updated) = entry.updated_at {
+                    node["updated_at"] = serde_json::Value::String(updated.to_rfc3339());
+                }
+                if let Some(preview) = &entry.content_preview {
+                    node["preview"] = serde_json::Value::String(preview.clone());
+                }
+            }
+
+            result.push(node);
+        }
+
+        Ok(result)
     }
 }
 
 #[async_trait]
-impl Tool for MemoryListTool {
+impl Tool for MemoryTreeTool {
     fn name(&self) -> &str {
-        "memory_list"
+        "memory_tree"
     }
 
     fn description(&self) -> &str {
-        "List files and directories in the workspace. Use this to explore \
-         the workspace structure and discover available files."
+        "View the workspace structure as a tree. Use this to explore \
+         the workspace hierarchy and discover available files and directories."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "directory": {
+                "path": {
                     "type": "string",
-                    "description": "Directory to list (empty string or '/' for root)",
+                    "description": "Root path to start from (empty string for workspace root)",
                     "default": ""
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "Maximum depth to traverse (1 = immediate children only)",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 10
                 }
             }
         })
@@ -361,27 +416,20 @@ impl Tool for MemoryListTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let directory = params
-            .get("directory")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("");
 
-        let entries = self
-            .workspace
-            .list(directory)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("List failed: {}", e)))?;
+        let depth = params
+            .get("depth")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .clamp(1, 10) as usize;
+
+        let tree = self.build_tree(path, 1, depth).await?;
 
         let output = serde_json::json!({
-            "directory": directory,
-            "entries": entries.iter().map(|e| serde_json::json!({
-                "path": e.path,
-                "name": e.name(),
-                "is_directory": e.is_directory,
-                "updated_at": e.updated_at.map(|t| t.to_rfc3339()),
-                "preview": e.content_preview,
-            })).collect::<Vec<_>>(),
-            "count": entries.len(),
+            "root": if path.is_empty() { "/" } else { path },
+            "depth": depth,
+            "tree": tree,
         });
 
         Ok(ToolOutput::success(output, start.elapsed()))
@@ -457,13 +505,15 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_list_schema() {
+    fn test_memory_tree_schema() {
         let workspace = make_test_workspace();
-        let tool = MemoryListTool::new(workspace);
+        let tool = MemoryTreeTool::new(workspace);
 
-        assert_eq!(tool.name(), "memory_list");
+        assert_eq!(tool.name(), "memory_tree");
 
         let schema = tool.parameters_schema();
-        assert!(schema["properties"]["directory"].is_object());
+        assert!(schema["properties"]["path"].is_object());
+        assert!(schema["properties"]["depth"].is_object());
+        assert_eq!(schema["properties"]["depth"]["default"], 1);
     }
 }

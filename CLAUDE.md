@@ -347,7 +347,7 @@ Four tools for LLM use:
 - **`memory_search`** - Hybrid search, MUST be called before answering questions about prior work
 - **`memory_write`** - Write to any path (memory, daily_log, or custom paths)
 - **`memory_read`** - Read any file by path
-- **`memory_list`** - List directory contents
+- **`memory_tree`** - View workspace structure as a tree (depth parameter, default 1)
 
 ### Hybrid Search (RRF)
 
