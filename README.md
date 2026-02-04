@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="#features">Features</a> •
+  <a href="#openclaw-feature-parity">Parity</a> •
   <a href="#installation">Installation</a> •
   <a href="#configuration">Configuration</a> •
   <a href="#architecture">Architecture</a> •
@@ -27,6 +28,35 @@
 - **Prompt injection defense** - Pattern detection, content sanitization, policy enforcement
 - **Self-repair** - Automatic detection and recovery of stuck jobs
 - **Heartbeat system** - Proactive periodic execution for background tasks
+
+## OpenClaw Feature Parity
+
+IronClaw is a Rust reimplementation inspired by [OpenClaw](https://github.com/openclaw/openclaw). See [FEATURE_PARITY.md](FEATURE_PARITY.md) for the complete tracking matrix.
+
+### Status Summary
+
+| Category | Status | Notes |
+|----------|--------|-------|
+| **Core Agent** | ✅ Complete | Sessions, workers, routing, context compaction |
+| **Channels** | 🚧 Partial | TUI, HTTP, REPL, WASM channels done; messaging platforms pending |
+| **Tools** | ✅ Complete | Built-in, MCP, WASM sandbox, dynamic builder |
+| **Memory** | ✅ Complete | Hybrid search, embeddings, workspace filesystem |
+| **Security** | ✅ Complete | WASM sandbox, prompt injection, leak detection |
+| **Automation** | 🚧 Partial | Heartbeat done; cron, hooks pending |
+| **Gateway** | ❌ Pending | WebSocket control plane, service management |
+| **Web UI** | ❌ Pending | Control dashboard, WebChat |
+| **Mobile/Desktop** | 🚫 Out of scope | Focus on server-side initially |
+
+### Key Differences from OpenClaw
+
+- **Rust vs TypeScript** - Native performance, single binary
+- **WASM sandbox vs Docker** - Lightweight, capability-based security
+- **PostgreSQL vs SQLite** - Production-ready persistence
+- **NEAR AI primary** - Session-based auth with model proxy
+
+### Contributing
+
+Pick an unassigned feature area in [FEATURE_PARITY.md](FEATURE_PARITY.md) and claim it.
 
 ## Installation
 
