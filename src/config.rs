@@ -665,7 +665,7 @@ impl SandboxModeConfig {
                     key: "SANDBOX_ENABLED".to_string(),
                     message: format!("must be 'true' or 'false': {e}"),
                 })?
-                .unwrap_or(false),
+                .unwrap_or(true),
             policy: optional_env("SANDBOX_POLICY")?.unwrap_or_else(|| "readonly".to_string()),
             timeout_secs: parse_optional_env("SANDBOX_TIMEOUT_SECS", 120)?,
             memory_limit_mb: parse_optional_env("SANDBOX_MEMORY_LIMIT_MB", 2048)?,
