@@ -239,10 +239,24 @@ mod tests {
     fn test_natural_language_routing() {
         let router = Router::new();
 
-        let msg = IncomingMessage::new("test", "user", "Can you create a website for me?");
+        // Explicit job creation with "create job" phrase
+        let msg = IncomingMessage::new("test", "user", "create job: build a website for me");
         let intent = router.route(&msg);
-
         assert!(matches!(intent, MessageIntent::CreateJob { .. }));
+
+        // Also matches when both "create" and "job" are present
+        let msg2 = IncomingMessage::new(
+            "test",
+            "user",
+            "I need to create a new job to build a website",
+        );
+        let intent2 = router.route(&msg2);
+        assert!(matches!(intent2, MessageIntent::CreateJob { .. }));
+
+        // General requests without explicit "job" fall through to Chat
+        let msg3 = IncomingMessage::new("test", "user", "Can you create a website for me?");
+        let intent3 = router.route(&msg3);
+        assert!(matches!(intent3, MessageIntent::Chat { .. }));
     }
 
     #[test]
