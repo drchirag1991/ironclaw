@@ -16,6 +16,8 @@ use near_agent::{
     history::Store,
     llm::{SessionConfig, create_llm_provider, create_session_manager},
     safety::SafetyLayer,
+    settings::Settings,
+    setup::{SetupConfig, SetupWizard},
     tools::{
         ToolRegistry,
         wasm::{WasmToolLoader, WasmToolRuntime},
@@ -39,14 +41,45 @@ async fn main() -> anyhow::Result<()> {
 
             return run_tool_command(tool_cmd.clone()).await;
         }
+        Some(Command::Setup {
+            skip_auth,
+            channels_only,
+        }) => {
+            // Load .env before running setup wizard
+            let _ = dotenvy::dotenv();
+
+            // Run setup wizard
+            let config = SetupConfig {
+                skip_auth: *skip_auth,
+                channels_only: *channels_only,
+            };
+            let mut wizard = SetupWizard::with_config(config);
+            wizard.run().await?;
+            return Ok(());
+        }
         None | Some(Command::Run) => {
             // Continue to run agent
         }
     }
 
-    // Load configuration first (before any logging setup)
-    // so we can do auth before TUI starts
-    let _ = dotenvy::dotenv(); // Load .env if present
+    // Load .env if present
+    let _ = dotenvy::dotenv();
+
+    // First-run detection: if setup hasn't been completed and user didn't skip it,
+    // automatically run the setup wizard
+    if !cli.no_setup {
+        let settings = Settings::load();
+        let session_path = near_agent::llm::session::default_session_path();
+
+        if !settings.setup_completed && !session_path.exists() {
+            println!("First run detected. Starting setup wizard...");
+            println!();
+            let mut wizard = SetupWizard::new();
+            wizard.run().await?;
+        }
+    }
+
+    // Load configuration (after potential setup)
     let config = Config::from_env()?;
 
     // Initialize session manager and authenticate BEFORE TUI setup

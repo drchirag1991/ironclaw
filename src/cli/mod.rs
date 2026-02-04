@@ -2,6 +2,7 @@
 //!
 //! Provides subcommands for:
 //! - Running the agent (`run`)
+//! - Interactive setup wizard (`setup`)
 //! - Managing WASM tools (`tool install`, `tool list`, `tool remove`)
 //! - Managing secrets (`secret set`, `secret list`, `secret remove`)
 
@@ -38,12 +39,27 @@ pub struct Cli {
     /// Configuration file path (optional, uses env vars by default)
     #[arg(short, long, global = true)]
     pub config: Option<std::path::PathBuf>,
+
+    /// Skip first-run setup check
+    #[arg(long, global = true)]
+    pub no_setup: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run the agent (default if no subcommand given)
     Run,
+
+    /// Interactive setup wizard
+    Setup {
+        /// Skip authentication (use existing session)
+        #[arg(long)]
+        skip_auth: bool,
+
+        /// Reconfigure channels only
+        #[arg(long)]
+        channels_only: bool,
+    },
 
     /// Manage WASM tools
     #[command(subcommand)]

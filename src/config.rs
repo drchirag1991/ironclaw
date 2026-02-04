@@ -149,7 +149,7 @@ impl LlmConfig {
                             .to_string()
                     }),
                 base_url: optional_env("NEARAI_BASE_URL")?
-                    .unwrap_or_else(|| "https://api.near.ai".to_string()),
+                    .unwrap_or_else(|| "https://cloud-api.near.ai".to_string()),
                 auth_base_url: optional_env("NEARAI_AUTH_URL")?
                     .unwrap_or_else(|| "https://private.near.ai".to_string()),
                 session_path: optional_env("NEARAI_SESSION_PATH")?

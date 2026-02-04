@@ -12,6 +12,34 @@ pub struct Settings {
     /// Currently selected model.
     #[serde(default)]
     pub selected_model: Option<String>,
+
+    /// Whether setup wizard has been completed.
+    #[serde(default)]
+    pub setup_completed: bool,
+
+    /// Channel configuration.
+    #[serde(default)]
+    pub channels: ChannelSettings,
+}
+
+/// Channel-specific settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChannelSettings {
+    /// Whether HTTP webhook channel is enabled.
+    #[serde(default)]
+    pub http_enabled: bool,
+
+    /// HTTP webhook port (if enabled).
+    #[serde(default)]
+    pub http_port: Option<u16>,
+
+    /// Whether Telegram channel is enabled.
+    #[serde(default)]
+    pub telegram_enabled: bool,
+
+    /// Whether Slack channel is enabled.
+    #[serde(default)]
+    pub slack_enabled: bool,
 }
 
 impl Settings {
@@ -80,6 +108,7 @@ mod tests {
 
         let settings = Settings {
             selected_model: Some("claude-3-5-sonnet-20241022".to_string()),
+            ..Default::default()
         };
 
         settings.save_to(&path).unwrap();
@@ -101,6 +130,7 @@ mod tests {
 
         let settings = Settings {
             selected_model: Some("my-model".to_string()),
+            ..Default::default()
         };
         assert_eq!(settings.model_or("default-model"), "my-model".to_string());
     }

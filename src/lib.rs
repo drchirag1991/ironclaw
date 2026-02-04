@@ -51,6 +51,7 @@ pub mod llm;
 pub mod safety;
 pub mod secrets;
 pub mod settings;
+pub mod setup;
 pub mod tools;
 pub mod workspace;
 
