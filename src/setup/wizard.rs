@@ -11,10 +11,13 @@ use deadpool_postgres::{Config as PoolConfig, Runtime};
 use secrecy::SecretString;
 use tokio_postgres::NoTls;
 
+use crate::channels::wasm::ChannelCapabilitiesFile;
 use crate::llm::{SessionConfig, SessionManager};
 use crate::secrets::SecretsCrypto;
 use crate::settings::Settings;
-use crate::setup::channels::{SecretsContext, setup_http, setup_telegram, setup_tunnel};
+use crate::setup::channels::{
+    SecretsContext, setup_http, setup_telegram, setup_tunnel, setup_wasm_channel,
+};
 use crate::setup::prompts::{
     input, print_header, print_info, print_step, print_success, select_many, select_one,
 };
@@ -330,16 +333,36 @@ impl SetupWizard {
         }
         println!();
 
-        let options = [
-            ("CLI/TUI (always enabled)", true),
-            ("HTTP webhook", self.settings.channels.http_enabled),
-            ("Telegram", self.settings.channels.telegram_enabled),
+        // Discover available WASM channels
+        let channels_dir = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".near-agent/channels");
+
+        let discovered_channels = discover_wasm_channels(&channels_dir).await;
+
+        // Build options list dynamically
+        let mut options: Vec<(String, bool)> = vec![
+            ("CLI/TUI (always enabled)".to_string(), true),
+            (
+                "HTTP webhook".to_string(),
+                self.settings.channels.http_enabled,
+            ),
         ];
 
-        let selected = select_many("Which channels do you want to enable?", &options)?;
+        // Add discovered WASM channels
+        for (name, _) in &discovered_channels {
+            let is_enabled = self.settings.channels.wasm_channels.contains(name);
+            let display_name = format!("{} (WASM)", capitalize_first(name));
+            options.push((display_name, is_enabled));
+        }
 
-        // Only initialize secrets context if we need it (HTTP or Telegram selected)
-        let needs_secrets = selected.contains(&1) || selected.contains(&2);
+        let options_refs: Vec<(&str, bool)> =
+            options.iter().map(|(s, b)| (s.as_str(), *b)).collect();
+
+        let selected = select_many("Which channels do you want to enable?", &options_refs)?;
+
+        // Determine if we need secrets context
+        let needs_secrets = selected.iter().any(|&i| i >= 1);
         let secrets = if needs_secrets {
             Some(self.init_secrets_context().await?)
         } else {
@@ -358,16 +381,47 @@ impl SetupWizard {
             self.settings.channels.http_enabled = false;
         }
 
-        // Telegram is index 2
-        if selected.contains(&2) {
-            println!();
-            if let Some(ref ctx) = secrets {
-                let result = setup_telegram(ctx).await.map_err(SetupError::Channel)?;
-                self.settings.channels.telegram_enabled = result.enabled;
+        // Process WASM channels (index 2 and above)
+        let mut enabled_wasm_channels = Vec::new();
+        for (idx, (channel_name, cap_file)) in discovered_channels.iter().enumerate() {
+            let option_idx = idx + 2; // Offset for CLI and HTTP
+
+            if selected.contains(&option_idx) {
+                println!();
+                if let Some(ref ctx) = secrets {
+                    // Use setup schema from capabilities if available
+                    let result = if !cap_file.setup.required_secrets.is_empty() {
+                        setup_wasm_channel(ctx, channel_name, &cap_file.setup)
+                            .await
+                            .map_err(SetupError::Channel)?
+                    } else {
+                        // Fall back to legacy Telegram setup for backwards compatibility
+                        if channel_name == "telegram" {
+                            let telegram_result =
+                                setup_telegram(ctx).await.map_err(SetupError::Channel)?;
+                            crate::setup::channels::WasmChannelSetupResult {
+                                enabled: telegram_result.enabled,
+                                channel_name: "telegram".to_string(),
+                            }
+                        } else {
+                            print_info(&format!(
+                                "No setup configuration found for {}",
+                                channel_name
+                            ));
+                            crate::setup::channels::WasmChannelSetupResult {
+                                enabled: true,
+                                channel_name: channel_name.to_string(),
+                            }
+                        }
+                    };
+
+                    if result.enabled {
+                        enabled_wasm_channels.push(result.channel_name);
+                    }
+                }
             }
-        } else {
-            self.settings.channels.telegram_enabled = false;
         }
+        self.settings.channels.wasm_channels = enabled_wasm_channels;
 
         Ok(())
     }
@@ -407,13 +461,17 @@ impl SetupWizard {
             println!("    - HTTP: enabled (port {})", port);
         }
 
-        if self.settings.channels.telegram_enabled {
+        for channel_name in &self.settings.channels.wasm_channels {
             let mode = if self.settings.tunnel.public_url.is_some() {
                 "webhook"
             } else {
                 "polling"
             };
-            println!("    - Telegram: enabled ({})", mode);
+            println!(
+                "    - {}: enabled ({})",
+                capitalize_first(channel_name),
+                mode
+            );
         }
 
         println!();
@@ -437,6 +495,81 @@ fn generate_master_key() -> String {
 impl Default for SetupWizard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Discover WASM channels in a directory.
+///
+/// Returns a list of (channel_name, capabilities_file) pairs.
+async fn discover_wasm_channels(dir: &std::path::Path) -> Vec<(String, ChannelCapabilitiesFile)> {
+    let mut channels = Vec::new();
+
+    if !dir.is_dir() {
+        return channels;
+    }
+
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(_) => return channels,
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+
+        // Look for .capabilities.json files
+        let extension = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        if !extension.ends_with(".capabilities.json") {
+            continue;
+        }
+
+        // Extract channel name
+        let name = extension.trim_end_matches(".capabilities.json").to_string();
+        if name.is_empty() {
+            continue;
+        }
+
+        // Check if corresponding .wasm file exists
+        let wasm_path = dir.join(format!("{}.wasm", name));
+        if !wasm_path.exists() {
+            continue;
+        }
+
+        // Parse capabilities file
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => match ChannelCapabilitiesFile::from_bytes(&bytes) {
+                Ok(cap_file) => {
+                    channels.push((name, cap_file));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to parse channel capabilities file"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to read channel capabilities file"
+                );
+            }
+        }
+    }
+
+    // Sort by name for consistent ordering
+    channels.sort_by(|a, b| a.0.cmp(&b.0));
+    channels
+}
+
+/// Capitalize the first letter of a string.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().chain(chars).collect(),
     }
 }
 

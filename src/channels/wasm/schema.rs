@@ -62,6 +62,10 @@ pub struct ChannelCapabilitiesFile {
     #[serde(default)]
     pub description: Option<String>,
 
+    /// Setup configuration for the wizard.
+    #[serde(default)]
+    pub setup: SetupSchema,
+
     /// Capabilities (tool + channel specific).
     #[serde(default)]
     pub capabilities: ChannelCapabilitiesSchema,
@@ -94,6 +98,29 @@ impl ChannelCapabilitiesFile {
     /// Get the channel config as JSON string.
     pub fn config_json(&self) -> String {
         serde_json::to_string(&self.config).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Get the webhook secret header name for this channel.
+    ///
+    /// Returns the configured header name from capabilities, or a sensible default.
+    pub fn webhook_secret_header(&self) -> Option<&str> {
+        self.capabilities
+            .channel
+            .as_ref()
+            .and_then(|c| c.webhook.as_ref())
+            .and_then(|w| w.secret_header.as_deref())
+    }
+
+    /// Get the webhook secret name for this channel.
+    ///
+    /// Returns the configured secret name or defaults to "{channel_name}_webhook_secret".
+    pub fn webhook_secret_name(&self) -> String {
+        self.capabilities
+            .channel
+            .as_ref()
+            .and_then(|c| c.webhook.as_ref())
+            .and_then(|w| w.secret_name.clone())
+            .unwrap_or_else(|| format!("{}_webhook_secret", self.name))
     }
 }
 
@@ -178,6 +205,80 @@ pub struct ChannelSpecificCapabilitiesSchema {
     /// Callback timeout in seconds.
     #[serde(default)]
     pub callback_timeout_secs: Option<u64>,
+
+    /// Webhook configuration (secret header, etc.).
+    #[serde(default)]
+    pub webhook: Option<WebhookSchema>,
+}
+
+/// Webhook configuration schema.
+///
+/// Allows channels to specify their webhook validation requirements.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookSchema {
+    /// HTTP header name for secret validation.
+    ///
+    /// Examples:
+    /// - Telegram: "X-Telegram-Bot-Api-Secret-Token"
+    /// - Slack: "X-Slack-Signature"
+    /// - GitHub: "X-Hub-Signature-256"
+    /// - Generic: "X-Webhook-Secret"
+    #[serde(default)]
+    pub secret_header: Option<String>,
+
+    /// Secret name in secrets store for webhook validation.
+    /// Default: "{channel_name}_webhook_secret"
+    #[serde(default)]
+    pub secret_name: Option<String>,
+}
+
+/// Setup configuration schema.
+///
+/// Allows channels to declare their setup requirements for the wizard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetupSchema {
+    /// Required secrets that must be configured during setup.
+    #[serde(default)]
+    pub required_secrets: Vec<SecretSetupSchema>,
+
+    /// Optional validation endpoint to verify configuration.
+    /// Placeholders like {secret_name} are replaced with actual values.
+    #[serde(default)]
+    pub validation_endpoint: Option<String>,
+}
+
+/// Configuration for a secret required during setup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretSetupSchema {
+    /// Secret name in the secrets store (e.g., "telegram_bot_token").
+    pub name: String,
+
+    /// Prompt to show the user during setup.
+    pub prompt: String,
+
+    /// Optional regex for validation.
+    #[serde(default)]
+    pub validation: Option<String>,
+
+    /// Whether this secret is optional.
+    #[serde(default)]
+    pub optional: bool,
+
+    /// Auto-generate configuration if the user doesn't provide a value.
+    #[serde(default)]
+    pub auto_generate: Option<AutoGenerateSchema>,
+}
+
+/// Configuration for auto-generating a secret value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoGenerateSchema {
+    /// Length of the generated value in bytes (will be hex-encoded).
+    #[serde(default = "default_auto_generate_length")]
+    pub length: usize,
+}
+
+fn default_auto_generate_length() -> usize {
+    32
 }
 
 /// Schema for emit rate limiting.
@@ -411,5 +512,77 @@ mod tests {
 
         assert_eq!(caps.emit_rate_limit.messages_per_minute, 50);
         assert_eq!(caps.emit_rate_limit.messages_per_hour, 1000);
+    }
+
+    #[test]
+    fn test_webhook_schema() {
+        let json = r#"{
+            "name": "telegram",
+            "capabilities": {
+                "channel": {
+                    "allowed_paths": ["/webhook/telegram"],
+                    "webhook": {
+                        "secret_header": "X-Telegram-Bot-Api-Secret-Token",
+                        "secret_name": "telegram_webhook_secret"
+                    }
+                }
+            }
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        assert_eq!(
+            file.webhook_secret_header(),
+            Some("X-Telegram-Bot-Api-Secret-Token")
+        );
+        assert_eq!(file.webhook_secret_name(), "telegram_webhook_secret");
+    }
+
+    #[test]
+    fn test_webhook_secret_name_default() {
+        let json = r#"{
+            "name": "mybot",
+            "capabilities": {}
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        assert_eq!(file.webhook_secret_header(), None);
+        assert_eq!(file.webhook_secret_name(), "mybot_webhook_secret");
+    }
+
+    #[test]
+    fn test_setup_schema() {
+        let json = r#"{
+            "name": "telegram",
+            "setup": {
+                "required_secrets": [
+                    {
+                        "name": "telegram_bot_token",
+                        "prompt": "Enter your Telegram Bot Token",
+                        "validation": "^[0-9]+:[A-Za-z0-9_-]+$"
+                    },
+                    {
+                        "name": "telegram_webhook_secret",
+                        "prompt": "Webhook secret (leave empty to auto-generate)",
+                        "optional": true,
+                        "auto_generate": { "length": 64 }
+                    }
+                ],
+                "validation_endpoint": "https://api.telegram.org/bot{telegram_bot_token}/getMe"
+            }
+        }"#;
+
+        let file = ChannelCapabilitiesFile::from_json(json).unwrap();
+        assert_eq!(file.setup.required_secrets.len(), 2);
+        assert_eq!(file.setup.required_secrets[0].name, "telegram_bot_token");
+        assert!(!file.setup.required_secrets[0].optional);
+        assert!(file.setup.required_secrets[1].optional);
+        assert_eq!(
+            file.setup.required_secrets[1]
+                .auto_generate
+                .as_ref()
+                .unwrap()
+                .length,
+            64
+        );
     }
 }

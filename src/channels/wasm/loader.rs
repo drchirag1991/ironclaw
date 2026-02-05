@@ -40,7 +40,7 @@ impl WasmChannelLoader {
         name: &str,
         wasm_path: &Path,
         capabilities_path: Option<&Path>,
-    ) -> Result<WasmChannel, WasmChannelError> {
+    ) -> Result<LoadedChannel, WasmChannelError> {
         // Validate name
         if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
             return Err(WasmChannelError::InvalidName(name.to_string()));
@@ -53,56 +53,59 @@ impl WasmChannelLoader {
         let wasm_bytes = fs::read(wasm_path).await?;
 
         // Read capabilities file
-        let (capabilities, config_json, description) = if let Some(cap_path) = capabilities_path {
-            if cap_path.exists() {
-                let cap_bytes = fs::read(cap_path).await?;
-                let cap_file = ChannelCapabilitiesFile::from_bytes(&cap_bytes)
-                    .map_err(|e| WasmChannelError::InvalidCapabilities(e.to_string()))?;
+        let (capabilities, config_json, description, cap_file) =
+            if let Some(cap_path) = capabilities_path {
+                if cap_path.exists() {
+                    let cap_bytes = fs::read(cap_path).await?;
+                    let cap_file = ChannelCapabilitiesFile::from_bytes(&cap_bytes)
+                        .map_err(|e| WasmChannelError::InvalidCapabilities(e.to_string()))?;
 
-                // Debug: log raw capabilities
-                tracing::debug!(
-                    channel = name,
-                    raw_capabilities = ?cap_file.capabilities,
-                    "Parsed capabilities file"
-                );
+                    // Debug: log raw capabilities
+                    tracing::debug!(
+                        channel = name,
+                        raw_capabilities = ?cap_file.capabilities,
+                        "Parsed capabilities file"
+                    );
 
-                let caps = cap_file.to_capabilities();
+                    let caps = cap_file.to_capabilities();
 
-                // Debug: log resulting capabilities
-                tracing::info!(
-                    channel = name,
-                    http_allowed = caps.tool_capabilities.http.is_some(),
-                    http_allowlist_count = caps
-                        .tool_capabilities
-                        .http
-                        .as_ref()
-                        .map(|h| h.allowlist.len())
-                        .unwrap_or(0),
-                    "Channel capabilities loaded"
-                );
+                    // Debug: log resulting capabilities
+                    tracing::info!(
+                        channel = name,
+                        http_allowed = caps.tool_capabilities.http.is_some(),
+                        http_allowlist_count = caps
+                            .tool_capabilities
+                            .http
+                            .as_ref()
+                            .map(|h| h.allowlist.len())
+                            .unwrap_or(0),
+                        "Channel capabilities loaded"
+                    );
 
-                let config = cap_file.config_json();
-                let desc = cap_file.description.clone();
+                    let config = cap_file.config_json();
+                    let desc = cap_file.description.clone();
 
-                (caps, config, desc)
+                    (caps, config, desc, Some(cap_file))
+                } else {
+                    tracing::warn!(
+                        path = %cap_path.display(),
+                        "Capabilities file not found, using defaults"
+                    );
+                    (
+                        ChannelCapabilities::for_channel(name),
+                        "{}".to_string(),
+                        None,
+                        None,
+                    )
+                }
             } else {
-                tracing::warn!(
-                    path = %cap_path.display(),
-                    "Capabilities file not found, using defaults"
-                );
                 (
                     ChannelCapabilities::for_channel(name),
                     "{}".to_string(),
                     None,
+                    None,
                 )
-            }
-        } else {
-            (
-                ChannelCapabilities::for_channel(name),
-                "{}".to_string(),
-                None,
-            )
-        };
+            };
 
         // Prepare the module
         let prepared = self
@@ -119,7 +122,10 @@ impl WasmChannelLoader {
             "Loaded WASM channel from file"
         );
 
-        Ok(channel)
+        Ok(LoadedChannel {
+            channel,
+            capabilities_file: cap_file,
+        })
     }
 
     /// Load all WASM channels from a directory.
@@ -176,8 +182,8 @@ impl WasmChannelLoader {
             };
 
             match self.load_from_files(&name, &path, cap_path_option).await {
-                Ok(channel) => {
-                    results.loaded.push(channel);
+                Ok(loaded) => {
+                    results.loaded.push(loaded);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -194,7 +200,7 @@ impl WasmChannelLoader {
         if !results.loaded.is_empty() {
             tracing::info!(
                 count = results.loaded.len(),
-                channels = ?results.loaded.iter().map(|c| c.channel_name()).collect::<Vec<_>>(),
+                channels = ?results.loaded.iter().map(|c| c.name()).collect::<Vec<_>>(),
                 "Loaded WASM channels from directory"
             );
         }
@@ -203,11 +209,42 @@ impl WasmChannelLoader {
     }
 }
 
+/// A loaded WASM channel with its capabilities file.
+pub struct LoadedChannel {
+    /// The loaded channel.
+    pub channel: WasmChannel,
+
+    /// The parsed capabilities file (if present).
+    pub capabilities_file: Option<ChannelCapabilitiesFile>,
+}
+
+impl LoadedChannel {
+    /// Get the channel name.
+    pub fn name(&self) -> &str {
+        self.channel.channel_name()
+    }
+
+    /// Get the webhook secret header name from capabilities.
+    pub fn webhook_secret_header(&self) -> Option<&str> {
+        self.capabilities_file
+            .as_ref()
+            .and_then(|f| f.webhook_secret_header())
+    }
+
+    /// Get the webhook secret name from capabilities.
+    pub fn webhook_secret_name(&self) -> String {
+        self.capabilities_file
+            .as_ref()
+            .map(|f| f.webhook_secret_name())
+            .unwrap_or_else(|| format!("{}_webhook_secret", self.channel.channel_name()))
+    }
+}
+
 /// Results from loading multiple channels.
 #[derive(Default)]
 pub struct LoadResults {
-    /// Successfully loaded channels.
-    pub loaded: Vec<WasmChannel>,
+    /// Successfully loaded channels with their capabilities.
+    pub loaded: Vec<LoadedChannel>,
 
     /// Errors encountered (path, error).
     pub errors: Vec<(PathBuf, WasmChannelError)>,
@@ -229,9 +266,9 @@ impl LoadResults {
         self.errors.len()
     }
 
-    /// Take ownership of loaded channels.
+    /// Take ownership of loaded channels (extracts just the WasmChannel).
     pub fn take_channels(self) -> Vec<WasmChannel> {
-        self.loaded
+        self.loaded.into_iter().map(|l| l.channel).collect()
     }
 }
 

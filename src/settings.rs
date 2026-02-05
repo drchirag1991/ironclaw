@@ -47,13 +47,11 @@ pub struct ChannelSettings {
     #[serde(default)]
     pub http_port: Option<u16>,
 
-    /// Whether Telegram channel is enabled.
+    /// Enabled WASM channels by name.
+    /// Channels not in this list but present in the channels directory will still load.
+    /// This is primarily used by the setup wizard to track which channels were configured.
     #[serde(default)]
-    pub telegram_enabled: bool,
-
-    /// Whether Slack channel is enabled.
-    #[serde(default)]
-    pub slack_enabled: bool,
+    pub wasm_channels: Vec<String>,
 }
 
 impl Settings {

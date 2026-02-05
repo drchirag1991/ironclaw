@@ -364,13 +364,15 @@ async fn main() -> anyhow::Result<()> {
                         let wasm_router = Arc::new(WasmChannelRouter::new());
                         let mut has_webhook_channels = false;
 
-                        for channel in results.loaded {
-                            let channel_name = channel.channel_name().to_string();
+                        for loaded in results.loaded {
+                            let channel_name = loaded.name().to_string();
                             tracing::info!("Loaded WASM channel: {}", channel_name);
+
+                            // Get webhook secret name from capabilities (generic)
+                            let secret_name = loaded.webhook_secret_name();
 
                             // Get webhook secret for this channel from secrets store
                             let webhook_secret = if let Some(ref secrets) = secrets_store {
-                                let secret_name = format!("{}_webhook_secret", channel_name);
                                 secrets
                                     .get_decrypted("default", &secret_name)
                                     .await
@@ -379,6 +381,10 @@ async fn main() -> anyhow::Result<()> {
                             } else {
                                 None
                             };
+
+                            // Get the secret header name from capabilities
+                            let secret_header =
+                                loaded.webhook_secret_header().map(|s| s.to_string());
 
                             // Register channel with router for webhook handling
                             // Use known webhook path based on channel name
@@ -390,82 +396,50 @@ async fn main() -> anyhow::Result<()> {
                                 require_secret: webhook_secret.is_some(),
                             }];
 
-                            let channel_arc = Arc::new(channel);
-
-                            // Clone webhook_secret before moving it to register()
-                            // We need it later for Telegram API registration
-                            let webhook_secret_for_telegram = webhook_secret.clone();
+                            let channel_arc = Arc::new(loaded.channel);
 
                             tracing::info!(
                                 channel = %channel_name,
                                 has_webhook_secret = webhook_secret.is_some(),
+                                secret_header = ?secret_header,
                                 "Registering channel with router"
                             );
 
                             wasm_router
-                                .register(Arc::clone(&channel_arc), endpoints, webhook_secret)
+                                .register(
+                                    Arc::clone(&channel_arc),
+                                    endpoints,
+                                    webhook_secret,
+                                    secret_header,
+                                )
                                 .await;
                             has_webhook_channels = true;
 
-                            // Set up Telegram channel credentials and optionally register webhook
-                            if channel_name == "telegram" {
-                                if let Some(ref secrets) = secrets_store {
-                                    // Inject bot token for HTTP request URL substitution
-                                    // This is needed for both webhook and polling modes
-                                    match inject_telegram_credentials(
-                                        &channel_arc,
-                                        secrets.as_ref(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            tracing::debug!("Telegram bot token injected");
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to inject Telegram credentials: {}",
-                                                e
-                                            );
-                                            tracing::warn!(
-                                                "Telegram channel may not be able to send responses"
+                            // Inject credentials for this channel (generic pattern-based injection)
+                            if let Some(ref secrets) = secrets_store {
+                                match inject_channel_credentials(
+                                    &channel_arc,
+                                    secrets.as_ref(),
+                                    &channel_name,
+                                )
+                                .await
+                                {
+                                    Ok(count) => {
+                                        if count > 0 {
+                                            tracing::info!(
+                                                channel = %channel_name,
+                                                credentials_injected = count,
+                                                "Channel credentials injected"
                                             );
                                         }
                                     }
-
-                                    // Register webhook if tunnel URL is configured
-                                    // Use the SAME webhook_secret that the router expects (from secrets store)
-                                    if let Some(ref tunnel_url) = config.tunnel.public_url {
-                                        match register_telegram_webhook(
-                                            &channel_arc,
-                                            tunnel_url,
-                                            webhook_secret_for_telegram.as_deref(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                tracing::info!(
-                                                    "Telegram webhook registered at {}/webhook/telegram",
-                                                    tunnel_url
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "Failed to register Telegram webhook: {}",
-                                                    e
-                                                );
-                                                tracing::warn!(
-                                                    "Telegram will fall back to polling mode"
-                                                );
-                                            }
-                                        }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            channel = %channel_name,
+                                            error = %e,
+                                            "Failed to inject channel credentials"
+                                        );
                                     }
-                                } else {
-                                    tracing::warn!(
-                                        "Telegram channel loaded but secrets store not available"
-                                    );
-                                    tracing::warn!(
-                                        "Set SECRETS_MASTER_KEY to enable Telegram bot token injection"
-                                    );
                                 }
                             }
 
@@ -559,66 +533,60 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Inject Telegram bot token into the channel's credentials.
+/// Inject credentials for a channel based on naming convention.
 ///
-/// This allows the WASM channel to use `{TELEGRAM_BOT_TOKEN}` in HTTP URLs
-/// without ever seeing the actual token value. Required for both webhook
-/// and polling modes to send responses.
-async fn inject_telegram_credentials(
+/// Looks for secrets matching the pattern `{channel_name}_*` and injects them
+/// as credential placeholders (e.g., `telegram_bot_token` -> `{TELEGRAM_BOT_TOKEN}`).
+///
+/// Returns the number of credentials injected.
+async fn inject_channel_credentials(
     channel: &Arc<near_agent::channels::wasm::WasmChannel>,
     secrets: &dyn SecretsStore,
-) -> anyhow::Result<()> {
-    tracing::info!("Injecting Telegram bot token into channel credentials");
-
-    // Get bot token from secrets
-    let decrypted = secrets
-        .get_decrypted("default", "telegram_bot_token")
+    channel_name: &str,
+) -> anyhow::Result<usize> {
+    // List all secrets for this user and filter by channel prefix
+    let all_secrets = secrets
+        .list("default")
         .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "Failed to get telegram_bot_token from secrets");
-            anyhow::anyhow!("Failed to get Telegram bot token: {}", e)
-        })?;
+        .map_err(|e| anyhow::anyhow!("Failed to list secrets: {}", e))?;
 
-    let bot_token = decrypted.expose();
-    let token_len = bot_token.len();
+    let prefix = format!("{}_", channel_name);
+    let mut count = 0;
 
-    // Inject the token into the channel's credentials for URL substitution
-    channel
-        .set_credential("TELEGRAM_BOT_TOKEN", bot_token.to_string())
-        .await;
+    for secret_meta in all_secrets {
+        // Only process secrets matching the channel prefix
+        if !secret_meta.name.starts_with(&prefix) {
+            continue;
+        }
 
-    // Verify injection
-    let creds = channel.get_credentials().await;
-    tracing::info!(
-        token_length = token_len,
-        has_token = creds.contains_key("TELEGRAM_BOT_TOKEN"),
-        credential_count = creds.len(),
-        "Telegram bot token injected successfully"
-    );
+        // Get the decrypted value
+        let decrypted = match secrets.get_decrypted("default", &secret_meta.name).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    secret = %secret_meta.name,
+                    error = %e,
+                    "Failed to decrypt secret for channel credential injection"
+                );
+                continue;
+            }
+        };
 
-    Ok(())
-}
+        // Convert secret name to placeholder format (SCREAMING_SNAKE_CASE)
+        let placeholder = secret_meta.name.to_uppercase();
 
-/// Register Telegram webhook for instant message delivery.
-///
-/// Calls the Telegram setWebhook API. Assumes credentials have already been
-/// injected via `inject_telegram_credentials` (gets token from channel).
-async fn register_telegram_webhook(
-    channel: &Arc<near_agent::channels::wasm::WasmChannel>,
-    tunnel_url: &str,
-    webhook_secret: Option<&str>,
-) -> anyhow::Result<()> {
-    // Get the bot token via the public getter
-    let credentials = channel.get_credentials().await;
-    let bot_token = credentials.get("TELEGRAM_BOT_TOKEN").ok_or_else(|| {
-        anyhow::anyhow!("Bot token not injected - call inject_telegram_credentials first")
-    })?;
+        tracing::debug!(
+            channel = %channel_name,
+            secret = %secret_meta.name,
+            placeholder = %placeholder,
+            "Injecting credential"
+        );
 
-    // Register the webhook with Telegram API
-    channel
-        .register_telegram_webhook(tunnel_url, bot_token, webhook_secret)
-        .await
-        .map_err(|e| anyhow::anyhow!("Webhook registration failed: {}", e))?;
+        channel
+            .set_credential(&placeholder, decrypted.expose().to_string())
+            .await;
+        count += 1;
+    }
 
-    Ok(())
+    Ok(count)
 }

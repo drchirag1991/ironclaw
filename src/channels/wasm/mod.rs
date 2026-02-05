@@ -92,11 +92,14 @@ pub use capabilities::{ChannelCapabilities, EmitRateLimitConfig, HttpEndpointCon
 pub use error::WasmChannelError;
 pub use host::{ChannelEmitRateLimiter, ChannelHostState, EmittedMessage};
 pub use loader::{
-    DiscoveredChannel, LoadResults, WasmChannelLoader, default_channels_dir, discover_channels,
+    DiscoveredChannel, LoadResults, LoadedChannel, WasmChannelLoader, default_channels_dir,
+    discover_channels,
 };
 pub use router::{
     RegisteredEndpoint, WasmChannelRouter, WasmChannelServer, create_wasm_channel_router,
 };
 pub use runtime::{PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig};
-pub use schema::{ChannelCapabilitiesFile, ChannelConfig};
+pub use schema::{
+    ChannelCapabilitiesFile, ChannelConfig, SecretSetupSchema, SetupSchema, WebhookSchema,
+};
 pub use wrapper::{HttpResponse, SharedWasmChannel, WasmChannel};

@@ -41,6 +41,8 @@ pub struct WasmChannelRouter {
     path_to_channel: RwLock<HashMap<String, String>>,
     /// Expected webhook secrets by channel name.
     secrets: RwLock<HashMap<String, String>>,
+    /// Webhook secret header names by channel name (e.g., "X-Telegram-Bot-Api-Secret-Token").
+    secret_headers: RwLock<HashMap<String, String>>,
 }
 
 impl WasmChannelRouter {
@@ -50,15 +52,24 @@ impl WasmChannelRouter {
             channels: RwLock::new(HashMap::new()),
             path_to_channel: RwLock::new(HashMap::new()),
             secrets: RwLock::new(HashMap::new()),
+            secret_headers: RwLock::new(HashMap::new()),
         }
     }
 
     /// Register a channel with its endpoints.
+    ///
+    /// # Arguments
+    /// * `channel` - The WASM channel to register
+    /// * `endpoints` - HTTP endpoints to register for this channel
+    /// * `secret` - Optional webhook secret for validation
+    /// * `secret_header` - Optional HTTP header name for secret validation
+    ///   (e.g., "X-Telegram-Bot-Api-Secret-Token"). Defaults to "X-Webhook-Secret".
     pub async fn register(
         &self,
         channel: Arc<WasmChannel>,
         endpoints: Vec<RegisteredEndpoint>,
         secret: Option<String>,
+        secret_header: Option<String>,
     ) {
         let name = channel.channel_name().to_string();
 
@@ -79,14 +90,32 @@ impl WasmChannelRouter {
 
         // Store secret if provided
         if let Some(s) = secret {
-            self.secrets.write().await.insert(name, s);
+            self.secrets.write().await.insert(name.clone(), s);
         }
+
+        // Store secret header if provided
+        if let Some(h) = secret_header {
+            self.secret_headers.write().await.insert(name, h);
+        }
+    }
+
+    /// Get the secret header name for a channel.
+    ///
+    /// Returns the configured header or "X-Webhook-Secret" as default.
+    pub async fn get_secret_header(&self, channel_name: &str) -> String {
+        self.secret_headers
+            .read()
+            .await
+            .get(channel_name)
+            .cloned()
+            .unwrap_or_else(|| "X-Webhook-Secret".to_string())
     }
 
     /// Unregister a channel and its endpoints.
     pub async fn unregister(&self, channel_name: &str) {
         self.channels.write().await.remove(channel_name);
         self.secrets.write().await.remove(channel_name);
+        self.secret_headers.write().await.remove(channel_name);
 
         // Remove all paths for this channel
         self.path_to_channel
@@ -224,23 +253,29 @@ async fn webhook_handler(
 
     // Check if secret is required
     if state.router.requires_secret(channel_name).await {
-        // Try to get secret from query param or header
-        // Telegram uses X-Telegram-Bot-Api-Secret-Token header
+        // Get the secret header name for this channel (from capabilities or default)
+        let secret_header_name = state.router.get_secret_header(channel_name).await;
+
+        // Try to get secret from query param or the channel's configured header
         let provided_secret = query
             .get("secret")
             .cloned()
             .or_else(|| {
                 headers
-                    .get("X-Telegram-Bot-Api-Secret-Token")
+                    .get(&secret_header_name)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string())
             })
             .or_else(|| {
-                // Fallback to generic header
-                headers
-                    .get("X-Webhook-Secret")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
+                // Fallback to generic header if different from configured
+                if secret_header_name != "X-Webhook-Secret" {
+                    headers
+                        .get("X-Webhook-Secret")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
             });
 
         tracing::debug!(
@@ -447,7 +482,7 @@ mod tests {
         }];
 
         router
-            .register(channel, endpoints, Some("secret123".to_string()))
+            .register(channel, endpoints, Some("secret123".to_string()), None)
             .await;
 
         // Should find channel by path
@@ -466,7 +501,7 @@ mod tests {
         let channel = create_test_channel("slack");
 
         router
-            .register(channel, vec![], Some("secret123".to_string()))
+            .register(channel, vec![], Some("secret123".to_string()), None)
             .await;
 
         // Correct secret
@@ -477,7 +512,7 @@ mod tests {
 
         // Channel without secret always validates
         let channel2 = create_test_channel("telegram");
-        router.register(channel2, vec![], None).await;
+        router.register(channel2, vec![], None, None).await;
         assert!(router.validate_secret("telegram", "anything").await);
     }
 
@@ -493,7 +528,7 @@ mod tests {
             require_secret: false,
         }];
 
-        router.register(channel, endpoints, None).await;
+        router.register(channel, endpoints, None, None).await;
 
         // Should exist
         assert!(
@@ -522,12 +557,41 @@ mod tests {
         let channel1 = create_test_channel("slack");
         let channel2 = create_test_channel("telegram");
 
-        router.register(channel1, vec![], None).await;
-        router.register(channel2, vec![], None).await;
+        router.register(channel1, vec![], None, None).await;
+        router.register(channel2, vec![], None, None).await;
 
         let channels = router.list_channels().await;
         assert_eq!(channels.len(), 2);
         assert!(channels.contains(&"slack".to_string()));
         assert!(channels.contains(&"telegram".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_router_secret_header() {
+        let router = WasmChannelRouter::new();
+        let channel = create_test_channel("telegram");
+
+        // Register with custom secret header
+        router
+            .register(
+                channel,
+                vec![],
+                Some("secret123".to_string()),
+                Some("X-Telegram-Bot-Api-Secret-Token".to_string()),
+            )
+            .await;
+
+        // Should return the custom header
+        assert_eq!(
+            router.get_secret_header("telegram").await,
+            "X-Telegram-Bot-Api-Secret-Token"
+        );
+
+        // Channel without custom header should use default
+        let channel2 = create_test_channel("slack");
+        router
+            .register(channel2, vec![], Some("secret456".to_string()), None)
+            .await;
+        assert_eq!(router.get_secret_header("slack").await, "X-Webhook-Secret");
     }
 }

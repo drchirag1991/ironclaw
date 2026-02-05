@@ -241,11 +241,22 @@ impl Guest for TelegramChannel {
                 channel_host::LogLevel::Info,
                 "Webhook mode enabled (polling disabled)",
             );
-            if let Some(ref url) = config.tunnel_url {
+
+            // Register webhook with Telegram API
+            if let Some(ref tunnel_url) = config.tunnel_url {
                 channel_host::log(
                     channel_host::LogLevel::Info,
-                    &format!("Tunnel URL: {}", url),
+                    &format!("Registering webhook with Telegram API: {}", tunnel_url),
                 );
+
+                if let Err(e) = register_webhook(tunnel_url, config.webhook_secret.as_deref()) {
+                    channel_host::log(
+                        channel_host::LogLevel::Error,
+                        &format!("Failed to register webhook: {}", e),
+                    );
+                    // Continue anyway, the host will start the server
+                    // and Telegram will eventually receive updates
+                }
             }
         }
 
@@ -492,6 +503,73 @@ impl Guest for TelegramChannel {
             channel_host::LogLevel::Info,
             "Telegram channel shutting down",
         );
+    }
+}
+
+// ============================================================================
+// Webhook Registration
+// ============================================================================
+
+/// Register webhook URL with Telegram API.
+///
+/// Called during on_start() when tunnel_url is configured.
+fn register_webhook(tunnel_url: &str, webhook_secret: Option<&str>) -> Result<(), String> {
+    let webhook_url = format!("{}/webhook/telegram", tunnel_url);
+
+    // Build setWebhook request body
+    let mut body = serde_json::json!({
+        "url": webhook_url,
+        "allowed_updates": ["message", "edited_message"]
+    });
+
+    if let Some(secret) = webhook_secret {
+        body["secret_token"] = serde_json::Value::String(secret.to_string());
+    }
+
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| format!("Failed to serialize body: {}", e))?;
+
+    let headers = serde_json::json!({
+        "Content-Type": "application/json"
+    });
+
+    // Make HTTP request to Telegram API
+    // Note: {TELEGRAM_BOT_TOKEN} is replaced by host with the actual token
+    let result = channel_host::http_request(
+        "POST",
+        "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+        &headers.to_string(),
+        Some(&body_bytes),
+    );
+
+    match result {
+        Ok(response) => {
+            if response.status != 200 {
+                let body_str = String::from_utf8_lossy(&response.body);
+                return Err(format!("HTTP {}: {}", response.status, body_str));
+            }
+
+            // Parse Telegram API response
+            let api_response: TelegramApiResponse<serde_json::Value> =
+                serde_json::from_slice(&response.body)
+                    .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+            if !api_response.ok {
+                return Err(format!(
+                    "Telegram API error: {}",
+                    api_response
+                        .description
+                        .unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
+
+            channel_host::log(
+                channel_host::LogLevel::Info,
+                &format!("Webhook registered successfully: {}", webhook_url),
+            );
+
+            Ok(())
+        }
+        Err(e) => Err(format!("HTTP request failed: {}", e)),
     }
 }
 

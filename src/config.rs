@@ -308,35 +308,10 @@ fn default_session_path() -> PathBuf {
 pub struct ChannelsConfig {
     pub cli: CliConfig,
     pub http: Option<HttpConfig>,
-    pub telegram: TelegramChannelConfig,
     /// Directory containing WASM channel modules (default: ~/.near-agent/channels/).
     pub wasm_channels_dir: std::path::PathBuf,
     /// Whether WASM channels are enabled.
     pub wasm_channels_enabled: bool,
-}
-
-/// Telegram channel configuration.
-///
-/// The tunnel URL for webhook mode comes from the global `TunnelConfig`.
-/// This config only contains Telegram-specific settings.
-#[derive(Debug, Clone, Default)]
-pub struct TelegramChannelConfig {
-    /// Secret token for webhook validation (optional but recommended).
-    ///
-    /// When set, Telegram will include this value in the
-    /// `X-Telegram-Bot-Api-Secret-Token` header of webhook requests.
-    /// The agent validates this header to ensure requests come from Telegram.
-    ///
-    /// Generate a secure random token (32+ characters recommended).
-    pub webhook_secret: Option<String>,
-}
-
-impl TelegramChannelConfig {
-    fn from_env() -> Result<Self, ConfigError> {
-        Ok(Self {
-            webhook_secret: optional_env("TELEGRAM_WEBHOOK_SECRET")?,
-        })
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -379,7 +354,6 @@ impl ChannelsConfig {
                 enabled: cli_enabled,
             },
             http,
-            telegram: TelegramChannelConfig::from_env()?,
             wasm_channels_dir: optional_env("WASM_CHANNELS_DIR")?
                 .map(PathBuf::from)
                 .unwrap_or_else(default_channels_dir),

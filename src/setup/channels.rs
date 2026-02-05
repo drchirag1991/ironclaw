@@ -330,10 +330,124 @@ pub async fn setup_http(secrets: &SecretsContext) -> Result<HttpSetupResult, Str
 }
 
 /// Generate a random webhook secret.
-fn generate_webhook_secret() -> String {
+pub fn generate_webhook_secret() -> String {
     use rand::RngCore;
     let mut rng = rand::thread_rng();
     let mut bytes = [0u8; 32];
+    rng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Result of WASM channel setup.
+#[derive(Debug, Clone)]
+pub struct WasmChannelSetupResult {
+    pub enabled: bool,
+    pub channel_name: String,
+}
+
+/// Set up a WASM channel using its capabilities file setup schema.
+///
+/// Reads setup requirements from the channel's capabilities file and
+/// prompts the user for each required secret.
+pub async fn setup_wasm_channel(
+    secrets: &SecretsContext,
+    channel_name: &str,
+    setup: &crate::channels::wasm::SetupSchema,
+) -> Result<WasmChannelSetupResult, String> {
+    println!("{} Setup:", channel_name);
+    println!();
+
+    for secret_config in &setup.required_secrets {
+        // Check if this secret already exists
+        if secrets.secret_exists(&secret_config.name).await {
+            print_info(&format!(
+                "Existing {} found in database.",
+                secret_config.name
+            ));
+            if !confirm("Replace existing value?", false).map_err(|e| e.to_string())? {
+                continue;
+            }
+        }
+
+        // Get the value from user or auto-generate
+        let value = if secret_config.optional {
+            let input_value =
+                optional_input(&secret_config.prompt, Some("leave empty to auto-generate"))
+                    .map_err(|e| e.to_string())?;
+
+            if let Some(v) = input_value {
+                if !v.is_empty() {
+                    SecretString::from(v)
+                } else if let Some(ref auto_gen) = secret_config.auto_generate {
+                    let generated = generate_secret_with_length(auto_gen.length);
+                    print_info(&format!(
+                        "Auto-generated {} ({} bytes)",
+                        secret_config.name, auto_gen.length
+                    ));
+                    SecretString::from(generated)
+                } else {
+                    continue; // Skip optional secret with no auto-generate
+                }
+            } else if let Some(ref auto_gen) = secret_config.auto_generate {
+                let generated = generate_secret_with_length(auto_gen.length);
+                print_info(&format!(
+                    "Auto-generated {} ({} bytes)",
+                    secret_config.name, auto_gen.length
+                ));
+                SecretString::from(generated)
+            } else {
+                continue; // Skip optional secret with no auto-generate
+            }
+        } else {
+            // Required secret
+            let input_value = secret_input(&secret_config.prompt).map_err(|e| e.to_string())?;
+
+            // Validate if pattern is provided
+            if let Some(ref pattern) = secret_config.validation {
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| format!("Invalid validation pattern: {}", e))?;
+                if !re.is_match(input_value.expose_secret()) {
+                    print_error(&format!(
+                        "Value does not match expected format: {}",
+                        pattern
+                    ));
+                    return Err("Validation failed".to_string());
+                }
+            }
+
+            input_value
+        };
+
+        // Save the secret
+        secrets.save_secret(&secret_config.name, &value).await?;
+        print_success(&format!("{} saved to database", secret_config.name));
+    }
+
+    // Optionally validate the configuration
+    if let Some(ref validation_endpoint) = setup.validation_endpoint {
+        print_info("Validating configuration...");
+        // The validation endpoint may contain placeholders like {telegram_bot_token}
+        // For now, we skip validation since we'd need to substitute secrets
+        // A full implementation would fetch secrets and substitute them
+        print_info(&format!(
+            "Validation endpoint configured: {} (validation skipped)",
+            validation_endpoint
+        ));
+    }
+
+    print_success(&format!("{} channel configured", channel_name));
+
+    Ok(WasmChannelSetupResult {
+        enabled: true,
+        channel_name: channel_name.to_string(),
+    })
+}
+
+/// Generate a random secret of specified length (in bytes).
+fn generate_secret_with_length(length: usize) -> String {
+    use rand::RngCore;
+    let mut rng = rand::thread_rng();
+    let mut bytes = vec![0u8; length];
     rng.fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

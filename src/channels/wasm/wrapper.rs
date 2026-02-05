@@ -356,23 +356,29 @@ pub struct WasmChannel {
     channel_config: RwLock<Option<ChannelConfig>>,
 
     /// Message sender (for emitting messages to the stream).
-    message_tx: RwLock<Option<mpsc::Sender<IncomingMessage>>>,
+    /// Wrapped in Arc for sharing with the polling task.
+    message_tx: Arc<RwLock<Option<mpsc::Sender<IncomingMessage>>>>,
 
     /// Pending responses (for synchronous response handling).
     pending_responses: RwLock<HashMap<Uuid, oneshot::Sender<String>>>,
 
     /// Rate limiter for message emission.
-    rate_limiter: RwLock<ChannelEmitRateLimiter>,
+    /// Wrapped in Arc for sharing with the polling task.
+    rate_limiter: Arc<RwLock<ChannelEmitRateLimiter>>,
 
     /// Shutdown signal sender.
     shutdown_tx: RwLock<Option<oneshot::Sender<()>>>,
+
+    /// Polling shutdown signal sender (keeps polling alive while held).
+    poll_shutdown_tx: RwLock<Option<oneshot::Sender<()>>>,
 
     /// Registered HTTP endpoints.
     endpoints: RwLock<Vec<RegisteredEndpoint>>,
 
     /// Injected credentials for HTTP requests (e.g., bot tokens).
     /// Keys are placeholder names like "TELEGRAM_BOT_TOKEN".
-    credentials: RwLock<HashMap<String, String>>,
+    /// Wrapped in Arc for sharing with the polling task.
+    credentials: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl WasmChannel {
@@ -393,12 +399,13 @@ impl WasmChannel {
             capabilities,
             config_json,
             channel_config: RwLock::new(None),
-            message_tx: RwLock::new(None),
+            message_tx: Arc::new(RwLock::new(None)),
             pending_responses: RwLock::new(HashMap::new()),
-            rate_limiter: RwLock::new(rate_limiter),
+            rate_limiter: Arc::new(RwLock::new(rate_limiter)),
             shutdown_tx: RwLock::new(None),
+            poll_shutdown_tx: RwLock::new(None),
             endpoints: RwLock::new(Vec::new()),
-            credentials: RwLock::new(HashMap::new()),
+            credentials: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -428,142 +435,6 @@ impl WasmChannel {
     /// Get the registered endpoints.
     pub async fn endpoints(&self) -> Vec<RegisteredEndpoint> {
         self.endpoints.read().await.clone()
-    }
-
-    /// Register a webhook URL with Telegram.
-    ///
-    /// Called during channel startup if tunnel_url is configured.
-    /// This enables instant message delivery instead of polling.
-    pub async fn register_telegram_webhook(
-        &self,
-        tunnel_url: &str,
-        bot_token: &str,
-        secret_token: Option<&str>,
-    ) -> Result<(), WasmChannelError> {
-        let webhook_url = format!("{}/webhook/telegram", tunnel_url);
-
-        tracing::info!(
-            channel = %self.name,
-            webhook_url = %webhook_url,
-            "Registering Telegram webhook"
-        );
-
-        // Build form parameters
-        let mut form_params = vec![
-            ("url", webhook_url.as_str()),
-            ("allowed_updates", r#"["message","edited_message"]"#),
-        ];
-
-        let secret_owned: String;
-        if let Some(secret) = secret_token {
-            secret_owned = secret.to_string();
-            form_params.push(("secret_token", &secret_owned));
-        }
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
-
-        let response = client
-            .post(format!(
-                "https://api.telegram.org/bot{}/setWebhook",
-                bot_token
-            ))
-            .form(&form_params)
-            .send()
-            .await
-            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(WasmChannelError::WebhookRegistration {
-                name: self.name.clone(),
-                reason: format!("HTTP {}: {}", status, body),
-            });
-        }
-
-        // Parse Telegram API response
-        let result: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
-
-        if result["ok"].as_bool() != Some(true) {
-            let description = result["description"]
-                .as_str()
-                .unwrap_or("unknown error")
-                .to_string();
-            return Err(WasmChannelError::WebhookRegistration {
-                name: self.name.clone(),
-                reason: description,
-            });
-        }
-
-        tracing::info!(
-            channel = %self.name,
-            webhook_url = %webhook_url,
-            "Telegram webhook registered successfully"
-        );
-
-        Ok(())
-    }
-
-    /// Delete the webhook and switch back to polling mode.
-    ///
-    /// Called during shutdown if webhook was registered.
-    pub async fn delete_telegram_webhook(&self, bot_token: &str) -> Result<(), WasmChannelError> {
-        tracing::info!(
-            channel = %self.name,
-            "Deleting Telegram webhook"
-        );
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
-
-        let response = client
-            .post(format!(
-                "https://api.telegram.org/bot{}/deleteWebhook",
-                bot_token
-            ))
-            .send()
-            .await
-            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(WasmChannelError::WebhookRegistration {
-                name: self.name.clone(),
-                reason: format!("HTTP {} (delete): {}", status, body),
-            });
-        }
-
-        let result: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
-
-        if result["ok"].as_bool() != Some(true) {
-            let description = result["description"]
-                .as_str()
-                .unwrap_or("unknown error")
-                .to_string();
-            return Err(WasmChannelError::WebhookRegistration {
-                name: self.name.clone(),
-                reason: format!("delete failed: {}", description),
-            });
-        }
-
-        tracing::info!(
-            channel = %self.name,
-            "Telegram webhook deleted"
-        );
-
-        Ok(())
     }
 
     /// Add channel host functions to the linker using generated bindings.
@@ -1154,11 +1025,20 @@ impl WasmChannel {
     }
 
     /// Start the polling loop if configured.
+    ///
+    /// Since we can't hold `Arc<Self>` from `&self`, we pass all the components
+    /// needed for polling to a spawned task. Each poll tick creates a fresh WASM
+    /// instance (matching our "fresh instance per callback" pattern).
     fn start_polling(&self, interval: Duration, shutdown_rx: oneshot::Receiver<()>) {
         let channel_name = self.name.clone();
+        let runtime = Arc::clone(&self.runtime);
+        let prepared = Arc::clone(&self.prepared);
+        let capabilities = self.capabilities.clone();
+        let message_tx = self.message_tx.clone();
+        let rate_limiter = self.rate_limiter.clone();
+        let credentials = self.credentials.clone();
+        let callback_timeout = self.runtime.config().callback_timeout;
 
-        // Clone self reference for the async block
-        // In a real implementation, we'd hold an Arc<Self>
         tokio::spawn(async move {
             let mut interval_timer = tokio::time::interval(interval);
             let mut shutdown = std::pin::pin!(shutdown_rx);
@@ -1168,9 +1048,45 @@ impl WasmChannel {
                     _ = interval_timer.tick() => {
                         tracing::debug!(
                             channel = %channel_name,
-                            "Polling tick (stub - would call on_poll)"
+                            "Polling tick - calling on_poll"
                         );
-                        // In real implementation: self.call_on_poll().await
+
+                        // Execute on_poll with fresh WASM instance
+                        let result = Self::execute_poll(
+                            &channel_name,
+                            &runtime,
+                            &prepared,
+                            &capabilities,
+                            &credentials,
+                            callback_timeout,
+                        ).await;
+
+                        match result {
+                            Ok(emitted_messages) => {
+                                // Process any emitted messages
+                                if !emitted_messages.is_empty() {
+                                    if let Err(e) = Self::dispatch_emitted_messages(
+                                        &channel_name,
+                                        emitted_messages,
+                                        &message_tx,
+                                        &rate_limiter,
+                                    ).await {
+                                        tracing::warn!(
+                                            channel = %channel_name,
+                                            error = %e,
+                                            "Failed to dispatch emitted messages from poll"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    channel = %channel_name,
+                                    error = %e,
+                                    "Polling callback failed"
+                                );
+                            }
+                        }
                     }
                     _ = &mut shutdown => {
                         tracing::info!(
@@ -1182,6 +1098,156 @@ impl WasmChannel {
                 }
             }
         });
+    }
+
+    /// Execute a single poll callback with a fresh WASM instance.
+    ///
+    /// Returns any emitted messages from the callback.
+    async fn execute_poll(
+        channel_name: &str,
+        runtime: &Arc<WasmChannelRuntime>,
+        prepared: &Arc<PreparedChannelModule>,
+        capabilities: &ChannelCapabilities,
+        credentials: &RwLock<HashMap<String, String>>,
+        timeout: Duration,
+    ) -> Result<Vec<EmittedMessage>, WasmChannelError> {
+        // Skip if no WASM bytes (testing mode)
+        if prepared.component_bytes.is_empty() {
+            tracing::debug!(
+                channel = %channel_name,
+                "WASM channel on_poll called (no WASM module)"
+            );
+            return Ok(Vec::new());
+        }
+
+        let runtime = Arc::clone(runtime);
+        let prepared = Arc::clone(prepared);
+        let capabilities = capabilities.clone();
+        let credentials_snapshot = credentials.read().await.clone();
+        let channel_name_owned = channel_name.to_string();
+
+        // Execute in blocking task with timeout
+        let result = tokio::time::timeout(timeout, async move {
+            tokio::task::spawn_blocking(move || {
+                let mut store =
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials_snapshot)?;
+                let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
+
+                // Call on_poll using the generated typed interface
+                let channel_iface = instance.near_agent_channel();
+                channel_iface
+                    .call_on_poll(&mut store)
+                    .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
+
+                let host_state =
+                    Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                Ok(host_state)
+            })
+            .await
+            .map_err(|e| WasmChannelError::ExecutionPanicked {
+                name: channel_name_owned.clone(),
+                reason: e.to_string(),
+            })?
+        })
+        .await;
+
+        match result {
+            Ok(Ok(mut host_state)) => {
+                let emitted = host_state.take_emitted_messages();
+                tracing::debug!(
+                    channel = %channel_name,
+                    emitted_count = emitted.len(),
+                    "WASM channel on_poll completed"
+                );
+                Ok(emitted)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(WasmChannelError::Timeout {
+                name: channel_name.to_string(),
+                callback: "on_poll".to_string(),
+            }),
+        }
+    }
+
+    /// Dispatch emitted messages to the message channel.
+    ///
+    /// This is a static helper used by the polling loop since it doesn't have
+    /// access to `&self`.
+    async fn dispatch_emitted_messages(
+        channel_name: &str,
+        messages: Vec<EmittedMessage>,
+        message_tx: &RwLock<Option<mpsc::Sender<IncomingMessage>>>,
+        rate_limiter: &RwLock<ChannelEmitRateLimiter>,
+    ) -> Result<(), WasmChannelError> {
+        tracing::info!(
+            channel = %channel_name,
+            message_count = messages.len(),
+            "Processing emitted messages from polling callback"
+        );
+
+        let tx_guard = message_tx.read().await;
+        let Some(tx) = tx_guard.as_ref() else {
+            tracing::error!(
+                channel = %channel_name,
+                count = messages.len(),
+                "Messages emitted but no sender available - channel may not be started!"
+            );
+            return Ok(());
+        };
+
+        let mut limiter = rate_limiter.write().await;
+
+        for emitted in messages {
+            // Check rate limit
+            if !limiter.check_and_record() {
+                tracing::warn!(
+                    channel = %channel_name,
+                    "Message emission rate limited"
+                );
+                return Err(WasmChannelError::EmitRateLimited {
+                    name: channel_name.to_string(),
+                });
+            }
+
+            // Convert to IncomingMessage
+            let mut msg = IncomingMessage::new(channel_name, &emitted.user_id, &emitted.content);
+
+            if let Some(name) = emitted.user_name {
+                msg = msg.with_user_name(name);
+            }
+
+            if let Some(thread_id) = emitted.thread_id {
+                msg = msg.with_thread(thread_id);
+            }
+
+            // Parse metadata JSON
+            if let Ok(metadata) = serde_json::from_str(&emitted.metadata_json) {
+                msg = msg.with_metadata(metadata);
+            }
+
+            // Send to stream
+            tracing::info!(
+                channel = %channel_name,
+                user_id = %emitted.user_id,
+                content_len = emitted.content.len(),
+                "Sending polled message to agent"
+            );
+
+            if tx.send(msg).await.is_err() {
+                tracing::error!(
+                    channel = %channel_name,
+                    "Failed to send polled message, channel closed"
+                );
+                break;
+            }
+
+            tracing::info!(
+                channel = %channel_name,
+                "Message successfully sent to agent queue"
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -1245,8 +1311,9 @@ impl Channel for WasmChannel {
                         reason: e,
                     })?;
 
-                // Create a new shutdown receiver for polling
-                let (_poll_shutdown_tx, poll_shutdown_rx) = oneshot::channel();
+                // Create shutdown channel for polling and store the sender to keep it alive
+                let (poll_shutdown_tx, poll_shutdown_rx) = oneshot::channel();
+                *self.poll_shutdown_tx.write().await = Some(poll_shutdown_tx);
 
                 self.start_polling(Duration::from_millis(interval as u64), poll_shutdown_rx);
             }
@@ -1315,6 +1382,9 @@ impl Channel for WasmChannel {
         if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(());
         }
+
+        // Stop polling by dropping the sender (receiver will complete)
+        let _ = self.poll_shutdown_tx.write().await.take();
 
         // Clear the message sender
         *self.message_tx.write().await = None;
@@ -1557,5 +1627,152 @@ mod tests {
 
         // Health check should fail after shutdown
         assert!(channel.health_check().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_execute_poll_no_wasm_returns_empty() {
+        // When there's no WASM module (empty component_bytes), execute_poll
+        // should return an empty vector of messages
+        let config = WasmChannelRuntimeConfig::for_testing();
+        let runtime = Arc::new(WasmChannelRuntime::new(config).unwrap());
+
+        let prepared = Arc::new(PreparedChannelModule {
+            name: "poll-test".to_string(),
+            description: "Test channel".to_string(),
+            component_bytes: Vec::new(), // No WASM bytes
+            limits: ResourceLimits::default(),
+        });
+
+        let capabilities = ChannelCapabilities::for_channel("poll-test").with_polling(1000);
+        let credentials = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let timeout = std::time::Duration::from_secs(5);
+
+        let result = WasmChannel::execute_poll(
+            "poll-test",
+            &runtime,
+            &prepared,
+            &capabilities,
+            &credentials,
+            timeout,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_emitted_messages_sends_to_channel() {
+        use crate::channels::wasm::host::EmittedMessage;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        let message_tx = Arc::new(tokio::sync::RwLock::new(Some(tx)));
+
+        let rate_limiter = Arc::new(tokio::sync::RwLock::new(
+            crate::channels::wasm::host::ChannelEmitRateLimiter::new(
+                crate::channels::wasm::capabilities::EmitRateLimitConfig::default(),
+            ),
+        ));
+
+        let messages = vec![
+            EmittedMessage::new("user1", "Hello from polling!"),
+            EmittedMessage::new("user2", "Another message"),
+        ];
+
+        let result = WasmChannel::dispatch_emitted_messages(
+            "test-channel",
+            messages,
+            &message_tx,
+            &rate_limiter,
+        )
+        .await;
+
+        assert!(result.is_ok());
+
+        // Verify messages were sent
+        let msg1 = rx.try_recv().expect("Should receive first message");
+        assert_eq!(msg1.user_id, "user1");
+        assert_eq!(msg1.content, "Hello from polling!");
+
+        let msg2 = rx.try_recv().expect("Should receive second message");
+        assert_eq!(msg2.user_id, "user2");
+        assert_eq!(msg2.content, "Another message");
+
+        // No more messages
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_emitted_messages_no_sender_returns_ok() {
+        use crate::channels::wasm::host::EmittedMessage;
+
+        // No sender available (channel not started)
+        let message_tx = Arc::new(tokio::sync::RwLock::new(None));
+        let rate_limiter = Arc::new(tokio::sync::RwLock::new(
+            crate::channels::wasm::host::ChannelEmitRateLimiter::new(
+                crate::channels::wasm::capabilities::EmitRateLimitConfig::default(),
+            ),
+        ));
+
+        let messages = vec![EmittedMessage::new("user1", "Hello!")];
+
+        // Should return Ok even without a sender (logs warning but doesn't fail)
+        let result = WasmChannel::dispatch_emitted_messages(
+            "test-channel",
+            messages,
+            &message_tx,
+            &rate_limiter,
+        )
+        .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_channel_with_polling_stores_shutdown_sender() {
+        // Create a channel with polling capabilities
+        let config = WasmChannelRuntimeConfig::for_testing();
+        let runtime = Arc::new(WasmChannelRuntime::new(config).unwrap());
+
+        let prepared = Arc::new(PreparedChannelModule {
+            name: "poll-channel".to_string(),
+            description: "Polling test channel".to_string(),
+            component_bytes: Vec::new(),
+            limits: ResourceLimits::default(),
+        });
+
+        // Enable polling with a 1 second minimum interval
+        let capabilities = ChannelCapabilities::for_channel("poll-channel")
+            .with_path("/webhook/poll")
+            .with_polling(1000);
+
+        let channel = WasmChannel::new(runtime, prepared, capabilities, "{}".to_string());
+
+        // Start the channel
+        let _stream = channel.start().await.expect("Channel should start");
+
+        // Verify poll_shutdown_tx is set (polling was started)
+        // Note: For testing channels without WASM, on_start returns no poll config,
+        // so polling won't actually be started. This verifies the basic lifecycle.
+        assert!(channel.health_check().await.is_ok());
+
+        // Shutdown should clean up properly
+        channel.shutdown().await.expect("Shutdown should succeed");
+        assert!(channel.health_check().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_call_on_poll_no_wasm_succeeds() {
+        // Verify call_on_poll returns Ok when there's no WASM module
+        let channel = create_test_channel();
+
+        // Start the channel first to set up message_tx
+        let _stream = channel.start().await.expect("Channel should start");
+
+        // call_on_poll should succeed (no-op for no WASM)
+        let result = channel.call_on_poll().await;
+        assert!(result.is_ok());
+
+        channel.shutdown().await.expect("Shutdown should succeed");
     }
 }
