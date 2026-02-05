@@ -1,11 +1,11 @@
-//! NEAR Agent - Main entry point.
+//! IronClaw - Main entry point.
 
 use std::sync::Arc;
 
 use clap::Parser;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-use near_agent::{
+use ironclaw::{
     agent::{Agent, AgentDeps},
     channels::{
         AppEvent, ChannelManager, HttpChannel, ReplChannel, TuiChannel,
@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     // automatically run the setup wizard
     if !cli.no_setup {
         let settings = Settings::load();
-        let session_path = near_agent::llm::session::default_session_path();
+        let session_path = ironclaw::llm::session::default_session_path();
 
         if !settings.setup_completed && !session_path.exists() {
             println!("First run detected. Starting setup wizard...");
@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize tracing and channels based on mode
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("near_agent=info,tower_http=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("ironclaw=info,tower_http=debug"));
 
     // Determine which mode to use: REPL, single message, or TUI
     let use_repl = cli.repl || cli.message.is_some();
@@ -150,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         (None, None, None)
     };
 
-    tracing::info!("Starting NEAR Agent...");
+    tracing::info!("Starting IronClaw...");
     tracing::info!("Loaded configuration for agent: {}", config.agent.name);
     tracing::info!("NEAR AI session authenticated");
 
@@ -578,7 +578,7 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Returns the number of credentials injected.
 async fn inject_channel_credentials(
-    channel: &Arc<near_agent::channels::wasm::WasmChannel>,
+    channel: &Arc<ironclaw::channels::wasm::WasmChannel>,
     secrets: &dyn SecretsStore,
     channel_name: &str,
 ) -> anyhow::Result<usize> {

@@ -1,9 +1,9 @@
 [package]
-name = "near-agent"
+name = "ironclaw"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "LLM-powered autonomous agent for the NEAR AI marketplace"
+description = "Secure personal AI assistant that protects your data and expands its capabilities on the fly"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

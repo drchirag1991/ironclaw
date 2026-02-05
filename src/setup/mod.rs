@@ -1,4 +1,4 @@
-//! Interactive setup wizard for NEAR Agent.
+//! Interactive setup wizard for IronClaw.
 //!
 //! Provides a guided setup experience for:
 //! - NEAR AI authentication
@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use near_agent::setup::SetupWizard;
+//! use ironclaw::setup::SetupWizard;
 //!
 //! let mut wizard = SetupWizard::new();
 //! wizard.run().await?;

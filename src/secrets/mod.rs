@@ -31,7 +31,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use near_agent::secrets::{SecretsStore, PostgresSecretsStore, SecretsCrypto, CreateSecretParams};
+//! use ironclaw::secrets::{SecretsStore, PostgresSecretsStore, SecretsCrypto, CreateSecretParams};
 //! use secrecy::SecretString;
 //!
 //! // Initialize crypto with master key from environment

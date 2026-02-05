@@ -1,4 +1,4 @@
-//! Configuration for the NEAR Agent.
+//! Configuration for IronClaw.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -192,7 +192,7 @@ pub struct NearAiConfig {
     pub base_url: String,
     /// Base URL for auth/refresh endpoints (default: https://private.near.ai)
     pub auth_base_url: String,
-    /// Path to session file (default: ~/.near-agent/session.json)
+    /// Path to session file (default: ~/.ironclaw/session.json)
     pub session_path: PathBuf,
     /// API mode: "responses" (chat-api) or "chat_completions" (cloud-api)
     pub api_mode: NearAiApiMode,
@@ -297,11 +297,11 @@ impl EmbeddingsConfig {
     }
 }
 
-/// Get the default session file path (~/.near-agent/session.json).
+/// Get the default session file path (~/.ironclaw/session.json).
 fn default_session_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".near-agent")
+        .join(".ironclaw")
         .join("session.json")
 }
 
@@ -310,7 +310,7 @@ fn default_session_path() -> PathBuf {
 pub struct ChannelsConfig {
     pub cli: CliConfig,
     pub http: Option<HttpConfig>,
-    /// Directory containing WASM channel modules (default: ~/.near-agent/channels/).
+    /// Directory containing WASM channel modules (default: ~/.ironclaw/channels/).
     pub wasm_channels_dir: std::path::PathBuf,
     /// Whether WASM channels are enabled.
     pub wasm_channels_enabled: bool,
@@ -371,11 +371,11 @@ impl ChannelsConfig {
     }
 }
 
-/// Get the default channels directory (~/.near-agent/channels/).
+/// Get the default channels directory (~/.ironclaw/channels/).
 fn default_channels_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".near-agent")
+        .join(".ironclaw")
         .join("channels")
 }
 
@@ -395,7 +395,7 @@ pub struct AgentConfig {
 impl AgentConfig {
     fn from_env() -> Result<Self, ConfigError> {
         Ok(Self {
-            name: optional_env("AGENT_NAME")?.unwrap_or_else(|| "near-agent".to_string()),
+            name: optional_env("AGENT_NAME")?.unwrap_or_else(|| "ironclaw".to_string()),
             max_parallel_jobs: parse_optional_env("AGENT_MAX_PARALLEL_JOBS", 5)?,
             job_timeout: Duration::from_secs(parse_optional_env("AGENT_JOB_TIMEOUT_SECS", 3600)?),
             stuck_threshold: Duration::from_secs(parse_optional_env(
@@ -447,7 +447,7 @@ impl SafetyConfig {
 pub struct WasmConfig {
     /// Whether WASM tool execution is enabled.
     pub enabled: bool,
-    /// Directory containing installed WASM tools (default: ~/.near-agent/tools/).
+    /// Directory containing installed WASM tools (default: ~/.ironclaw/tools/).
     pub tools_dir: PathBuf,
     /// Default memory limit in bytes (default: 10 MB).
     pub default_memory_limit: u64,
@@ -521,11 +521,11 @@ impl Default for WasmConfig {
     }
 }
 
-/// Get the default tools directory (~/.near-agent/tools/).
+/// Get the default tools directory (~/.ironclaw/tools/).
 fn default_tools_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".near-agent")
+        .join(".ironclaw")
         .join("tools")
 }
 

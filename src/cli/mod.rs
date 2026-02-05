@@ -13,8 +13,10 @@ pub use tool::{ToolCommand, run_tool_command};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "near-agent")]
-#[command(about = "LLM-powered autonomous agent for the NEAR AI marketplace")]
+#[command(name = "ironclaw")]
+#[command(
+    about = "Secure personal AI assistant that protects your data and expands its capabilities"
+)]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]

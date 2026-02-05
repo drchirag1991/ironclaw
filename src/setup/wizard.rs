@@ -53,7 +53,7 @@ pub struct SetupConfig {
     pub channels_only: bool,
 }
 
-/// Interactive setup wizard for NEAR Agent.
+/// Interactive setup wizard for IronClaw.
 pub struct SetupWizard {
     config: SetupConfig,
     settings: Settings,
@@ -87,7 +87,7 @@ impl SetupWizard {
 
     /// Run the setup wizard.
     pub async fn run(&mut self) -> Result<(), SetupError> {
-        print_header("NEAR Agent Setup Wizard");
+        print_header("IronClaw Setup Wizard");
 
         let total_steps = if self.config.channels_only { 1 } else { 3 };
         let mut current_step = 1;
@@ -336,7 +336,7 @@ impl SetupWizard {
         // Discover available WASM channels
         let channels_dir = dirs::home_dir()
             .unwrap_or_default()
-            .join(".near-agent/channels");
+            .join(".ironclaw/channels");
 
         let discovered_channels = discover_wasm_channels(&channels_dir).await;
 
@@ -438,7 +438,7 @@ impl SetupWizard {
         })?;
 
         println!();
-        print_success("Configuration saved to ~/.near-agent/");
+        print_success("Configuration saved to ~/.ironclaw/");
         println!();
 
         // Print summary
@@ -476,7 +476,7 @@ impl SetupWizard {
 
         println!();
         println!("To start the agent, run:");
-        println!("  near-agent");
+        println!("  ironclaw");
         println!();
 
         Ok(())

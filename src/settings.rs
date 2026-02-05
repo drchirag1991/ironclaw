@@ -1,6 +1,6 @@
 //! User settings persistence.
 //!
-//! Stores user preferences like selected model in ~/.near-agent/settings.json.
+//! Stores user preferences like selected model in ~/.ironclaw/settings.json.
 
 use std::path::PathBuf;
 
@@ -55,11 +55,11 @@ pub struct ChannelSettings {
 }
 
 impl Settings {
-    /// Get the default settings file path (~/.near-agent/settings.json).
+    /// Get the default settings file path (~/.ironclaw/settings.json).
     pub fn default_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".near-agent")
+            .join(".ironclaw")
             .join("settings.json")
     }
 

@@ -1,4 +1,4 @@
-//! Error types for the NEAR Agent.
+//! Error types for IronClaw.
 
 use std::time::Duration;
 
