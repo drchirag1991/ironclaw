@@ -99,4 +99,4 @@ pub use router::{
 };
 pub use runtime::{PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig};
 pub use schema::{ChannelCapabilitiesFile, ChannelConfig};
-pub use wrapper::{HttpResponse, WasmChannel};
+pub use wrapper::{HttpResponse, SharedWasmChannel, WasmChannel};

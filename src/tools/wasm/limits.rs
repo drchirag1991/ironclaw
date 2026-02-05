@@ -79,13 +79,16 @@ pub struct WasmResourceLimiter {
 
 impl WasmResourceLimiter {
     /// Create a new limiter with the given memory limit.
+    ///
+    /// Note: max_instances is set to 10 to accommodate WASM Component Model
+    /// which creates multiple internal instances (main component + WASI adapters).
     pub fn new(memory_limit: u64) -> Self {
         Self {
             memory_limit,
             memory_used: 0,
             max_tables: 10,
             tables_created: 0,
-            max_instances: 1,
+            max_instances: 10, // Component model needs multiple instances for WASI
             instances_created: 0,
         }
     }
@@ -157,7 +160,7 @@ impl ResourceLimiter for WasmResourceLimiter {
     }
 
     fn memories(&self) -> usize {
-        // Allow one memory per instance
+        // Allow multiple memories for component model with WASI
         self.max_instances as usize
     }
 }

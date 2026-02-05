@@ -9,13 +9,17 @@ use near_agent::{
     agent::{Agent, AgentDeps},
     channels::{
         AppEvent, ChannelManager, HttpChannel, ReplChannel, TuiChannel,
-        wasm::{WasmChannelLoader, WasmChannelRuntime, WasmChannelRuntimeConfig},
+        wasm::{
+            RegisteredEndpoint, SharedWasmChannel, WasmChannelLoader, WasmChannelRouter,
+            WasmChannelRuntime, WasmChannelRuntimeConfig, WasmChannelServer,
+        },
     },
     cli::{Cli, Command, run_tool_command},
     config::Config,
     history::Store,
     llm::{SessionConfig, create_llm_provider, create_session_manager},
     safety::SafetyLayer,
+    secrets::{PostgresSecretsStore, SecretsCrypto, SecretsStore},
     settings::Settings,
     setup::{SetupConfig, SetupWizard},
     tools::{
@@ -327,6 +331,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Create secrets store if master key is configured (needed for Telegram webhook registration)
+    let secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>> =
+        if let (Some(store), Some(master_key)) = (&store, config.secrets.master_key()) {
+            match SecretsCrypto::new(master_key.clone()) {
+                Ok(crypto) => Some(Arc::new(PostgresSecretsStore::new(
+                    store.pool(),
+                    Arc::new(crypto),
+                ))),
+                Err(e) => {
+                    tracing::warn!("Failed to initialize secrets crypto: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     // Load WASM channels if enabled
     if config.channels.wasm_channels_enabled && config.channels.wasm_channels_dir.exists() {
         match WasmChannelRuntime::new(WasmChannelRuntimeConfig::default()) {
@@ -339,10 +360,140 @@ async fn main() -> anyhow::Result<()> {
                     .await
                 {
                     Ok(results) => {
+                        // Create router for WASM channel webhooks
+                        let wasm_router = Arc::new(WasmChannelRouter::new());
+                        let mut has_webhook_channels = false;
+
                         for channel in results.loaded {
-                            tracing::info!("Loaded WASM channel: {}", channel.channel_name());
-                            channels.add(Box::new(channel));
+                            let channel_name = channel.channel_name().to_string();
+                            tracing::info!("Loaded WASM channel: {}", channel_name);
+
+                            // Get webhook secret for this channel from secrets store
+                            let webhook_secret = if let Some(ref secrets) = secrets_store {
+                                let secret_name = format!("{}_webhook_secret", channel_name);
+                                secrets
+                                    .get_decrypted("default", &secret_name)
+                                    .await
+                                    .ok()
+                                    .map(|s| s.expose().to_string())
+                            } else {
+                                None
+                            };
+
+                            // Register channel with router for webhook handling
+                            // Use known webhook path based on channel name
+                            let webhook_path = format!("/webhook/{}", channel_name);
+                            let endpoints = vec![RegisteredEndpoint {
+                                channel_name: channel_name.clone(),
+                                path: webhook_path.clone(),
+                                methods: vec!["POST".to_string()],
+                                require_secret: webhook_secret.is_some(),
+                            }];
+
+                            let channel_arc = Arc::new(channel);
+
+                            // Clone webhook_secret before moving it to register()
+                            // We need it later for Telegram API registration
+                            let webhook_secret_for_telegram = webhook_secret.clone();
+
+                            tracing::info!(
+                                channel = %channel_name,
+                                has_webhook_secret = webhook_secret.is_some(),
+                                "Registering channel with router"
+                            );
+
+                            wasm_router
+                                .register(Arc::clone(&channel_arc), endpoints, webhook_secret)
+                                .await;
+                            has_webhook_channels = true;
+
+                            // Set up Telegram channel credentials and optionally register webhook
+                            if channel_name == "telegram" {
+                                if let Some(ref secrets) = secrets_store {
+                                    // Inject bot token for HTTP request URL substitution
+                                    // This is needed for both webhook and polling modes
+                                    match inject_telegram_credentials(
+                                        &channel_arc,
+                                        secrets.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            tracing::debug!("Telegram bot token injected");
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to inject Telegram credentials: {}",
+                                                e
+                                            );
+                                            tracing::warn!(
+                                                "Telegram channel may not be able to send responses"
+                                            );
+                                        }
+                                    }
+
+                                    // Register webhook if tunnel URL is configured
+                                    // Use the SAME webhook_secret that the router expects (from secrets store)
+                                    if let Some(ref tunnel_url) = config.tunnel.public_url {
+                                        match register_telegram_webhook(
+                                            &channel_arc,
+                                            tunnel_url,
+                                            webhook_secret_for_telegram.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                tracing::info!(
+                                                    "Telegram webhook registered at {}/webhook/telegram",
+                                                    tunnel_url
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "Failed to register Telegram webhook: {}",
+                                                    e
+                                                );
+                                                tracing::warn!(
+                                                    "Telegram will fall back to polling mode"
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "Telegram channel loaded but secrets store not available"
+                                    );
+                                    tracing::warn!(
+                                        "Set SECRETS_MASTER_KEY to enable Telegram bot token injection"
+                                    );
+                                }
+                            }
+
+                            // Wrap in SharedWasmChannel for ChannelManager
+                            // Both the router and ChannelManager share the same underlying channel
+                            channels.add(Box::new(SharedWasmChannel::new(channel_arc)));
                         }
+
+                        // Start WASM channel webhook server if we have channels with webhooks
+                        if has_webhook_channels && config.tunnel.public_url.is_some() {
+                            let server = WasmChannelServer::new(wasm_router);
+                            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
+                            match server.start(addr).await {
+                                Ok(_handle) => {
+                                    tracing::info!(
+                                        "WASM channel webhook server started on {}",
+                                        addr
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to start WASM channel webhook server: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+
                         for (path, err) in &results.errors {
                             tracing::warn!(
                                 "Failed to load WASM channel {}: {}",
@@ -405,5 +556,69 @@ async fn main() -> anyhow::Result<()> {
     agent.run().await?;
 
     tracing::info!("Agent shutdown complete");
+    Ok(())
+}
+
+/// Inject Telegram bot token into the channel's credentials.
+///
+/// This allows the WASM channel to use `{TELEGRAM_BOT_TOKEN}` in HTTP URLs
+/// without ever seeing the actual token value. Required for both webhook
+/// and polling modes to send responses.
+async fn inject_telegram_credentials(
+    channel: &Arc<near_agent::channels::wasm::WasmChannel>,
+    secrets: &dyn SecretsStore,
+) -> anyhow::Result<()> {
+    tracing::info!("Injecting Telegram bot token into channel credentials");
+
+    // Get bot token from secrets
+    let decrypted = secrets
+        .get_decrypted("default", "telegram_bot_token")
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to get telegram_bot_token from secrets");
+            anyhow::anyhow!("Failed to get Telegram bot token: {}", e)
+        })?;
+
+    let bot_token = decrypted.expose();
+    let token_len = bot_token.len();
+
+    // Inject the token into the channel's credentials for URL substitution
+    channel
+        .set_credential("TELEGRAM_BOT_TOKEN", bot_token.to_string())
+        .await;
+
+    // Verify injection
+    let creds = channel.get_credentials().await;
+    tracing::info!(
+        token_length = token_len,
+        has_token = creds.contains_key("TELEGRAM_BOT_TOKEN"),
+        credential_count = creds.len(),
+        "Telegram bot token injected successfully"
+    );
+
+    Ok(())
+}
+
+/// Register Telegram webhook for instant message delivery.
+///
+/// Calls the Telegram setWebhook API. Assumes credentials have already been
+/// injected via `inject_telegram_credentials` (gets token from channel).
+async fn register_telegram_webhook(
+    channel: &Arc<near_agent::channels::wasm::WasmChannel>,
+    tunnel_url: &str,
+    webhook_secret: Option<&str>,
+) -> anyhow::Result<()> {
+    // Get the bot token via the public getter
+    let credentials = channel.get_credentials().await;
+    let bot_token = credentials.get("TELEGRAM_BOT_TOKEN").ok_or_else(|| {
+        anyhow::anyhow!("Bot token not injected - call inject_telegram_credentials first")
+    })?;
+
+    // Register the webhook with Telegram API
+    channel
+        .register_telegram_webhook(tunnel_url, bot_token, webhook_secret)
+        .await
+        .map_err(|e| anyhow::anyhow!("Webhook registration failed: {}", e))?;
+
     Ok(())
 }

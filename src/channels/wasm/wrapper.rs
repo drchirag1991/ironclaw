@@ -37,7 +37,8 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 use wasmtime::Store;
-use wasmtime::component::{Component, Linker, Val};
+use wasmtime::component::{Component, Linker};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 use crate::channels::wasm::capabilities::ChannelCapabilities;
 use crate::channels::wasm::error::WasmChannelError;
@@ -50,19 +51,285 @@ use crate::error::ChannelError;
 use crate::tools::wasm::LogLevel;
 use crate::tools::wasm::WasmResourceLimiter;
 
+// Generate component model bindings from the WIT file
+wasmtime::component::bindgen!({
+    path: "wit/channel.wit",
+    world: "sandboxed-channel",
+    async: false,
+    with: {
+        // Use our own store data type
+    },
+});
+
 /// Store data for WASM channel execution.
 ///
-/// Contains the resource limiter and channel-specific host state.
+/// Contains the resource limiter, channel-specific host state, and WASI context.
 struct ChannelStoreData {
     limiter: WasmResourceLimiter,
     host_state: ChannelHostState,
+    wasi: WasiCtx,
+    table: ResourceTable,
+    /// Injected credentials for URL substitution (e.g., bot tokens).
+    /// Keys are placeholder names like "TELEGRAM_BOT_TOKEN".
+    credentials: HashMap<String, String>,
 }
 
 impl ChannelStoreData {
-    fn new(memory_limit: u64, channel_name: &str, capabilities: ChannelCapabilities) -> Self {
+    fn new(
+        memory_limit: u64,
+        channel_name: &str,
+        capabilities: ChannelCapabilities,
+        credentials: HashMap<String, String>,
+    ) -> Self {
+        // Create a minimal WASI context (no filesystem, no env vars for security)
+        let wasi = WasiCtxBuilder::new().build();
+
         Self {
             limiter: WasmResourceLimiter::new(memory_limit),
             host_state: ChannelHostState::new(channel_name, capabilities),
+            wasi,
+            table: ResourceTable::new(),
+            credentials,
+        }
+    }
+
+    /// Inject credentials into a URL by replacing placeholders.
+    ///
+    /// Replaces patterns like `{TELEGRAM_BOT_TOKEN}` with actual values from
+    /// the injected credentials map. This allows WASM channels to reference
+    /// credentials without ever seeing the actual values.
+    fn inject_credentials_into_url(&self, url: &str) -> String {
+        let mut result = url.to_string();
+
+        tracing::debug!(
+            url = %url,
+            credential_count = self.credentials.len(),
+            credential_names = ?self.credentials.keys().collect::<Vec<_>>(),
+            "Injecting credentials into URL"
+        );
+
+        // Replace all known placeholders from the credentials map
+        for (name, value) in &self.credentials {
+            let placeholder = format!("{{{}}}", name);
+            if result.contains(&placeholder) {
+                tracing::debug!(
+                    placeholder = %placeholder,
+                    "Found and replacing credential placeholder"
+                );
+                result = result.replace(&placeholder, value);
+            }
+        }
+
+        // Check if any placeholders remain (indicates missing credential)
+        if result.contains('{') && result.contains('}') {
+            tracing::warn!(
+                original_url = %url,
+                result_url = %result,
+                "URL may contain unresolved placeholders"
+            );
+        }
+
+        result
+    }
+}
+
+// Implement WasiView to provide WASI context and resource table
+impl WasiView for ChannelStoreData {
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.wasi
+    }
+
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
+// Implement the generated Host trait for channel-host interface
+impl near::agent::channel_host::Host for ChannelStoreData {
+    fn log(&mut self, level: near::agent::channel_host::LogLevel, message: String) {
+        let log_level = match level {
+            near::agent::channel_host::LogLevel::Trace => LogLevel::Trace,
+            near::agent::channel_host::LogLevel::Debug => LogLevel::Debug,
+            near::agent::channel_host::LogLevel::Info => LogLevel::Info,
+            near::agent::channel_host::LogLevel::Warn => LogLevel::Warn,
+            near::agent::channel_host::LogLevel::Error => LogLevel::Error,
+        };
+        let _ = self.host_state.log(log_level, message);
+    }
+
+    fn now_millis(&mut self) -> u64 {
+        self.host_state.now_millis()
+    }
+
+    fn workspace_read(&mut self, path: String) -> Option<String> {
+        self.host_state.workspace_read(&path).ok().flatten()
+    }
+
+    fn workspace_write(&mut self, path: String, content: String) -> Result<(), String> {
+        self.host_state
+            .workspace_write(&path, content)
+            .map_err(|e| e.to_string())
+    }
+
+    fn http_request(
+        &mut self,
+        method: String,
+        url: String,
+        headers_json: String,
+        body: Option<Vec<u8>>,
+    ) -> Result<near::agent::channel_host::HttpResponse, String> {
+        tracing::info!(
+            method = %method,
+            original_url = %url,
+            body_len = body.as_ref().map(|b| b.len()).unwrap_or(0),
+            "WASM http_request called"
+        );
+
+        // Inject credentials into URL (e.g., replace {TELEGRAM_BOT_TOKEN} with actual token)
+        let injected_url = self.inject_credentials_into_url(&url);
+
+        // Log whether injection happened (without revealing the token)
+        let url_changed = injected_url != url;
+        tracing::info!(
+            url_changed = url_changed,
+            has_bot_token = injected_url.contains("/bot") && !injected_url.contains("{"),
+            "URL after credential injection"
+        );
+
+        // Check if HTTP is allowed for this URL
+        self.host_state
+            .check_http_allowed(&injected_url, &method)
+            .map_err(|e| {
+                tracing::error!(error = %e, "HTTP not allowed");
+                format!("HTTP not allowed: {}", e)
+            })?;
+
+        // Record the request for rate limiting
+        self.host_state.record_http_request().map_err(|e| {
+            tracing::error!(error = %e, "Rate limit exceeded");
+            format!("Rate limit exceeded: {}", e)
+        })?;
+
+        // Parse headers
+        let headers: std::collections::HashMap<String, String> =
+            serde_json::from_str(&headers_json).unwrap_or_default();
+
+        tracing::debug!(header_count = headers.len(), "Parsed request headers");
+
+        let url = injected_url;
+
+        // Make the HTTP request using blocking I/O
+        // We're already in a spawn_blocking context, so we can use block_on
+        let result = tokio::runtime::Handle::current().block_on(async {
+            let client = reqwest::Client::new();
+
+            let mut request = match method.to_uppercase().as_str() {
+                "GET" => client.get(&url),
+                "POST" => client.post(&url),
+                "PUT" => client.put(&url),
+                "DELETE" => client.delete(&url),
+                "PATCH" => client.patch(&url),
+                "HEAD" => client.head(&url),
+                _ => return Err(format!("Unsupported HTTP method: {}", method)),
+            };
+
+            // Add headers
+            for (key, value) in headers {
+                request = request.header(&key, &value);
+            }
+
+            // Add body if present
+            if let Some(body_bytes) = body {
+                request = request.body(body_bytes);
+            }
+
+            // Send request with timeout
+            let response = request
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+            let status = response.status().as_u16();
+            let response_headers: std::collections::HashMap<String, String> = response
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.to_str()
+                        .ok()
+                        .map(|v| (k.as_str().to_string(), v.to_string()))
+                })
+                .collect();
+            let headers_json = serde_json::to_string(&response_headers).unwrap_or_default();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|e| format!("Failed to read response body: {}", e))?
+                .to_vec();
+
+            tracing::info!(
+                status = status,
+                body_len = body.len(),
+                "HTTP response received"
+            );
+
+            // Log response body for debugging (truncated)
+            if let Ok(body_str) = std::str::from_utf8(&body) {
+                let truncated = if body_str.len() > 500 {
+                    format!("{}...", &body_str[..500])
+                } else {
+                    body_str.to_string()
+                };
+                tracing::debug!(body = %truncated, "Response body");
+            }
+
+            Ok(near::agent::channel_host::HttpResponse {
+                status,
+                headers_json,
+                body,
+            })
+        });
+
+        match &result {
+            Ok(resp) => {
+                tracing::info!(status = resp.status, "http_request completed successfully");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "http_request failed");
+            }
+        }
+
+        result
+    }
+
+    fn secret_exists(&mut self, name: String) -> bool {
+        self.host_state.secret_exists(&name)
+    }
+
+    fn emit_message(&mut self, msg: near::agent::channel_host::EmittedMessage) {
+        tracing::info!(
+            user_id = %msg.user_id,
+            user_name = ?msg.user_name,
+            content_len = msg.content.len(),
+            "WASM emit_message called"
+        );
+
+        let mut emitted = EmittedMessage::new(msg.user_id.clone(), msg.content.clone());
+        if let Some(name) = msg.user_name {
+            emitted = emitted.with_user_name(name);
+        }
+        if let Some(tid) = msg.thread_id {
+            emitted = emitted.with_thread_id(tid);
+        }
+        emitted = emitted.with_metadata(msg.metadata_json);
+
+        match self.host_state.emit_message(emitted) {
+            Ok(()) => {
+                tracing::info!("Message emitted to host state successfully");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to emit message to host state");
+            }
         }
     }
 }
@@ -102,6 +369,10 @@ pub struct WasmChannel {
 
     /// Registered HTTP endpoints.
     endpoints: RwLock<Vec<RegisteredEndpoint>>,
+
+    /// Injected credentials for HTTP requests (e.g., bot tokens).
+    /// Keys are placeholder names like "TELEGRAM_BOT_TOKEN".
+    credentials: RwLock<HashMap<String, String>>,
 }
 
 impl WasmChannel {
@@ -127,7 +398,21 @@ impl WasmChannel {
             rate_limiter: RwLock::new(rate_limiter),
             shutdown_tx: RwLock::new(None),
             endpoints: RwLock::new(Vec::new()),
+            credentials: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Set a credential for URL injection.
+    pub async fn set_credential(&self, name: &str, value: String) {
+        self.credentials
+            .write()
+            .await
+            .insert(name.to_string(), value);
+    }
+
+    /// Get a snapshot of credentials for use in callbacks.
+    pub async fn get_credentials(&self) -> HashMap<String, String> {
+        self.credentials.read().await.clone()
     }
 
     /// Get the channel name.
@@ -145,155 +430,177 @@ impl WasmChannel {
         self.endpoints.read().await.clone()
     }
 
-    /// Add channel host functions to the linker.
+    /// Register a webhook URL with Telegram.
     ///
-    /// These functions are imported by the WASM channel module.
-    fn add_host_functions(linker: &mut Linker<ChannelStoreData>) -> Result<(), WasmChannelError> {
-        // host.log(level: log-level, message: string)
-        linker
-            .root()
-            .func_wrap(
-                "log",
-                |mut ctx: wasmtime::StoreContextMut<'_, ChannelStoreData>,
-                 (level, message): (i32, String)| {
-                    let log_level = match level {
-                        0 => LogLevel::Trace,
-                        1 => LogLevel::Debug,
-                        2 => LogLevel::Info,
-                        3 => LogLevel::Warn,
-                        4 => LogLevel::Error,
-                        _ => LogLevel::Info,
-                    };
-                    // Ignore errors from logging (rate limiting)
-                    let _ = ctx.data_mut().host_state.log(log_level, message);
-                    Ok(())
-                },
-            )
-            .map_err(|e| WasmChannelError::Config(format!("Failed to add log function: {}", e)))?;
+    /// Called during channel startup if tunnel_url is configured.
+    /// This enables instant message delivery instead of polling.
+    pub async fn register_telegram_webhook(
+        &self,
+        tunnel_url: &str,
+        bot_token: &str,
+        secret_token: Option<&str>,
+    ) -> Result<(), WasmChannelError> {
+        let webhook_url = format!("{}/webhook/telegram", tunnel_url);
 
-        // host.now-millis() -> u64
-        linker
-            .root()
-            .func_wrap(
-                "now-millis",
-                |ctx: wasmtime::StoreContextMut<'_, ChannelStoreData>,
-                 (): ()|
-                 -> anyhow::Result<(u64,)> {
-                    Ok((ctx.data().host_state.now_millis(),))
-                },
-            )
-            .map_err(|e| {
-                WasmChannelError::Config(format!("Failed to add now-millis function: {}", e))
-            })?;
+        tracing::info!(
+            channel = %self.name,
+            webhook_url = %webhook_url,
+            "Registering Telegram webhook"
+        );
 
-        // host.workspace-read(path: string) -> option<string>
-        linker
-            .root()
-            .func_wrap(
-                "workspace-read",
-                |ctx: wasmtime::StoreContextMut<'_, ChannelStoreData>,
-                 (path,): (String,)|
-                 -> anyhow::Result<(Option<String>,)> {
-                    let result = ctx.data().host_state.workspace_read(&path).ok().flatten();
-                    Ok((result,))
-                },
-            )
-            .map_err(|e| {
-                WasmChannelError::Config(format!("Failed to add workspace-read function: {}", e))
-            })?;
+        // Build form parameters
+        let mut form_params = vec![
+            ("url", webhook_url.as_str()),
+            ("allowed_updates", r#"["message","edited_message"]"#),
+        ];
 
-        // host.workspace-write(path: string, content: string) -> result<_, string>
-        linker
-            .root()
-            .func_wrap(
-                "workspace-write",
-                |mut ctx: wasmtime::StoreContextMut<'_, ChannelStoreData>,
-                 (path, content): (String, String)|
-                 -> anyhow::Result<(Result<(), String>,)> {
-                    let result = ctx
-                        .data_mut()
-                        .host_state
-                        .workspace_write(&path, content)
-                        .map_err(|e| e.to_string());
-                    Ok((result,))
-                },
-            )
-            .map_err(|e| {
-                WasmChannelError::Config(format!("Failed to add workspace-write function: {}", e))
-            })?;
+        let secret_owned: String;
+        if let Some(secret) = secret_token {
+            secret_owned = secret.to_string();
+            form_params.push(("secret_token", &secret_owned));
+        }
 
-        // host.emit-message(msg: emitted-message)
-        // The message is passed as a record with fields: user-id, user-name, content, thread-id, metadata-json
-        linker
-            .root()
-            .func_wrap(
-                "emit-message",
-                |mut ctx: wasmtime::StoreContextMut<'_, ChannelStoreData>,
-                 (user_id, user_name, content, thread_id, metadata_json): (
-                    String,
-                    Option<String>,
-                    String,
-                    Option<String>,
-                    String,
-                )| {
-                    let mut msg = EmittedMessage::new(user_id, content);
-                    if let Some(name) = user_name {
-                        msg = msg.with_user_name(name);
-                    }
-                    if let Some(tid) = thread_id {
-                        msg = msg.with_thread_id(tid);
-                    }
-                    msg = msg.with_metadata(metadata_json);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
 
-                    // Ignore errors (rate limiting just drops messages)
-                    let _ = ctx.data_mut().host_state.emit_message(msg);
-                    Ok(())
-                },
-            )
-            .map_err(|e| {
-                WasmChannelError::Config(format!("Failed to add emit-message function: {}", e))
-            })?;
+        let response = client
+            .post(format!(
+                "https://api.telegram.org/bot{}/setWebhook",
+                bot_token
+            ))
+            .form(&form_params)
+            .send()
+            .await
+            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
 
-        // host.secret-exists(name: string) -> bool
-        linker
-            .root()
-            .func_wrap(
-                "secret-exists",
-                |ctx: wasmtime::StoreContextMut<'_, ChannelStoreData>,
-                 (name,): (String,)|
-                 -> anyhow::Result<(bool,)> {
-                    Ok((ctx.data().host_state.secret_exists(&name),))
-                },
-            )
-            .map_err(|e| {
-                WasmChannelError::Config(format!("Failed to add secret-exists function: {}", e))
-            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(WasmChannelError::WebhookRegistration {
+                name: self.name.clone(),
+                reason: format!("HTTP {}: {}", status, body),
+            });
+        }
+
+        // Parse Telegram API response
+        let result: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
+
+        if result["ok"].as_bool() != Some(true) {
+            let description = result["description"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string();
+            return Err(WasmChannelError::WebhookRegistration {
+                name: self.name.clone(),
+                reason: description,
+            });
+        }
+
+        tracing::info!(
+            channel = %self.name,
+            webhook_url = %webhook_url,
+            "Telegram webhook registered successfully"
+        );
 
         Ok(())
     }
 
-    /// Execute a WASM callback synchronously (called from spawn_blocking).
+    /// Delete the webhook and switch back to polling mode.
     ///
-    /// This is the core execution logic shared by all callbacks.
-    fn execute_callback_sync<F, R>(
+    /// Called during shutdown if webhook was registered.
+    pub async fn delete_telegram_webhook(&self, bot_token: &str) -> Result<(), WasmChannelError> {
+        tracing::info!(
+            channel = %self.name,
+            "Deleting Telegram webhook"
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
+
+        let response = client
+            .post(format!(
+                "https://api.telegram.org/bot{}/deleteWebhook",
+                bot_token
+            ))
+            .send()
+            .await
+            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(WasmChannelError::WebhookRegistration {
+                name: self.name.clone(),
+                reason: format!("HTTP {} (delete): {}", status, body),
+            });
+        }
+
+        let result: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WasmChannelError::HttpRequest(e.to_string()))?;
+
+        if result["ok"].as_bool() != Some(true) {
+            let description = result["description"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string();
+            return Err(WasmChannelError::WebhookRegistration {
+                name: self.name.clone(),
+                reason: format!("delete failed: {}", description),
+            });
+        }
+
+        tracing::info!(
+            channel = %self.name,
+            "Telegram webhook deleted"
+        );
+
+        Ok(())
+    }
+
+    /// Add channel host functions to the linker using generated bindings.
+    ///
+    /// Uses the wasmtime::component::bindgen! generated `add_to_linker` function
+    /// to properly register all host functions with correct component model signatures.
+    fn add_host_functions(linker: &mut Linker<ChannelStoreData>) -> Result<(), WasmChannelError> {
+        // Add WASI support (required by the component adapter)
+        wasmtime_wasi::add_to_linker_sync(linker).map_err(|e| {
+            WasmChannelError::Config(format!("Failed to add WASI functions: {}", e))
+        })?;
+
+        // Use the generated add_to_linker function from bindgen for our custom interface
+        near::agent::channel_host::add_to_linker(linker, |state| state).map_err(|e| {
+            WasmChannelError::Config(format!("Failed to add host functions: {}", e))
+        })?;
+
+        Ok(())
+    }
+
+    /// Create a fresh store configured for WASM execution.
+    fn create_store(
         runtime: &WasmChannelRuntime,
         prepared: &PreparedChannelModule,
         capabilities: &ChannelCapabilities,
-        export_name: &str,
-        build_args: F,
-    ) -> Result<(R, ChannelHostState), WasmChannelError>
-    where
-        F: FnOnce() -> (
-            Vec<Val>,
-            Box<dyn FnOnce(&Val) -> Result<R, WasmChannelError>>,
-        ),
-    {
+        credentials: HashMap<String, String>,
+    ) -> Result<Store<ChannelStoreData>, WasmChannelError> {
         let engine = runtime.engine();
         let limits = &prepared.limits;
 
         // Create fresh store with channel state (NEAR pattern: fresh instance per call)
-        let store_data =
-            ChannelStoreData::new(limits.memory_bytes, &prepared.name, capabilities.clone());
+        let store_data = ChannelStoreData::new(
+            limits.memory_bytes,
+            &prepared.name,
+            capabilities.clone(),
+            credentials,
+        );
         let mut store = Store::new(engine, store_data);
 
         // Configure fuel if enabled
@@ -310,6 +617,17 @@ impl WasmChannel {
         // Set up resource limiter
         store.limiter(|data| &mut data.limiter);
 
+        Ok(store)
+    }
+
+    /// Instantiate the WASM component using generated bindings.
+    fn instantiate_component(
+        runtime: &WasmChannelRuntime,
+        prepared: &PreparedChannelModule,
+        store: &mut Store<ChannelStoreData>,
+    ) -> Result<SandboxedChannel, WasmChannelError> {
+        let engine = runtime.engine();
+
         // Compile the component (uses cached bytes)
         let component = Component::new(engine, prepared.component_bytes())
             .map_err(|e| WasmChannelError::Compilation(e.to_string()))?;
@@ -318,58 +636,44 @@ impl WasmChannel {
         let mut linker = Linker::new(engine);
         Self::add_host_functions(&mut linker)?;
 
-        // Instantiate the component
-        let instance = linker
-            .instantiate(&mut store, &component)
+        // Instantiate using the generated bindings
+        let instance = SandboxedChannel::instantiate(store, &component, &linker)
             .map_err(|e| WasmChannelError::Instantiation(e.to_string()))?;
 
-        // Get the export function
-        let func = instance
-            .get_func(&mut store, export_name)
-            .ok_or_else(|| WasmChannelError::MissingExport(export_name.to_string()))?;
+        Ok(instance)
+    }
 
-        // Build arguments and result extractor
-        let (args, extract_result) = build_args();
-
-        // Call the function
-        let mut results = vec![Val::Bool(false)]; // Placeholder
-        func.call(&mut store, &args, &mut results).map_err(|e| {
-            let error_str = e.to_string();
-            if error_str.contains("out of fuel") {
-                WasmChannelError::FuelExhausted {
-                    name: prepared.name.clone(),
-                    limit: limits.fuel,
-                }
-            } else if error_str.contains("unreachable") {
-                WasmChannelError::Trapped {
-                    name: prepared.name.clone(),
-                    reason: "unreachable code executed".to_string(),
-                }
-            } else {
-                WasmChannelError::Trapped {
-                    name: prepared.name.clone(),
-                    reason: error_str,
-                }
+    /// Map WASM execution errors to our error types.
+    fn map_wasm_error(e: anyhow::Error, name: &str, fuel_limit: u64) -> WasmChannelError {
+        let error_str = e.to_string();
+        if error_str.contains("out of fuel") {
+            WasmChannelError::FuelExhausted {
+                name: name.to_string(),
+                limit: fuel_limit,
             }
-        })?;
+        } else if error_str.contains("unreachable") {
+            WasmChannelError::Trapped {
+                name: name.to_string(),
+                reason: "unreachable code executed".to_string(),
+            }
+        } else {
+            WasmChannelError::Trapped {
+                name: name.to_string(),
+                reason: error_str,
+            }
+        }
+    }
 
-        // Post-call completion (cleanup)
-        func.post_return(&mut store)
-            .map_err(|e| WasmChannelError::Trapped {
-                name: prepared.name.clone(),
-                reason: format!("post_return failed: {}", e),
-            })?;
-
-        // Extract result
-        let result = extract_result(&results[0])?;
-
-        // Get host state with emitted messages and pending writes
-        let host_state = std::mem::replace(
+    /// Extract host state after callback execution.
+    fn extract_host_state(
+        store: &mut Store<ChannelStoreData>,
+        channel_name: &str,
+        capabilities: &ChannelCapabilities,
+    ) -> ChannelHostState {
+        std::mem::replace(
             &mut store.data_mut().host_state,
-            ChannelHostState::new(&prepared.name, capabilities.clone()),
-        );
-
-        Ok((result, host_state))
+            ChannelHostState::new(channel_name, capabilities.clone()),
+        )
     }
 
     /// Execute the on_start callback.
@@ -394,20 +698,40 @@ impl WasmChannel {
         let capabilities = self.capabilities.clone();
         let config_json = self.config_json.clone();
         let timeout = self.runtime.config().callback_timeout;
-        let channel_name_for_error = self.name.clone();
+        let channel_name = self.name.clone();
+        let credentials = self.get_credentials().await;
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
-                Self::execute_callback_sync(&runtime, &prepared, &capabilities, "on-start", || {
-                    let args = vec![Val::String(config_json)];
-                    let extract = Box::new(|result: &Val| extract_channel_config(result));
-                    (args, extract)
-                })
+                let mut store =
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
+
+                // Call on_start using the generated typed interface
+                let channel_iface = instance.near_agent_channel();
+                let wasm_result = channel_iface
+                    .call_on_start(&mut store, &config_json)
+                    .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
+
+                // Convert the result
+                let config = match wasm_result {
+                    Ok(wit_config) => convert_channel_config(wit_config),
+                    Err(err_msg) => {
+                        return Err(WasmChannelError::CallbackFailed {
+                            name: prepared.name.clone(),
+                            reason: err_msg,
+                        });
+                    }
+                };
+
+                let host_state =
+                    Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                Ok((config, host_state))
             })
             .await
             .map_err(|e| WasmChannelError::ExecutionPanicked {
-                name: channel_name_for_error.clone(),
+                name: channel_name.clone(),
                 reason: e.to_string(),
             })?
         })
@@ -443,6 +767,33 @@ impl WasmChannel {
         body: &[u8],
         secret_validated: bool,
     ) -> Result<HttpResponse, WasmChannelError> {
+        tracing::info!(
+            channel = %self.name,
+            method = method,
+            path = path,
+            body_len = body.len(),
+            secret_validated = secret_validated,
+            "call_on_http_request invoked (webhook received)"
+        );
+
+        // Log the body for debugging (if it looks like JSON)
+        if let Ok(body_str) = std::str::from_utf8(body) {
+            let truncated = if body_str.len() > 1000 {
+                format!("{}...", &body_str[..1000])
+            } else {
+                body_str.to_string()
+            };
+            tracing::debug!(body = %truncated, "Webhook request body");
+        }
+
+        // Log credentials state (without values)
+        let creds = self.get_credentials().await;
+        tracing::info!(
+            credential_count = creds.len(),
+            credential_names = ?creds.keys().collect::<Vec<_>>(),
+            "Credentials available for on_http_request"
+        );
+
         // If no WASM bytes, return 200 OK (for testing)
         if self.prepared.component_bytes.is_empty() {
             tracing::debug!(
@@ -458,6 +809,7 @@ impl WasmChannel {
         let prepared = Arc::clone(&self.prepared);
         let capabilities = self.capabilities.clone();
         let timeout = self.runtime.config().callback_timeout;
+        let credentials = self.get_credentials().await;
 
         // Prepare request data
         let method = method.to_string();
@@ -466,39 +818,39 @@ impl WasmChannel {
         let query_json = serde_json::to_string(&query).unwrap_or_default();
         let body = body.to_vec();
 
-        // Clone name for error handling before moving into closure
-        let channel_name_for_error = self.name.clone();
+        let channel_name = self.name.clone();
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
-                Self::execute_callback_sync(
-                    &runtime,
-                    &prepared,
-                    &capabilities,
-                    "on-http-request",
-                    || {
-                        // Build incoming-http-request record
-                        let request = Val::Record(vec![
-                            ("method".to_string(), Val::String(method)),
-                            ("path".to_string(), Val::String(path)),
-                            ("headers-json".to_string(), Val::String(headers_json)),
-                            ("query-json".to_string(), Val::String(query_json)),
-                            (
-                                "body".to_string(),
-                                Val::List(body.into_iter().map(Val::U8).collect()),
-                            ),
-                            ("secret-validated".to_string(), Val::Bool(secret_validated)),
-                        ]);
-                        let args = vec![request];
-                        let extract = Box::new(|result: &Val| extract_http_response(result));
-                        (args, extract)
-                    },
-                )
+                let mut store =
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
+
+                // Build the WIT request type
+                let wit_request = wit_channel::IncomingHttpRequest {
+                    method,
+                    path,
+                    headers_json,
+                    query_json,
+                    body,
+                    secret_validated,
+                };
+
+                // Call on_http_request using the generated typed interface
+                let channel_iface = instance.near_agent_channel();
+                let wit_response = channel_iface
+                    .call_on_http_request(&mut store, &wit_request)
+                    .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
+
+                let response = convert_http_response(wit_response);
+                let host_state =
+                    Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                Ok((response, host_state))
             })
             .await
             .map_err(|e| WasmChannelError::ExecutionPanicked {
-                name: channel_name_for_error.clone(),
+                name: channel_name.clone(),
                 reason: e.to_string(),
             })?
         })
@@ -544,15 +896,24 @@ impl WasmChannel {
         let capabilities = self.capabilities.clone();
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
+        let credentials = self.get_credentials().await;
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
-                Self::execute_callback_sync(&runtime, &prepared, &capabilities, "on-poll", || {
-                    let args = vec![];
-                    let extract = Box::new(|_result: &Val| Ok(()));
-                    (args, extract)
-                })
+                let mut store =
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
+
+                // Call on_poll using the generated typed interface
+                let channel_iface = instance.near_agent_channel();
+                channel_iface
+                    .call_on_poll(&mut store)
+                    .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
+
+                let host_state =
+                    Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                Ok(((), host_state))
             })
             .await
             .map_err(|e| WasmChannelError::ExecutionPanicked {
@@ -593,6 +954,22 @@ impl WasmChannel {
         thread_id: Option<&str>,
         metadata_json: &str,
     ) -> Result<(), WasmChannelError> {
+        tracing::info!(
+            channel = %self.name,
+            message_id = %message_id,
+            content_len = content.len(),
+            thread_id = ?thread_id,
+            "call_on_respond invoked"
+        );
+
+        // Log credentials state (without values)
+        let creds = self.get_credentials().await;
+        tracing::info!(
+            credential_count = creds.len(),
+            credential_names = ?creds.keys().collect::<Vec<_>>(),
+            "Credentials available for on_respond"
+        );
+
         // If no WASM bytes, do nothing (for testing)
         if self.prepared.component_bytes.is_empty() {
             tracing::debug!(
@@ -608,6 +985,7 @@ impl WasmChannel {
         let capabilities = self.capabilities.clone();
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
+        let credentials = self.get_credentials().await;
 
         // Prepare response data
         let message_id_str = message_id.to_string();
@@ -616,37 +994,62 @@ impl WasmChannel {
         let metadata_json = metadata_json.to_string();
 
         // Execute in blocking task with timeout
+        tracing::info!(channel = %channel_name, "Starting on_respond WASM execution");
+
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
-                Self::execute_callback_sync(
-                    &runtime,
-                    &prepared,
-                    &capabilities,
-                    "on-respond",
-                    || {
-                        // Build agent-response record
-                        let response = Val::Record(vec![
-                            ("message-id".to_string(), Val::String(message_id_str)),
-                            ("content".to_string(), Val::String(content)),
-                            (
-                                "thread-id".to_string(),
-                                match thread_id {
-                                    Some(tid) => Val::Option(Some(Box::new(Val::String(tid)))),
-                                    None => Val::Option(None),
-                                },
-                            ),
-                            ("metadata-json".to_string(), Val::String(metadata_json)),
-                        ]);
-                        let args = vec![response];
-                        let extract = Box::new(|result: &Val| extract_result_unit(result));
-                        (args, extract)
-                    },
-                )
+                tracing::info!("Creating WASM store for on_respond");
+                let mut store =
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+
+                tracing::info!("Instantiating WASM component for on_respond");
+                let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
+
+                // Build the WIT response type
+                let wit_response = wit_channel::AgentResponse {
+                    message_id: message_id_str,
+                    content: content.clone(),
+                    thread_id,
+                    metadata_json,
+                };
+
+                tracing::info!(
+                    content_preview = %if content.len() > 50 { &content[..50] } else { &content },
+                    "Calling WASM on_respond"
+                );
+
+                // Call on_respond using the generated typed interface
+                let channel_iface = instance.near_agent_channel();
+                let wasm_result = channel_iface
+                    .call_on_respond(&mut store, &wit_response)
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "WASM on_respond call failed");
+                        Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel)
+                    })?;
+
+                tracing::info!(wasm_result = ?wasm_result, "WASM on_respond returned");
+
+                // Check for WASM-level errors
+                if let Err(ref err_msg) = wasm_result {
+                    tracing::error!(error = %err_msg, "WASM on_respond returned error");
+                    return Err(WasmChannelError::CallbackFailed {
+                        name: prepared.name.clone(),
+                        reason: err_msg.clone(),
+                    });
+                }
+
+                let host_state =
+                    Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                tracing::info!("on_respond WASM execution completed successfully");
+                Ok(((), host_state))
             })
             .await
-            .map_err(|e| WasmChannelError::ExecutionPanicked {
-                name: channel_name.clone(),
-                reason: e.to_string(),
+            .map_err(|e| {
+                tracing::error!(error = %e, "spawn_blocking panicked");
+                WasmChannelError::ExecutionPanicked {
+                    name: channel_name.clone(),
+                    reason: e.to_string(),
+                }
             })?
         })
         .await;
@@ -674,16 +1077,23 @@ impl WasmChannel {
         &self,
         messages: Vec<EmittedMessage>,
     ) -> Result<(), WasmChannelError> {
+        tracing::info!(
+            channel = %self.name,
+            message_count = messages.len(),
+            "Processing emitted messages from WASM callback"
+        );
+
         if messages.is_empty() {
+            tracing::debug!(channel = %self.name, "No messages emitted");
             return Ok(());
         }
 
         let tx_guard = self.message_tx.read().await;
         let Some(tx) = tx_guard.as_ref() else {
-            tracing::warn!(
+            tracing::error!(
                 channel = %self.name,
                 count = messages.len(),
-                "Messages emitted but no sender available"
+                "Messages emitted but no sender available - channel may not be started!"
             );
             return Ok(());
         };
@@ -719,13 +1129,25 @@ impl WasmChannel {
             }
 
             // Send to stream
+            tracing::info!(
+                channel = %self.name,
+                user_id = %emitted.user_id,
+                content_len = emitted.content.len(),
+                "Sending emitted message to agent"
+            );
+
             if tx.send(msg).await.is_err() {
-                tracing::warn!(
+                tracing::error!(
                     channel = %self.name,
                     "Failed to send emitted message, channel closed"
                 );
                 break;
             }
+
+            tracing::info!(
+                channel = %self.name,
+                "Message successfully sent to agent queue"
+            );
         }
 
         Ok(())
@@ -851,7 +1273,10 @@ impl Channel for WasmChannel {
         }
 
         // Call WASM on_respond
-        let metadata_json = serde_json::to_string(&response.metadata).unwrap_or_default();
+        // IMPORTANT: Use the ORIGINAL message's metadata, not the response's metadata.
+        // The original metadata contains channel-specific routing info (e.g., Telegram chat_id)
+        // that the WASM channel needs to send the reply to the correct destination.
+        let metadata_json = serde_json::to_string(&msg.metadata).unwrap_or_default();
         self.call_on_respond(
             msg.id,
             &response.content,
@@ -915,241 +1340,103 @@ impl std::fmt::Debug for WasmChannel {
 }
 
 // ============================================================================
-// Value Extraction Helpers
+// Shared Channel Wrapper
 // ============================================================================
 
-/// Extract ChannelConfig from a WIT result<channel-config, string>.
-fn extract_channel_config(val: &Val) -> Result<ChannelConfig, WasmChannelError> {
-    // Result is (ok: option<channel-config>, err: option<string>)
-    match val {
-        Val::Result(result) => match result.as_ref() {
-            Ok(Some(config_val)) => extract_channel_config_inner(config_val),
-            Ok(None) => Err(WasmChannelError::InvalidResponse(
-                "on-start returned empty Ok".to_string(),
-            )),
-            Err(Some(err_val)) => {
-                if let Val::String(err) = err_val.as_ref() {
-                    Err(WasmChannelError::CallbackFailed {
-                        name: "channel".to_string(),
-                        reason: err.clone(),
-                    })
-                } else {
-                    Err(WasmChannelError::InvalidResponse(
-                        "on-start error is not a string".to_string(),
-                    ))
-                }
-            }
-            Err(None) => Err(WasmChannelError::InvalidResponse(
-                "on-start returned empty Err".to_string(),
-            )),
-        },
-        // Fallback: try to parse as record directly (for simpler implementations)
-        Val::Record(_) => extract_channel_config_inner(val),
-        _ => Err(WasmChannelError::InvalidResponse(format!(
-            "Expected result or record, got {:?}",
-            std::mem::discriminant(val)
-        ))),
+/// A wrapper around `Arc<WasmChannel>` that implements `Channel`.
+///
+/// This allows sharing the same WasmChannel instance between:
+/// - The WasmChannelRouter (for webhook handling)
+/// - The ChannelManager (for message streaming and responses)
+pub struct SharedWasmChannel {
+    inner: Arc<WasmChannel>,
+}
+
+impl SharedWasmChannel {
+    /// Create a new shared wrapper.
+    pub fn new(channel: Arc<WasmChannel>) -> Self {
+        Self { inner: channel }
+    }
+
+    /// Get the inner Arc.
+    pub fn inner(&self) -> &Arc<WasmChannel> {
+        &self.inner
     }
 }
 
-/// Extract ChannelConfig from a channel-config record.
-fn extract_channel_config_inner(val: &Val) -> Result<ChannelConfig, WasmChannelError> {
-    match val {
-        Val::Record(fields) => {
-            let mut display_name = String::new();
-            let mut http_endpoints = Vec::new();
-            let mut poll = None;
-
-            for (name, field_val) in fields {
-                match name.as_str() {
-                    "display-name" => {
-                        if let Val::String(s) = field_val {
-                            display_name = s.clone();
-                        }
-                    }
-                    "http-endpoints" => {
-                        if let Val::List(endpoints) = field_val {
-                            for ep in endpoints {
-                                if let Ok(endpoint) = extract_http_endpoint_config(ep) {
-                                    http_endpoints.push(endpoint);
-                                }
-                            }
-                        }
-                    }
-                    "poll" => {
-                        if let Val::Option(Some(poll_val)) = field_val {
-                            poll = extract_poll_config(poll_val).ok();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            Ok(ChannelConfig {
-                display_name,
-                http_endpoints,
-                poll,
-            })
-        }
-        _ => Err(WasmChannelError::InvalidResponse(
-            "Expected record for channel-config".to_string(),
-        )),
+impl std::fmt::Debug for SharedWasmChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedWasmChannel")
+            .field("inner", &self.inner)
+            .finish()
     }
 }
 
-/// Extract HttpEndpointConfigSchema from a record.
-fn extract_http_endpoint_config(
-    val: &Val,
-) -> Result<crate::channels::wasm::schema::HttpEndpointConfigSchema, WasmChannelError> {
-    match val {
-        Val::Record(fields) => {
-            let mut path = String::new();
-            let mut methods = Vec::new();
-            let mut require_secret = false;
+#[async_trait]
+impl Channel for SharedWasmChannel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
 
-            for (name, field_val) in fields {
-                match name.as_str() {
-                    "path" => {
-                        if let Val::String(s) = field_val {
-                            path = s.clone();
-                        }
-                    }
-                    "methods" => {
-                        if let Val::List(list) = field_val {
-                            for item in list {
-                                if let Val::String(s) = item {
-                                    methods.push(s.clone());
-                                }
-                            }
-                        }
-                    }
-                    "require-secret" => {
-                        if let Val::Bool(b) = field_val {
-                            require_secret = *b;
-                        }
-                    }
-                    _ => {}
-                }
-            }
+    async fn start(&self) -> Result<MessageStream, ChannelError> {
+        self.inner.start().await
+    }
 
-            Ok(crate::channels::wasm::schema::HttpEndpointConfigSchema {
-                path,
-                methods,
-                require_secret,
-            })
-        }
-        _ => Err(WasmChannelError::InvalidResponse(
-            "Expected record for http-endpoint-config".to_string(),
-        )),
+    async fn respond(
+        &self,
+        msg: &IncomingMessage,
+        response: OutgoingResponse,
+    ) -> Result<(), ChannelError> {
+        self.inner.respond(msg, response).await
+    }
+
+    async fn health_check(&self) -> Result<(), ChannelError> {
+        self.inner.health_check().await
+    }
+
+    async fn shutdown(&self) -> Result<(), ChannelError> {
+        self.inner.shutdown().await
     }
 }
 
-/// Extract PollConfigSchema from a record.
-fn extract_poll_config(
-    val: &Val,
-) -> Result<crate::channels::wasm::schema::PollConfigSchema, WasmChannelError> {
-    match val {
-        Val::Record(fields) => {
-            let mut interval_ms = 30_000;
-            let mut enabled = false;
+// ============================================================================
+// WIT Type Conversion Helpers
+// ============================================================================
 
-            for (name, field_val) in fields {
-                match name.as_str() {
-                    "interval-ms" => {
-                        if let Val::U32(n) = field_val {
-                            interval_ms = *n;
-                        }
-                    }
-                    "enabled" => {
-                        if let Val::Bool(b) = field_val {
-                            enabled = *b;
-                        }
-                    }
-                    _ => {}
-                }
-            }
+// Type aliases for the generated WIT types (exported interface)
+use exports::near::agent::channel as wit_channel;
 
-            Ok(crate::channels::wasm::schema::PollConfigSchema {
-                interval_ms,
-                enabled,
-            })
-        }
-        _ => Err(WasmChannelError::InvalidResponse(
-            "Expected record for poll-config".to_string(),
-        )),
+/// Convert WIT-generated ChannelConfig to our internal type.
+fn convert_channel_config(wit: wit_channel::ChannelConfig) -> ChannelConfig {
+    ChannelConfig {
+        display_name: wit.display_name,
+        http_endpoints: wit
+            .http_endpoints
+            .into_iter()
+            .map(
+                |ep| crate::channels::wasm::schema::HttpEndpointConfigSchema {
+                    path: ep.path,
+                    methods: ep.methods,
+                    require_secret: ep.require_secret,
+                },
+            )
+            .collect(),
+        poll: wit
+            .poll
+            .map(|p| crate::channels::wasm::schema::PollConfigSchema {
+                interval_ms: p.interval_ms,
+                enabled: p.enabled,
+            }),
     }
 }
 
-/// Extract HttpResponse from a WIT outgoing-http-response record.
-fn extract_http_response(val: &Val) -> Result<HttpResponse, WasmChannelError> {
-    match val {
-        Val::Record(fields) => {
-            let mut status = 200u16;
-            let mut headers = HashMap::new();
-            let mut body = Vec::new();
-
-            for (name, field_val) in fields {
-                match name.as_str() {
-                    "status" => {
-                        if let Val::U16(s) = field_val {
-                            status = *s;
-                        }
-                    }
-                    "headers-json" => {
-                        if let Val::String(s) = field_val {
-                            if let Ok(h) = serde_json::from_str::<HashMap<String, String>>(s) {
-                                headers = h;
-                            }
-                        }
-                    }
-                    "body" => {
-                        if let Val::List(bytes) = field_val {
-                            body = bytes
-                                .iter()
-                                .filter_map(|v| if let Val::U8(b) = v { Some(*b) } else { None })
-                                .collect();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            Ok(HttpResponse {
-                status,
-                headers,
-                body,
-            })
-        }
-        _ => Err(WasmChannelError::InvalidResponse(
-            "Expected record for http-response".to_string(),
-        )),
-    }
-}
-
-/// Extract unit result from a WIT result<_, string>.
-fn extract_result_unit(val: &Val) -> Result<(), WasmChannelError> {
-    match val {
-        Val::Result(result) => match result.as_ref() {
-            Ok(_) => Ok(()),
-            Err(Some(err_val)) => {
-                if let Val::String(err) = err_val.as_ref() {
-                    Err(WasmChannelError::CallbackFailed {
-                        name: "channel".to_string(),
-                        reason: err.clone(),
-                    })
-                } else {
-                    Err(WasmChannelError::InvalidResponse(
-                        "Error is not a string".to_string(),
-                    ))
-                }
-            }
-            Err(None) => Err(WasmChannelError::InvalidResponse(
-                "Returned empty Err".to_string(),
-            )),
-        },
-        // Unit return (for on-poll which returns nothing)
-        Val::Tuple(items) if items.is_empty() => Ok(()),
-        _ => Ok(()), // Treat anything else as success for unit-returning callbacks
+/// Convert WIT-generated OutgoingHttpResponse to our HttpResponse type.
+fn convert_http_response(wit: wit_channel::OutgoingHttpResponse) -> HttpResponse {
+    let headers = serde_json::from_str(&wit.headers_json).unwrap_or_default();
+    HttpResponse {
+        status: wit.status,
+        headers,
+        body: wit.body,
     }
 }
 

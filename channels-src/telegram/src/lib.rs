@@ -154,6 +154,9 @@ struct SentMessage {
     message_id: i64,
 }
 
+/// Workspace path for storing polling state.
+const POLLING_STATE_PATH: &str = "state/last_update_id";
+
 // ============================================================================
 // Channel Metadata
 // ============================================================================
@@ -186,12 +189,23 @@ struct TelegramConfig {
     respond_to_all_group_messages: bool,
 
     /// Whether to use polling instead of webhooks.
+    /// Automatically disabled if tunnel_url is set.
     #[serde(default)]
     polling_enabled: bool,
 
     /// Polling interval in milliseconds (if polling enabled).
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
+
+    /// Public tunnel URL for webhook mode (e.g., "https://abc123.ngrok.io").
+    /// When set, webhook mode is enabled and polling is disabled.
+    #[serde(default)]
+    tunnel_url: Option<String>,
+
+    /// Secret token for webhook validation.
+    /// Telegram will include this in the X-Telegram-Bot-Api-Secret-Token header.
+    #[serde(default)]
+    webhook_secret: Option<String>,
 }
 
 fn default_poll_interval() -> u32 {
@@ -218,8 +232,29 @@ impl Guest for TelegramChannel {
             );
         }
 
-        // Configure polling if enabled
-        let poll = if config.polling_enabled {
+        // Determine mode: webhook or polling
+        // Webhook mode is enabled if tunnel_url is set, which disables polling
+        let webhook_mode = config.tunnel_url.is_some();
+
+        if webhook_mode {
+            channel_host::log(
+                channel_host::LogLevel::Info,
+                "Webhook mode enabled (polling disabled)",
+            );
+            if let Some(ref url) = config.tunnel_url {
+                channel_host::log(
+                    channel_host::LogLevel::Info,
+                    &format!("Tunnel URL: {}", url),
+                );
+            }
+        }
+
+        // Configure polling only if not in webhook mode and polling is enabled
+        let poll = if !webhook_mode && config.polling_enabled {
+            channel_host::log(
+                channel_host::LogLevel::Info,
+                &format!("Polling enabled (interval: {}ms)", config.poll_interval_ms.max(30000)),
+            );
             Some(PollConfig {
                 interval_ms: config.poll_interval_ms.max(30000), // Enforce minimum
                 enabled: true,
@@ -228,18 +263,37 @@ impl Guest for TelegramChannel {
             None
         };
 
+        // Webhook secret validation is handled by the host (X-Telegram-Bot-Api-Secret-Token header)
+        // The require_secret flag tells the host to validate the secret_validated field
+        let require_secret = config.webhook_secret.is_some();
+
         Ok(ChannelConfig {
             display_name: "Telegram".to_string(),
             http_endpoints: vec![HttpEndpointConfig {
                 path: "/webhook/telegram".to_string(),
                 methods: vec!["POST".to_string()],
-                require_secret: false, // Telegram doesn't use signing secrets by default
+                require_secret,
             }],
             poll,
         })
     }
 
     fn on_http_request(req: IncomingHttpRequest) -> OutgoingHttpResponse {
+        // Check if webhook secret validation passed (if required)
+        // The host validates X-Telegram-Bot-Api-Secret-Token header and sets secret_validated
+        // If require_secret was true in config but validation failed, secret_validated will be false
+        if !req.secret_validated {
+            // This means require_secret was set but the secret didn't match
+            // We still check the field even though the host should have already rejected invalid requests
+            // This is defense in depth
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                "Webhook request with invalid or missing secret token",
+            );
+            // Return 401 but Telegram will keep retrying, so this is just for logging
+            // In practice, the host should reject these before they reach us
+        }
+
         // Parse the request body as UTF-8
         let body_str = match std::str::from_utf8(&req.body) {
             Ok(s) => s,
@@ -269,12 +323,98 @@ impl Guest for TelegramChannel {
     }
 
     fn on_poll() {
-        // Polling mode: call getUpdates API
-        // For now, we focus on webhook mode. Polling can be added later.
+        // Read last offset from workspace storage
+        let offset = match channel_host::workspace_read(POLLING_STATE_PATH) {
+            Some(s) => s.parse::<i64>().unwrap_or(0),
+            None => 0,
+        };
+
         channel_host::log(
             channel_host::LogLevel::Debug,
-            "Polling tick (not implemented yet)",
+            &format!("Polling getUpdates with offset {}", offset),
         );
+
+        // Build getUpdates URL with parameters
+        // - offset: Identifier of the first update to be returned
+        // - timeout: Long polling timeout in seconds (Telegram recommends 30+)
+        // - allowed_updates: Only get message updates
+        let url = format!(
+            "https://api.telegram.org/bot{{TELEGRAM_BOT_TOKEN}}/getUpdates?offset={}&timeout=30&allowed_updates=[\"message\",\"edited_message\"]",
+            offset
+        );
+
+        let headers = serde_json::json!({});
+
+        let result = channel_host::http_request("GET", &url, &headers.to_string(), None);
+
+        match result {
+            Ok(response) => {
+                if response.status != 200 {
+                    let body_str = String::from_utf8_lossy(&response.body);
+                    channel_host::log(
+                        channel_host::LogLevel::Error,
+                        &format!("getUpdates returned {}: {}", response.status, body_str),
+                    );
+                    return;
+                }
+
+                // Parse response
+                let api_response: Result<TelegramApiResponse<Vec<TelegramUpdate>>, _> =
+                    serde_json::from_slice(&response.body);
+
+                match api_response {
+                    Ok(resp) if resp.ok => {
+                        if let Some(updates) = resp.result {
+                            let mut new_offset = offset;
+
+                            for update in updates {
+                                // Track highest update_id for next poll
+                                if update.update_id >= new_offset {
+                                    new_offset = update.update_id + 1;
+                                }
+
+                                // Process the update (emits messages)
+                                handle_update(update);
+                            }
+
+                            // Save new offset if it changed
+                            if new_offset != offset {
+                                if let Err(e) = channel_host::workspace_write(
+                                    POLLING_STATE_PATH,
+                                    &new_offset.to_string(),
+                                ) {
+                                    channel_host::log(
+                                        channel_host::LogLevel::Error,
+                                        &format!("Failed to save polling offset: {}", e),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        channel_host::log(
+                            channel_host::LogLevel::Error,
+                            &format!(
+                                "Telegram API error: {}",
+                                resp.description.unwrap_or_else(|| "unknown".to_string())
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        channel_host::log(
+                            channel_host::LogLevel::Error,
+                            &format!("Failed to parse getUpdates response: {}", e),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                channel_host::log(
+                    channel_host::LogLevel::Error,
+                    &format!("getUpdates request failed: {}", e),
+                );
+            }
+        }
     }
 
     fn on_respond(response: AgentResponse) -> Result<(), String> {
@@ -320,14 +460,15 @@ impl Guest for TelegramChannel {
 
                 // Parse Telegram response
                 let api_response: TelegramApiResponse<SentMessage> =
-                    serde_json::from_slice(&http_response.body).map_err(|e| {
-                        format!("Failed to parse Telegram response: {}", e)
-                    })?;
+                    serde_json::from_slice(&http_response.body)
+                        .map_err(|e| format!("Failed to parse Telegram response: {}", e))?;
 
                 if !api_response.ok {
                     return Err(format!(
                         "Telegram API error: {}",
-                        api_response.description.unwrap_or_else(|| "unknown".to_string())
+                        api_response
+                            .description
+                            .unwrap_or_else(|| "unknown".to_string())
                     ));
                 }
 
@@ -347,7 +488,10 @@ impl Guest for TelegramChannel {
     }
 
     fn on_shutdown() {
-        channel_host::log(channel_host::LogLevel::Info, "Telegram channel shutting down");
+        channel_host::log(
+            channel_host::LogLevel::Info,
+            "Telegram channel shutting down",
+        );
     }
 }
 
@@ -422,8 +566,7 @@ fn handle_message(message: TelegramMessage) {
         is_private,
     };
 
-    let metadata_json =
-        serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+    let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
 
     // Clean the message text (strip bot mentions and commands)
     let cleaned_text = clean_message_text(&text);

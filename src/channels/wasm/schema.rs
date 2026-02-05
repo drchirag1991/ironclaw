@@ -101,8 +101,10 @@ impl ChannelCapabilitiesFile {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChannelCapabilitiesSchema {
     /// Tool capabilities (HTTP, secrets, workspace_read).
+    /// Note: Using the struct directly (not Option) because #[serde(flatten)]
+    /// with Option<T> doesn't work correctly when T has all-optional fields.
     #[serde(flatten)]
-    pub tool: Option<ToolCapabilitiesFile>,
+    pub tool: ToolCapabilitiesFile,
 
     /// Channel-specific capabilities.
     #[serde(default)]
@@ -112,11 +114,7 @@ pub struct ChannelCapabilitiesSchema {
 impl ChannelCapabilitiesSchema {
     /// Convert to runtime ChannelCapabilities.
     pub fn to_channel_capabilities(&self, channel_name: &str) -> ChannelCapabilities {
-        let tool_caps = self
-            .tool
-            .as_ref()
-            .map(|t| t.to_capabilities())
-            .unwrap_or_default();
+        let tool_caps = self.tool.to_capabilities();
 
         let mut caps =
             ChannelCapabilities::for_channel(channel_name).with_tool_capabilities(tool_caps);

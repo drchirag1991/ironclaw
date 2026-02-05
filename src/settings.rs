@@ -17,9 +17,23 @@ pub struct Settings {
     #[serde(default)]
     pub setup_completed: bool,
 
+    /// Tunnel configuration for exposing the agent to the internet.
+    #[serde(default)]
+    pub tunnel: TunnelSettings,
+
     /// Channel configuration.
     #[serde(default)]
     pub channels: ChannelSettings,
+}
+
+/// Tunnel settings for public webhook endpoints.
+///
+/// The tunnel URL is shared across all channels that need webhooks.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TunnelSettings {
+    /// Public URL from tunnel provider (e.g., "https://abc123.ngrok.io").
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 /// Channel-specific settings.

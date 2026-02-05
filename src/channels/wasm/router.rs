@@ -180,7 +180,6 @@ async fn health_handler(State(state): State<RouterState>) -> impl IntoResponse {
 }
 
 /// Generic webhook handler that routes to the appropriate WASM channel.
-#[allow(dead_code)]
 async fn webhook_handler(
     State(state): State<RouterState>,
     method: Method,
@@ -191,10 +190,21 @@ async fn webhook_handler(
 ) -> impl IntoResponse {
     let full_path = format!("/webhook/{}", path);
 
+    tracing::info!(
+        method = %method,
+        path = %full_path,
+        body_len = body.len(),
+        "Webhook request received"
+    );
+
     // Find the channel for this path
     let channel = match state.router.get_channel_for_path(&full_path).await {
         Some(c) => c,
         None => {
+            tracing::warn!(
+                path = %full_path,
+                "No channel registered for webhook path"
+            );
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
@@ -205,21 +215,48 @@ async fn webhook_handler(
         }
     };
 
+    tracing::info!(
+        channel = %channel.channel_name(),
+        "Found channel for webhook"
+    );
+
     let channel_name = channel.channel_name();
 
     // Check if secret is required
     if state.router.requires_secret(channel_name).await {
         // Try to get secret from query param or header
-        let provided_secret = query.get("secret").cloned().or_else(|| {
-            headers
-                .get("X-Webhook-Secret")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        });
+        // Telegram uses X-Telegram-Bot-Api-Secret-Token header
+        let provided_secret = query
+            .get("secret")
+            .cloned()
+            .or_else(|| {
+                headers
+                    .get("X-Telegram-Bot-Api-Secret-Token")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| {
+                // Fallback to generic header
+                headers
+                    .get("X-Webhook-Secret")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+            });
+
+        tracing::debug!(
+            channel = %channel_name,
+            has_provided_secret = provided_secret.is_some(),
+            provided_secret_len = provided_secret.as_ref().map(|s| s.len()),
+            "Checking webhook secret"
+        );
 
         match provided_secret {
             Some(secret) => {
                 if !state.router.validate_secret(channel_name, &secret).await {
+                    tracing::warn!(
+                        channel = %channel_name,
+                        "Webhook secret validation failed"
+                    );
                     return (
                         StatusCode::UNAUTHORIZED,
                         Json(serde_json::json!({
@@ -227,8 +264,13 @@ async fn webhook_handler(
                         })),
                     );
                 }
+                tracing::debug!(channel = %channel_name, "Webhook secret validated");
             }
             None => {
+                tracing::warn!(
+                    channel = %channel_name,
+                    "Webhook secret required but not provided"
+                );
                 return (
                     StatusCode::UNAUTHORIZED,
                     Json(serde_json::json!({
@@ -251,6 +293,13 @@ async fn webhook_handler(
 
     // Call the WASM channel
     let secret_validated = state.router.requires_secret(channel_name).await;
+
+    tracing::info!(
+        channel = %channel_name,
+        secret_validated = secret_validated,
+        "Calling WASM channel on_http_request"
+    );
+
     match channel
         .call_on_http_request(
             method.as_str(),
@@ -265,6 +314,13 @@ async fn webhook_handler(
         Ok(response) => {
             let status =
                 StatusCode::from_u16(response.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+            tracing::info!(
+                channel = %channel_name,
+                status = %status,
+                body_len = response.body.len(),
+                "WASM channel on_http_request completed successfully"
+            );
 
             // Build response with headers
             let body_json: serde_json::Value = serde_json::from_slice(&response.body)
@@ -296,25 +352,22 @@ async fn webhook_handler(
 /// Create an Axum router for WASM channel webhooks.
 ///
 /// This router can be merged with the existing HTTP channel router.
-#[allow(dead_code)]
 pub fn create_wasm_channel_router(router: Arc<WasmChannelRouter>) -> Router {
     let state = RouterState::new(router);
 
     Router::new()
         .route("/wasm-channels/health", get(health_handler))
         // Catch-all for webhook paths
-        .route("/webhook/*path", get(webhook_handler))
-        .route("/webhook/*path", post(webhook_handler))
+        .route("/webhook/{*path}", get(webhook_handler))
+        .route("/webhook/{*path}", post(webhook_handler))
         .with_state(state)
 }
 
 /// HTTP server for WASM channel webhooks.
-#[allow(dead_code)]
 pub struct WasmChannelServer {
     router: Arc<WasmChannelRouter>,
 }
 
-#[allow(dead_code)]
 impl WasmChannelServer {
     /// Create a new server.
     pub fn new(router: Arc<WasmChannelRouter>) -> Self {

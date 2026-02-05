@@ -74,6 +74,12 @@ pub enum WasmChannelError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[error("Webhook registration failed for channel {name}: {reason}")]
+    WebhookRegistration { name: String, reason: String },
+
+    #[error("HTTP request error: {0}")]
+    HttpRequest(String),
 }
 
 impl From<crate::tools::wasm::WasmError> for WasmChannelError {

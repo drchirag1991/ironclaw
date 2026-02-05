@@ -13,8 +13,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 use crate::secrets::{CreateSecretParams, PostgresSecretsStore, SecretsCrypto, SecretsStore};
+use crate::settings::Settings;
 use crate::setup::prompts::{
-    confirm, optional_input, print_error, print_info, print_success, secret_input,
+    confirm, input, optional_input, print_error, print_info, print_success, secret_input,
 };
 
 /// Context for saving secrets during setup.
@@ -58,6 +59,7 @@ impl SecretsContext {
 pub struct TelegramSetupResult {
     pub enabled: bool,
     pub bot_username: Option<String>,
+    pub webhook_secret: Option<String>,
 }
 
 /// Telegram Bot API response for getMe.
@@ -94,9 +96,12 @@ pub async fn setup_telegram(secrets: &SecretsContext) -> Result<TelegramSetupRes
     if secrets.secret_exists("telegram_bot_token").await {
         print_info("Existing Telegram token found in database.");
         if !confirm("Replace existing token?", false).map_err(|e| e.to_string())? {
+            // Still offer to configure webhook secret if not already done
+            let webhook_secret = setup_telegram_webhook_secret(secrets).await?;
             return Ok(TelegramSetupResult {
                 enabled: true,
                 bot_username: None,
+                webhook_secret,
             });
         }
     }
@@ -117,9 +122,13 @@ pub async fn setup_telegram(secrets: &SecretsContext) -> Result<TelegramSetupRes
             secrets.save_secret("telegram_bot_token", &token).await?;
             print_success("Token saved to database");
 
+            // Offer webhook secret configuration
+            let webhook_secret = setup_telegram_webhook_secret(secrets).await?;
+
             Ok(TelegramSetupResult {
                 enabled: true,
                 bot_username: username,
+                webhook_secret,
             })
         }
         Err(e) => {
@@ -131,10 +140,105 @@ pub async fn setup_telegram(secrets: &SecretsContext) -> Result<TelegramSetupRes
                 Ok(TelegramSetupResult {
                     enabled: false,
                     bot_username: None,
+                    webhook_secret: None,
                 })
             }
         }
     }
+}
+
+/// Set up a tunnel for exposing the agent to the internet.
+///
+/// This is shared across all channels that need webhook endpoints.
+/// Returns the tunnel URL if configured.
+pub fn setup_tunnel() -> Result<Option<String>, String> {
+    // Check if already configured
+    let settings = Settings::load();
+    if let Some(ref url) = settings.tunnel.public_url {
+        print_info(&format!("Existing tunnel configured: {}", url));
+        if !confirm("Change tunnel configuration?", false).map_err(|e| e.to_string())? {
+            return Ok(Some(url.clone()));
+        }
+    }
+
+    println!();
+    print_info("Tunnel Configuration (for webhook endpoints):");
+    print_info("A tunnel exposes your local agent to the internet, enabling:");
+    print_info("  - Instant Telegram message delivery (instead of polling)");
+    print_info("  - Future: Slack, Discord, GitHub webhooks");
+    print_info("");
+    print_info("Supported tunnel providers:");
+    print_info("  - ngrok: ngrok http 8080");
+    print_info("  - Cloudflare: cloudflared tunnel --url http://localhost:8080");
+    print_info("  - localtunnel: lt --port 8080");
+    print_info("");
+    print_info("Security note: Webhook endpoints don't use tunnel-level auth.");
+    print_info("Security comes from provider-specific secrets (e.g., Telegram webhook secret).");
+    println!();
+
+    if !confirm("Configure a tunnel?", false).map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+
+    let tunnel_url =
+        input("Tunnel URL (e.g., https://abc123.ngrok.io)").map_err(|e| e.to_string())?;
+
+    // Validate URL format
+    if !tunnel_url.starts_with("https://") {
+        print_error("URL must start with https:// (webhooks require HTTPS)");
+        return Err("Invalid tunnel URL: must use HTTPS".to_string());
+    }
+
+    // Remove trailing slash if present
+    let tunnel_url = tunnel_url.trim_end_matches('/').to_string();
+
+    // Save to settings
+    let mut settings = Settings::load();
+    settings.tunnel.public_url = Some(tunnel_url.clone());
+    settings
+        .save()
+        .map_err(|e| format!("Failed to save settings: {}", e))?;
+
+    print_success(&format!("Tunnel URL saved: {}", tunnel_url));
+    print_info("");
+    print_info("Make sure your tunnel is running before starting the agent.");
+    print_info("You can also set TUNNEL_URL environment variable to override.");
+
+    Ok(Some(tunnel_url))
+}
+
+/// Set up Telegram webhook secret for signature validation.
+///
+/// Returns the webhook secret if configured.
+async fn setup_telegram_webhook_secret(secrets: &SecretsContext) -> Result<Option<String>, String> {
+    // Check if tunnel is configured
+    let settings = Settings::load();
+    if settings.tunnel.public_url.is_none() {
+        print_info("");
+        print_info("No tunnel configured. Telegram will use polling mode (30s+ delay).");
+        print_info("Run setup again to configure a tunnel for instant delivery.");
+        return Ok(None);
+    }
+
+    println!();
+    print_info("Telegram Webhook Security:");
+    print_info("A webhook secret adds an extra layer of security by validating");
+    print_info("that requests actually come from Telegram's servers.");
+
+    if !confirm("Generate a webhook secret?", true).map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+
+    let secret = generate_webhook_secret();
+    secrets
+        .save_secret(
+            "telegram_webhook_secret",
+            &SecretString::from(secret.clone()),
+        )
+        .await?;
+    print_success("Webhook secret generated and saved");
+
+    Ok(Some(secret))
 }
 
 /// Validate a Telegram bot token by calling the getMe API.

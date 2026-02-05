@@ -13,6 +13,7 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub llm: LlmConfig,
     pub embeddings: EmbeddingsConfig,
+    pub tunnel: TunnelConfig,
     pub channels: ChannelsConfig,
     pub agent: AgentConfig,
     pub safety: SafetyConfig,
@@ -32,6 +33,7 @@ impl Config {
             database: DatabaseConfig::from_env()?,
             llm: LlmConfig::from_env()?,
             embeddings: EmbeddingsConfig::from_env()?,
+            tunnel: TunnelConfig::from_env()?,
             channels: ChannelsConfig::from_env()?,
             agent: AgentConfig::from_env()?,
             safety: SafetyConfig::from_env()?,
@@ -39,6 +41,81 @@ impl Config {
             secrets: SecretsConfig::from_env()?,
             builder: BuilderModeConfig::from_env()?,
             heartbeat: HeartbeatConfig::from_env()?,
+        })
+    }
+}
+
+/// Tunnel configuration for exposing the agent to the internet.
+///
+/// Used by channels and tools that need public webhook endpoints.
+/// The tunnel URL is shared across all channels (Telegram, Slack, etc.).
+///
+/// # Security Notes
+///
+/// **Webhook endpoints** (e.g., `/webhook/telegram`) should NOT use tunnel-level
+/// authentication because webhook providers (Telegram, Slack, GitHub) need
+/// unauthenticated access to POST updates. Security for webhooks comes from:
+/// - Webhook signature verification (provider-specific secrets)
+/// - IP allowlisting (if supported by provider)
+///
+/// **Non-webhook endpoints** (admin APIs, health checks) CAN be protected using
+/// tunnel provider features:
+/// - ngrok: Basic Auth, OAuth, IP restrictions
+/// - Cloudflare: Access policies, mTLS
+///
+/// These protections are configured in the tunnel provider, not here.
+///
+/// # Supported Providers
+///
+/// - **ngrok**: `ngrok http 8080` -> `https://abc123.ngrok.io`
+/// - **Cloudflare Tunnel**: `cloudflared tunnel --url http://localhost:8080`
+/// - **localtunnel**: `lt --port 8080`
+/// - Any service that provides a public HTTPS URL to localhost
+#[derive(Debug, Clone, Default)]
+pub struct TunnelConfig {
+    /// Public URL from tunnel provider (e.g., "https://abc123.ngrok.io").
+    ///
+    /// When set, channels that support webhooks will register their endpoints
+    /// with this base URL instead of using polling.
+    pub public_url: Option<String>,
+}
+
+impl TunnelConfig {
+    fn from_env() -> Result<Self, ConfigError> {
+        // Priority: env var > settings file
+        let public_url = optional_env("TUNNEL_URL")?.or_else(|| {
+            crate::settings::Settings::load()
+                .tunnel
+                .public_url
+                .filter(|s| !s.is_empty())
+        });
+
+        // Validate URL format if provided
+        if let Some(ref url) = public_url {
+            if !url.starts_with("https://") {
+                return Err(ConfigError::InvalidValue {
+                    key: "TUNNEL_URL".to_string(),
+                    message: "must start with https:// (webhooks require HTTPS)".to_string(),
+                });
+            }
+        }
+
+        Ok(Self { public_url })
+    }
+
+    /// Check if a tunnel is configured.
+    pub fn is_enabled(&self) -> bool {
+        self.public_url.is_some()
+    }
+
+    /// Get the webhook URL for a given path.
+    ///
+    /// Returns `None` if no tunnel is configured.
+    pub fn webhook_url(&self, path: &str) -> Option<String> {
+        self.public_url.as_ref().map(|base| {
+            let base = base.trim_end_matches('/');
+            let path = path.trim_start_matches('/');
+            format!("{}/{}", base, path)
         })
     }
 }
@@ -231,10 +308,35 @@ fn default_session_path() -> PathBuf {
 pub struct ChannelsConfig {
     pub cli: CliConfig,
     pub http: Option<HttpConfig>,
+    pub telegram: TelegramChannelConfig,
     /// Directory containing WASM channel modules (default: ~/.near-agent/channels/).
     pub wasm_channels_dir: std::path::PathBuf,
     /// Whether WASM channels are enabled.
     pub wasm_channels_enabled: bool,
+}
+
+/// Telegram channel configuration.
+///
+/// The tunnel URL for webhook mode comes from the global `TunnelConfig`.
+/// This config only contains Telegram-specific settings.
+#[derive(Debug, Clone, Default)]
+pub struct TelegramChannelConfig {
+    /// Secret token for webhook validation (optional but recommended).
+    ///
+    /// When set, Telegram will include this value in the
+    /// `X-Telegram-Bot-Api-Secret-Token` header of webhook requests.
+    /// The agent validates this header to ensure requests come from Telegram.
+    ///
+    /// Generate a secure random token (32+ characters recommended).
+    pub webhook_secret: Option<String>,
+}
+
+impl TelegramChannelConfig {
+    fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            webhook_secret: optional_env("TELEGRAM_WEBHOOK_SECRET")?,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +379,7 @@ impl ChannelsConfig {
                 enabled: cli_enabled,
             },
             http,
+            telegram: TelegramChannelConfig::from_env()?,
             wasm_channels_dir: optional_env("WASM_CHANNELS_DIR")?
                 .map(PathBuf::from)
                 .unwrap_or_else(default_channels_dir),

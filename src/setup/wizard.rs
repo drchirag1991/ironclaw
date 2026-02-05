@@ -14,7 +14,7 @@ use tokio_postgres::NoTls;
 use crate::llm::{SessionConfig, SessionManager};
 use crate::secrets::SecretsCrypto;
 use crate::settings::Settings;
-use crate::setup::channels::{SecretsContext, setup_http, setup_telegram};
+use crate::setup::channels::{SecretsContext, setup_http, setup_telegram, setup_tunnel};
 use crate::setup::prompts::{
     input, print_header, print_info, print_step, print_success, select_many, select_one,
 };
@@ -316,6 +316,20 @@ impl SetupWizard {
 
     /// Step 3: Channel configuration.
     async fn step_channels(&mut self) -> Result<(), SetupError> {
+        // First, configure tunnel (shared across all channels that need webhooks)
+        match setup_tunnel() {
+            Ok(Some(url)) => {
+                self.settings.tunnel.public_url = Some(url);
+            }
+            Ok(None) => {
+                self.settings.tunnel.public_url = None;
+            }
+            Err(e) => {
+                print_info(&format!("Tunnel setup skipped: {}", e));
+            }
+        }
+        println!();
+
         let options = [
             ("CLI/TUI (always enabled)", true),
             ("HTTP webhook", self.settings.channels.http_enabled),
@@ -381,6 +395,10 @@ impl SetupWizard {
             println!("  Model: {}", model);
         }
 
+        if let Some(ref tunnel_url) = self.settings.tunnel.public_url {
+            println!("  Tunnel: {}", tunnel_url);
+        }
+
         println!("  Channels:");
         println!("    - CLI/TUI: enabled");
 
@@ -390,7 +408,12 @@ impl SetupWizard {
         }
 
         if self.settings.channels.telegram_enabled {
-            println!("    - Telegram: enabled");
+            let mode = if self.settings.tunnel.public_url.is_some() {
+                "webhook"
+            } else {
+                "polling"
+            };
+            println!("    - Telegram: enabled ({})", mode);
         }
 
         println!();

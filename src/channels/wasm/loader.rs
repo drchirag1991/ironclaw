@@ -59,7 +59,28 @@ impl WasmChannelLoader {
                 let cap_file = ChannelCapabilitiesFile::from_bytes(&cap_bytes)
                     .map_err(|e| WasmChannelError::InvalidCapabilities(e.to_string()))?;
 
+                // Debug: log raw capabilities
+                tracing::debug!(
+                    channel = name,
+                    raw_capabilities = ?cap_file.capabilities,
+                    "Parsed capabilities file"
+                );
+
                 let caps = cap_file.to_capabilities();
+
+                // Debug: log resulting capabilities
+                tracing::info!(
+                    channel = name,
+                    http_allowed = caps.tool_capabilities.http.is_some(),
+                    http_allowlist_count = caps
+                        .tool_capabilities
+                        .http
+                        .as_ref()
+                        .map(|h| h.allowlist.len())
+                        .unwrap_or(0),
+                    "Channel capabilities loaded"
+                );
+
                 let config = cap_file.config_json();
                 let desc = cap_file.description.clone();
 
