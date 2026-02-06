@@ -2,7 +2,7 @@
 //!
 //! Provides subcommands for:
 //! - Running the agent (`run`)
-//! - Interactive setup wizard (`setup`)
+//! - Interactive onboarding wizard (`onboard`)
 //! - Managing configuration (`config list`, `config get`, `config set`)
 //! - Managing WASM tools (`tool install`, `tool list`, `tool remove`)
 //! - Managing MCP servers (`mcp add`, `mcp auth`, `mcp list`, `mcp test`)
@@ -53,9 +53,9 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub config: Option<std::path::PathBuf>,
 
-    /// Skip first-run setup check
+    /// Skip first-run onboarding check
     #[arg(long, global = true)]
-    pub no_setup: bool,
+    pub no_onboard: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -63,8 +63,8 @@ pub enum Command {
     /// Run the agent (default if no subcommand given)
     Run,
 
-    /// Interactive setup wizard
-    Setup {
+    /// Interactive onboarding wizard
+    Onboard {
         /// Skip authentication (use existing session)
         #[arg(long)]
         skip_auth: bool,

@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 /// User settings persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
-    /// Whether setup wizard has been completed.
-    #[serde(default)]
-    pub setup_completed: bool,
+    /// Whether onboarding wizard has been completed.
+    #[serde(default, alias = "setup_completed")]
+    pub onboard_completed: bool,
 
     // === Step 1: Database ===
     /// Database connection URL (postgres://...).
@@ -775,7 +775,7 @@ mod tests {
         // Check some expected entries
         assert!(list.iter().any(|(k, _)| k == "agent.name"));
         assert!(list.iter().any(|(k, _)| k == "heartbeat.enabled"));
-        assert!(list.iter().any(|(k, _)| k == "setup_completed"));
+        assert!(list.iter().any(|(k, _)| k == "onboard_completed"));
     }
 
     #[test]

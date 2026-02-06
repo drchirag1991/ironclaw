@@ -40,7 +40,7 @@ pub async fn run_status_command() -> anyhow::Result<()> {
     if session_path.exists() {
         println!("found ({})", session_path.display());
     } else {
-        println!("not found (run `ironclaw setup`)");
+        println!("not found (run `ironclaw onboard`)");
     }
 
     // Secrets

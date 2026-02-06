@@ -138,7 +138,7 @@ impl DatabaseConfig {
             .or(settings.database_url.clone())
             .ok_or_else(|| ConfigError::MissingRequired {
                 key: "database_url".to_string(),
-                hint: "Run 'ironclaw setup' or set DATABASE_URL environment variable".to_string(),
+                hint: "Run 'ironclaw onboard' or set DATABASE_URL environment variable".to_string(),
             })?;
 
         // Priority: env var > settings > default
@@ -583,7 +583,7 @@ impl SecretsConfig {
                             // This might happen if keychain was cleared
                             tracing::warn!(
                                 "Secrets configured for keychain but key not found. \
-                                 Run 'ironclaw setup' to reconfigure."
+                                 Run 'ironclaw onboard' to reconfigure."
                             );
                             (None, KeySource::None)
                         }

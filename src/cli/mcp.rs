@@ -450,7 +450,9 @@ async fn get_secrets_store() -> anyhow::Result<Arc<dyn SecretsStore + Send + Syn
     let config = Config::from_env()?;
 
     let master_key = config.secrets.master_key().ok_or_else(|| {
-        anyhow::anyhow!("SECRETS_MASTER_KEY not set. Run 'ironclaw setup' first or set it in .env")
+        anyhow::anyhow!(
+            "SECRETS_MASTER_KEY not set. Run 'ironclaw onboard' first or set it in .env"
+        )
     })?;
 
     let store = Store::new(&config.database).await?;

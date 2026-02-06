@@ -731,7 +731,7 @@ impl SetupWizard {
 
     /// Save settings and print summary.
     fn save_and_summarize(&mut self) -> Result<(), SetupError> {
-        self.settings.setup_completed = true;
+        self.settings.onboard_completed = true;
 
         self.settings.save().map_err(|e| {
             SetupError::Io(std::io::Error::new(
@@ -815,7 +815,7 @@ impl SetupWizard {
         println!();
         println!("To change settings later:");
         println!("  ironclaw config set <setting> <value>");
-        println!("  ironclaw setup");
+        println!("  ironclaw onboard");
         println!();
 
         Ok(())

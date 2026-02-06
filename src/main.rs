@@ -128,14 +128,13 @@ async fn main() -> anyhow::Result<()> {
 
             return run_status_command().await;
         }
-        Some(Command::Setup {
+        Some(Command::Onboard {
             skip_auth,
             channels_only,
         }) => {
-            // Load .env before running setup wizard
+            // Load .env before running onboarding wizard
             let _ = dotenvy::dotenv();
 
-            // Run setup wizard
             let config = SetupConfig {
                 skip_auth: *skip_auth,
                 channels_only: *channels_only,
@@ -153,9 +152,9 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     // Enhanced first-run detection
-    if !cli.no_setup {
-        if let Some(reason) = check_setup_needed() {
-            println!("Setup needed: {}", reason);
+    if !cli.no_onboard {
+        if let Some(reason) = check_onboard_needed() {
+            println!("Onboarding needed: {}", reason);
             println!();
             let mut wizard = SetupWizard::new();
             wizard.run().await?;
@@ -170,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("  {}", hint);
             eprintln!();
             eprintln!(
-                "Run 'ironclaw setup' to configure, or set the required environment variables."
+                "Run 'ironclaw onboard' to configure, or set the required environment variables."
             );
             std::process::exit(1);
         }
@@ -781,10 +780,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Check if setup is needed and return the reason.
+/// Check if onboarding is needed and return the reason.
 ///
-/// Returns `Some(reason)` if setup should be triggered, `None` otherwise.
-fn check_setup_needed() -> Option<&'static str> {
+/// Returns `Some(reason)` if onboarding should be triggered, `None` otherwise.
+fn check_onboard_needed() -> Option<&'static str> {
     let settings = Settings::load();
 
     // Database not configured (and not in env)
@@ -801,9 +800,9 @@ fn check_setup_needed() -> Option<&'static str> {
         // For now, we don't require it for first run
     }
 
-    // First run (setup never completed and no session)
+    // First run (onboarding never completed and no session)
     let session_path = ironclaw::llm::session::default_session_path();
-    if !settings.setup_completed && !session_path.exists() {
+    if !settings.onboard_completed && !session_path.exists() {
         return Some("First run");
     }
 
