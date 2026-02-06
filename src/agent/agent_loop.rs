@@ -42,6 +42,7 @@ use crate::config::{AgentConfig, HeartbeatConfig};
 use crate::context::ContextManager;
 use crate::context::JobContext;
 use crate::error::Error;
+use crate::extensions::ExtensionManager;
 use crate::history::Store;
 use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult};
 use crate::safety::SafetyLayer;
@@ -68,6 +69,7 @@ pub struct AgentDeps {
     pub safety: Arc<SafetyLayer>,
     pub tools: Arc<ToolRegistry>,
     pub workspace: Option<Arc<Workspace>>,
+    pub extension_manager: Option<Arc<ExtensionManager>>,
 }
 
 /// The main agent that coordinates all components.
@@ -374,13 +376,6 @@ impl Agent {
     }
 
     async fn handle_message(&self, message: &IncomingMessage) -> Result<Option<String>, Error> {
-        tracing::debug!(
-            "Received message from {} on {}: {}",
-            message.user_id,
-            message.channel,
-            truncate(&message.content, 100)
-        );
-
         // Parse submission type first
         let submission = SubmissionParser::parse(&message.content);
 
@@ -393,6 +388,41 @@ impl Agent {
                 message.thread_id.as_deref(),
             )
             .await;
+
+        // Auth mode interception: if the thread is awaiting a token, route
+        // the message directly to the credential store. Nothing touches
+        // logs, turns, history, or compaction.
+        let pending_auth = {
+            let sess = session.lock().await;
+            sess.threads
+                .get(&thread_id)
+                .and_then(|t| t.pending_auth.clone())
+        };
+
+        if let Some(pending) = pending_auth {
+            match &submission {
+                Submission::UserInput { content } => {
+                    return self
+                        .process_auth_token(message, &pending, content, session, thread_id)
+                        .await;
+                }
+                _ => {
+                    // Any control submission (interrupt, undo, etc.) cancels auth mode
+                    let mut sess = session.lock().await;
+                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                        thread.pending_auth = None;
+                    }
+                    // Fall through to normal handling
+                }
+            }
+        }
+
+        tracing::debug!(
+            "Received message from {} on {} ({} chars)",
+            message.user_id,
+            message.channel,
+            message.content.len()
+        );
 
         // Process based on submission type
         let result = match submission {
@@ -867,6 +897,19 @@ impl Agent {
                             }
                         }
 
+                        // If tool_auth returned awaiting_token, enter auth mode
+                        // and short-circuit: return the instructions directly so
+                        // the LLM doesn't get a chance to hallucinate tool calls.
+                        if let Some((ext_name, instructions)) =
+                            detect_auth_awaiting(&tc.name, &tool_result)
+                        {
+                            let mut sess = session.lock().await;
+                            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                                thread.enter_auth_mode(ext_name);
+                            }
+                            return Ok(AgenticLoopResult::Response(instructions));
+                        }
+
                         // Add tool result to context for next LLM call
                         let result_content = match tool_result {
                             Ok(output) => {
@@ -1236,6 +1279,29 @@ impl Agent {
                 }
             }
 
+            // If tool_auth returned awaiting_token, enter auth mode and
+            // return instructions directly (skip agentic loop continuation).
+            if let Some((ext_name, instructions)) =
+                detect_auth_awaiting(&pending.tool_name, &tool_result)
+            {
+                {
+                    let mut sess = session.lock().await;
+                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                        thread.enter_auth_mode(ext_name);
+                        thread.complete_turn(&instructions);
+                    }
+                }
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::Status("Awaiting token".into()),
+                        &message.metadata,
+                    )
+                    .await;
+                return Ok(SubmissionResult::response(instructions));
+            }
+
             // Add tool result to context
             let result_content = match tool_result {
                 Ok(output) => {
@@ -1333,6 +1399,75 @@ impl Agent {
                  You can continue the conversation or try a different approach.",
                 pending.tool_name
             )))
+        }
+    }
+
+    /// Handle an auth token submitted while the thread is in auth mode.
+    ///
+    /// The token goes directly to the extension manager's credential store,
+    /// completely bypassing logging, turn creation, history, and compaction.
+    async fn process_auth_token(
+        &self,
+        message: &IncomingMessage,
+        pending: &crate::agent::session::PendingAuth,
+        token: &str,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+    ) -> Result<Option<String>, Error> {
+        let token = token.trim();
+
+        // Clear auth mode regardless of outcome
+        {
+            let mut sess = session.lock().await;
+            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                thread.pending_auth = None;
+            }
+        }
+
+        let ext_mgr = match self.deps.extension_manager.as_ref() {
+            Some(mgr) => mgr,
+            None => return Ok(Some("Extension manager not available.".to_string())),
+        };
+
+        match ext_mgr.auth(&pending.extension_name, Some(token)).await {
+            Ok(result) if result.status == "authenticated" => {
+                tracing::info!(
+                    "Extension '{}' authenticated via auth mode",
+                    pending.extension_name
+                );
+
+                // Notify via channel status so the response doesn't echo the token
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::Status("Authenticated".into()),
+                        &message.metadata,
+                    )
+                    .await;
+
+                Ok(Some(format!(
+                    "{} authenticated successfully.",
+                    pending.extension_name
+                )))
+            }
+            Ok(result) => {
+                // Unexpected state, re-enter auth mode
+                {
+                    let mut sess = session.lock().await;
+                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                        thread.enter_auth_mode(pending.extension_name.clone());
+                    }
+                }
+                let msg = result
+                    .instructions
+                    .unwrap_or_else(|| "Invalid token. Please try again.".to_string());
+                Ok(Some(msg))
+            }
+            Err(e) => Ok(Some(format!(
+                "Authentication failed for {}: {}",
+                pending.extension_name, e
+            ))),
         }
     }
 
@@ -1737,10 +1872,96 @@ impl Agent {
     }
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len])
+/// Check if a tool_auth result indicates the extension is awaiting a token.
+///
+/// Returns `Some((extension_name, instructions))` if the tool result contains
+/// `awaiting_token: true`, meaning the thread should enter auth mode.
+fn detect_auth_awaiting(
+    tool_name: &str,
+    result: &Result<String, Error>,
+) -> Option<(String, String)> {
+    if tool_name != "tool_auth" {
+        return None;
+    }
+    let output = result.as_ref().ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(output).ok()?;
+    if parsed.get("awaiting_token") != Some(&serde_json::Value::Bool(true)) {
+        return None;
+    }
+    let name = parsed.get("name")?.as_str()?.to_string();
+    let instructions = parsed
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Please provide your API token/key.")
+        .to_string();
+    Some((name, instructions))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::Error;
+
+    use super::detect_auth_awaiting;
+
+    #[test]
+    fn test_detect_auth_awaiting_positive() {
+        let result: Result<String, Error> = Ok(serde_json::json!({
+            "name": "telegram",
+            "kind": "WasmTool",
+            "awaiting_token": true,
+            "status": "awaiting_token",
+            "instructions": "Please provide your Telegram Bot API token."
+        })
+        .to_string());
+
+        let detected = detect_auth_awaiting("tool_auth", &result);
+        assert!(detected.is_some());
+        let (name, instructions) = detected.unwrap();
+        assert_eq!(name, "telegram");
+        assert!(instructions.contains("Telegram Bot API"));
+    }
+
+    #[test]
+    fn test_detect_auth_awaiting_not_awaiting() {
+        let result: Result<String, Error> = Ok(serde_json::json!({
+            "name": "telegram",
+            "kind": "WasmTool",
+            "awaiting_token": false,
+            "status": "authenticated"
+        })
+        .to_string());
+
+        assert!(detect_auth_awaiting("tool_auth", &result).is_none());
+    }
+
+    #[test]
+    fn test_detect_auth_awaiting_wrong_tool() {
+        let result: Result<String, Error> = Ok(serde_json::json!({
+            "name": "telegram",
+            "awaiting_token": true,
+        })
+        .to_string());
+
+        assert!(detect_auth_awaiting("tool_list", &result).is_none());
+    }
+
+    #[test]
+    fn test_detect_auth_awaiting_error_result() {
+        let result: Result<String, Error> =
+            Err(crate::error::ToolError::NotFound { name: "x".into() }.into());
+        assert!(detect_auth_awaiting("tool_auth", &result).is_none());
+    }
+
+    #[test]
+    fn test_detect_auth_awaiting_default_instructions() {
+        let result: Result<String, Error> = Ok(serde_json::json!({
+            "name": "custom_tool",
+            "awaiting_token": true,
+            "status": "awaiting_token"
+        })
+        .to_string());
+
+        let (_, instructions) = detect_auth_awaiting("tool_auth", &result).unwrap();
+        assert_eq!(instructions, "Please provide your API token/key.");
     }
 }

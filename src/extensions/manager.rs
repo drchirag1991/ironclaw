@@ -460,11 +460,34 @@ impl ExtensionManager {
     async fn auth_mcp(
         &self,
         name: &str,
-        _token: Option<&str>,
+        token: Option<&str>,
     ) -> Result<AuthResult, ExtensionError> {
         let server = get_mcp_server(name)
             .await
             .map_err(|e| ExtensionError::NotInstalled(e.to_string()))?;
+
+        // If a token was provided directly, store it and we're done.
+        if let Some(token_value) = token {
+            let secret_name = server.token_secret_name();
+            let params =
+                CreateSecretParams::new(&secret_name, token_value).with_provider(name.to_string());
+            self.secrets
+                .create(&self.user_id, params)
+                .await
+                .map_err(|e| ExtensionError::AuthFailed(e.to_string()))?;
+
+            tracing::info!("MCP server '{}' authenticated via manual token", name);
+            return Ok(AuthResult {
+                name: name.to_string(),
+                kind: ExtensionKind::McpServer,
+                auth_url: None,
+                callback_type: None,
+                instructions: None,
+                setup_url: None,
+                awaiting_token: false,
+                status: "authenticated".to_string(),
+            });
+        }
 
         // Check if already authenticated
         if is_authenticated(&server, &self.secrets, &self.user_id).await {
@@ -483,7 +506,7 @@ impl ExtensionManager {
         // Run the full OAuth flow (opens browser, waits for callback)
         match authorize_mcp_server(&server, &self.secrets, &self.user_id).await {
             Ok(_token) => {
-                tracing::info!("MCP server '{}' authenticated successfully", name);
+                tracing::info!("MCP server '{}' authenticated via OAuth", name);
                 Ok(AuthResult {
                     name: name.to_string(),
                     kind: ExtensionKind::McpServer,
@@ -496,10 +519,45 @@ impl ExtensionManager {
                 })
             }
             Err(crate::tools::mcp::auth::AuthError::NotSupported) => {
-                // Server doesn't support OAuth at all, try to build a non-interactive auth URL
-                self.auth_mcp_build_url(name, &server).await
+                // Server doesn't support OAuth, try building a URL first
+                match self.auth_mcp_build_url(name, &server).await {
+                    Ok(result) => Ok(result),
+                    Err(_) => {
+                        // No OAuth, no DCR: fall back to manual token entry
+                        Ok(AuthResult {
+                            name: name.to_string(),
+                            kind: ExtensionKind::McpServer,
+                            auth_url: None,
+                            callback_type: None,
+                            instructions: Some(format!(
+                                "Server '{}' does not support OAuth. \
+                                 Please provide an API token/key for this server.",
+                                name
+                            )),
+                            setup_url: None,
+                            awaiting_token: true,
+                            status: "awaiting_token".to_string(),
+                        })
+                    }
+                }
             }
-            Err(e) => Err(ExtensionError::AuthFailed(e.to_string())),
+            Err(e) => {
+                // OAuth failed for some other reason, fall back to manual token
+                Ok(AuthResult {
+                    name: name.to_string(),
+                    kind: ExtensionKind::McpServer,
+                    auth_url: None,
+                    callback_type: None,
+                    instructions: Some(format!(
+                        "OAuth failed for '{}': {}. \
+                         Please provide an API token/key manually.",
+                        name, e
+                    )),
+                    setup_url: None,
+                    awaiting_token: true,
+                    status: "awaiting_token".to_string(),
+                })
+            }
         }
     }
 
