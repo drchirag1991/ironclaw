@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::error::LlmError;
+
 use crate::llm::{
     ChatMessage, CompletionRequest, LlmProvider, ToolCall, ToolCompletionRequest, ToolDefinition,
 };
@@ -309,10 +310,10 @@ Respond in JSON format:
                 return Ok(RespondResult::ToolCalls(response.tool_calls));
             }
 
-            // No tool calls - clean up the response
             let content = response
                 .content
                 .unwrap_or_else(|| "I'm not sure how to respond to that.".to_string());
+
             Ok(RespondResult::Text(clean_response(&content)))
         } else {
             // No tools, use simple completion

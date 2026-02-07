@@ -215,6 +215,7 @@ impl ExtensionManager {
                             name: server.name.clone(),
                             kind: ExtensionKind::McpServer,
                             description: server.description.clone(),
+                            url: Some(server.url.clone()),
                             authenticated,
                             active,
                             tools,
@@ -240,6 +241,7 @@ impl ExtensionManager {
                             name: name.clone(),
                             kind: ExtensionKind::WasmTool,
                             description: None,
+                            url: None,
                             authenticated: true, // WASM tools don't always need auth
                             active,
                             tools: if active { vec![name] } else { Vec::new() },
@@ -263,6 +265,7 @@ impl ExtensionManager {
                             name,
                             kind: ExtensionKind::WasmChannel,
                             description: None,
+                            url: None,
                             authenticated: true,
                             active: true, // If loaded at startup, they're active
                             tools: Vec::new(),

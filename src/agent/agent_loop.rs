@@ -2,29 +2,6 @@
 
 use std::sync::Arc;
 
-/// Escape special characters for Telegram's legacy Markdown.
-///
-/// In Telegram's Markdown mode, these characters have special meaning:
-/// - `_` starts/ends italic
-/// - `*` starts/ends bold
-/// - `` ` `` starts/ends code
-/// - `[` starts a link
-///
-/// We escape them with backslash so dynamic content doesn't break formatting.
-fn escape_telegram_markdown(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '_' | '*' | '`' | '[' => {
-                result.push('\\');
-                result.push(c);
-            }
-            _ => result.push(c),
-        }
-    }
-    result
-}
-
 use futures::StreamExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -339,17 +316,37 @@ impl Agent {
         // Main message loop
         tracing::info!("Agent {} ready and listening", self.config.name);
 
-        while let Some(message) = message_stream.next().await {
+        loop {
+            let message = tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Ctrl+C received, shutting down...");
+                    break;
+                }
+                msg = message_stream.next() => {
+                    match msg {
+                        Some(m) => m,
+                        None => {
+                            tracing::info!("All channel streams ended, shutting down...");
+                            break;
+                        }
+                    }
+                }
+            };
+
             match self.handle_message(&message).await {
-                Ok(Some(response)) => {
+                Ok(Some(response)) if !response.is_empty() => {
                     let _ = self
                         .channels
                         .respond(&message, OutgoingResponse::text(response))
                         .await;
                 }
+                Ok(Some(_)) => {
+                    // Empty response, nothing to send (e.g. approval handled via send_status)
+                }
                 Ok(None) => {
-                    // Shutdown signal received
-                    tracing::info!("Shutdown signal received, exiting...");
+                    // Shutdown signal received (/quit, /exit, /shutdown)
+                    tracing::info!("Shutdown command received, exiting...");
                     break;
                 }
                 Err(e) => {
@@ -439,6 +436,7 @@ impl Agent {
             Submission::Heartbeat => self.process_heartbeat().await,
             Submission::Summarize => self.process_summarize(session, thread_id).await,
             Submission::Suggest => self.process_suggest(session, thread_id).await,
+            Submission::Quit => return Ok(None),
             Submission::SwitchThread { thread_id: target } => {
                 self.process_switch_thread(message, target).await
             }
@@ -478,34 +476,24 @@ impl Agent {
                 description,
                 parameters,
             } => {
-                // Format approval request for user
-                let params_preview = serde_json::to_string_pretty(&parameters)
-                    .unwrap_or_else(|_| parameters.to_string());
-                let params_truncated = if params_preview.chars().count() > 200 {
-                    format!(
-                        "{}...",
-                        params_preview.chars().take(200).collect::<String>()
+                // Each channel renders the approval prompt via send_status.
+                // Web gateway shows an inline card, REPL prints a formatted prompt, etc.
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::ApprovalNeeded {
+                            request_id: request_id.to_string(),
+                            tool_name,
+                            description,
+                            parameters,
+                        },
+                        &message.metadata,
                     )
-                } else {
-                    params_preview
-                };
-                // Escape Markdown special chars in dynamic values to avoid breaking
-                // Telegram's Markdown parser (underscores, asterisks, backticks, brackets)
-                let tool_name_escaped = escape_telegram_markdown(&tool_name);
-                let description_escaped = escape_telegram_markdown(&description);
-                // Params go inside a code block, so no escaping needed there
-                Ok(Some(format!(
-                    "🔒 Tool requires approval:\n\n\
-                     *Tool:* {}\n\
-                     *Description:* {}\n\
-                     *Parameters:*\n```\n{}\n```\n\n\
-                     Reply with:\n\
-                     • yes or approve to allow this tool\n\
-                     • always to always allow this tool in this session\n\
-                     • no or deny to reject\n\n\
-                     Request ID: {}",
-                    tool_name_escaped, description_escaped, params_truncated, request_id
-                )))
+                    .await;
+
+                // Empty string signals the caller to skip respond() (no duplicate text)
+                Ok(Some(String::new()))
             }
         }
     }
@@ -663,7 +651,7 @@ impl Agent {
 
         // Run the agentic tool execution loop
         let result = self
-            .run_agentic_loop(message, session.clone(), thread_id, turn_messages)
+            .run_agentic_loop(message, session.clone(), thread_id, turn_messages, false)
             .await;
 
         // Re-acquire lock and check if interrupted
@@ -732,12 +720,17 @@ impl Agent {
     ///
     /// Returns `AgenticLoopResult::Response` on completion, or
     /// `AgenticLoopResult::NeedApproval` if a tool requires user approval.
+    ///
+    /// When `resume_after_tool` is true the loop already knows a tool was
+    /// executed earlier in this turn (e.g. an approved tool), so it won't
+    /// force the LLM to use tools if it responds with text.
     async fn run_agentic_loop(
         &self,
         message: &IncomingMessage,
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
         initial_messages: Vec<ChatMessage>,
+        resume_after_tool: bool,
     ) -> Result<AgenticLoopResult, Error> {
         // Load workspace system prompt (identity files: AGENTS.md, SOUL.md, etc.)
         let system_prompt = if let Some(ws) = self.workspace() {
@@ -766,7 +759,7 @@ impl Agent {
 
         const MAX_TOOL_ITERATIONS: usize = 10;
         let mut iteration = 0;
-        let mut tools_executed = false;
+        let mut tools_executed = resume_after_tool;
 
         loop {
             iteration += 1;
@@ -824,6 +817,14 @@ impl Agent {
                 }
                 RespondResult::ToolCalls(tool_calls) => {
                     tools_executed = true;
+
+                    // Add the assistant message with tool_calls to context.
+                    // OpenAI-compatible APIs require this before tool-result messages.
+                    context_messages.push(ChatMessage::assistant_with_tool_calls(
+                        "",
+                        tool_calls.clone(),
+                    ));
+
                     // Execute tools and add results to context
                     let _ = self
                         .channels
@@ -1323,9 +1324,9 @@ impl Agent {
                 result_content,
             ));
 
-            // Continue the agentic loop
+            // Continue the agentic loop (a tool was already executed this turn)
             let result = self
-                .run_agentic_loop(message, session.clone(), thread_id, context_messages)
+                .run_agentic_loop(message, session.clone(), thread_id, context_messages, true)
                 .await;
 
             // Handle the result
@@ -1441,15 +1442,38 @@ impl Agent {
                     .channels
                     .send_status(
                         &message.channel,
-                        StatusUpdate::Status("Authenticated".into()),
+                        StatusUpdate::Status("Authenticated, loading tools...".into()),
                         &message.metadata,
                     )
                     .await;
 
-                Ok(Some(format!(
-                    "{} authenticated successfully.",
-                    pending.extension_name
-                )))
+                // Auto-activate so tools are available immediately after auth
+                match ext_mgr.activate(&pending.extension_name).await {
+                    Ok(activate_result) => {
+                        let tool_count = activate_result.tools_loaded.len();
+                        let tool_list = if activate_result.tools_loaded.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n\nTools: {}", activate_result.tools_loaded.join(", "))
+                        };
+                        Ok(Some(format!(
+                            "{} authenticated and activated ({} tools loaded).{}",
+                            pending.extension_name, tool_count, tool_list
+                        )))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Extension '{}' authenticated but activation failed: {}",
+                            pending.extension_name,
+                            e
+                        );
+                        Ok(Some(format!(
+                            "{} authenticated successfully, but activation failed: {}. \
+                             Try activating manually.",
+                            pending.extension_name, e
+                        )))
+                    }
+                }
             }
             Ok(result) => {
                 // Unexpected state, re-enter auth mode
@@ -1860,11 +1884,6 @@ impl Agent {
             "tools" => {
                 let tools = self.tools().list().await;
                 Ok(Some(format!("Available tools: {}", tools.join(", "))))
-            }
-
-            "quit" | "exit" | "shutdown" => {
-                // Signal shutdown - return None to indicate no response needed
-                Ok(None)
             }
 
             _ => Ok(Some(format!("Unknown command: {}. Try /help", command))),

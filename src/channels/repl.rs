@@ -286,7 +286,9 @@ impl Channel for ReplChannel {
                         }
                     }
                     Err(ReadlineError::Eof) => {
-                        // Ctrl+D: quit
+                        // Ctrl+D: send /quit so the agent loop runs graceful shutdown
+                        let msg = IncomingMessage::new("repl", "user", "/quit");
+                        let _ = tx.blocking_send(msg);
                         break;
                     }
                     Err(e) => {
@@ -361,6 +363,37 @@ impl Channel for ReplChannel {
                 if debug || msg.contains("approval") || msg.contains("Approval") {
                     eprintln!("\x1b[90m[status] {msg}\x1b[0m");
                 }
+            }
+            StatusUpdate::ApprovalNeeded {
+                request_id,
+                tool_name,
+                description,
+                parameters,
+            } => {
+                let params_preview = serde_json::to_string_pretty(&parameters)
+                    .unwrap_or_else(|_| parameters.to_string());
+                let params_truncated = if params_preview.chars().count() > 200 {
+                    format!(
+                        "{}...",
+                        params_preview.chars().take(200).collect::<String>()
+                    )
+                } else {
+                    params_preview
+                };
+                eprintln!();
+                eprintln!("\x1b[33m  Tool requires approval\x1b[0m");
+                eprintln!("  \x1b[1mTool:\x1b[0m {tool_name}");
+                eprintln!("  \x1b[1mDesc:\x1b[0m {description}");
+                eprintln!(
+                    "  \x1b[1mParams:\x1b[0m\n  {}",
+                    params_truncated.replace('\n', "\n  ")
+                );
+                eprintln!();
+                eprintln!(
+                    "  Reply: \x1b[32myes\x1b[0m / \x1b[34malways\x1b[0m / \x1b[31mno\x1b[0m"
+                );
+                eprintln!("  \x1b[90mRequest ID: {request_id}\x1b[0m");
+                eprintln!();
             }
         }
         Ok(())

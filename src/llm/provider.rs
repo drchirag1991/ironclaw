@@ -27,6 +27,11 @@ pub struct ChatMessage {
     /// Name of the tool for tool results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Tool calls requested by the assistant (for conversation replay).
+    /// OpenAI-compatible APIs require the assistant message to include
+    /// tool_calls when followed by tool result messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 impl ChatMessage {
@@ -37,6 +42,7 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         }
     }
 
@@ -47,6 +53,7 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
         }
     }
 
@@ -57,6 +64,28 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: None,
             name: None,
+            tool_calls: None,
+        }
+    }
+
+    /// Create an assistant message that requested tool calls.
+    ///
+    /// OpenAI-compatible APIs require the assistant message to carry the
+    /// `tool_calls` array when followed by tool-result messages.
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_call_id: None,
+            name: None,
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
         }
     }
 
@@ -71,6 +100,7 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
+            tool_calls: None,
         }
     }
 }
