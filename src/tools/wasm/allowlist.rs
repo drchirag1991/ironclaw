@@ -398,11 +398,31 @@ mod tests {
     #[test]
     fn test_path_traversal_blocked() {
         let validator = validator_with_patterns();
-        assert!(!validator.validate("https://api.openai.com/v1/../admin", "GET").is_allowed());
-        assert!(!validator.validate("https://api.openai.com/v1/../../etc/passwd", "GET").is_allowed());
-        assert!(!validator.validate("https://api.openai.com/v1/%2E%2E/admin", "GET").is_allowed());
-        assert!(!validator.validate("https://api.openai.com/v1/%2e%2e/%2e%2e/root", "GET").is_allowed());
-        assert!(validator.validate("https://api.openai.com/v1/chat/completions", "POST").is_allowed());
+        assert!(
+            !validator
+                .validate("https://api.openai.com/v1/../admin", "GET")
+                .is_allowed()
+        );
+        assert!(
+            !validator
+                .validate("https://api.openai.com/v1/../../etc/passwd", "GET")
+                .is_allowed()
+        );
+        assert!(
+            !validator
+                .validate("https://api.openai.com/v1/%2E%2E/admin", "GET")
+                .is_allowed()
+        );
+        assert!(
+            !validator
+                .validate("https://api.openai.com/v1/%2e%2e/%2e%2e/root", "GET")
+                .is_allowed()
+        );
+        assert!(
+            validator
+                .validate("https://api.openai.com/v1/chat/completions", "POST")
+                .is_allowed()
+        );
     }
 
     #[test]
