@@ -284,32 +284,8 @@ impl Agent {
                     for (idx, original_tc) in tool_calls.iter().enumerate() {
                         let mut tc = original_tc.clone();
 
-                        // Check if tool requires approval (skipped when auto_approve_tools is set)
-                        if !self.config.auto_approve_tools
-                            && let Some(tool) = self.tools().get(&tc.name).await
-                            && tool.requires_approval()
-                        {
-                            let mut is_auto_approved = {
-                                let sess = session.lock().await;
-                                sess.is_tool_auto_approved(&tc.name)
-                            };
-
-                            // Override auto-approval for destructive parameters
-                            if is_auto_approved && tool.requires_approval_for(&tc.arguments) {
-                                tracing::info!(
-                                    tool = %tc.name,
-                                    "Parameters require explicit approval despite auto-approve"
-                                );
-                                is_auto_approved = false;
-                            }
-
-                            if !is_auto_approved {
-                                approval_needed = Some((idx, tc, tool));
-                                break; // remaining tools are deferred
-                            }
-                        }
-
-                        // Hook: BeforeToolCall
+                        // Hook: BeforeToolCall (runs before approval so hooks can
+                        // modify parameters — approval is checked on final params)
                         let event = crate::hooks::HookEvent::ToolCall {
                             tool_name: tc.name.clone(),
                             parameters: tc.arguments.clone(),
@@ -350,6 +326,27 @@ impl Agent {
                                 }
                             },
                             _ => {}
+                        }
+
+                        // Check if tool requires approval on the final (post-hook)
+                        // parameters. Skipped when auto_approve_tools is set.
+                        if !self.config.auto_approve_tools
+                            && let Some(tool) = self.tools().get(&tc.name).await
+                        {
+                            use crate::tools::ApprovalRequirement;
+                            let needs_approval = match tool.requires_approval(&tc.arguments) {
+                                ApprovalRequirement::Never => false,
+                                ApprovalRequirement::UnlessAutoApproved => {
+                                    let sess = session.lock().await;
+                                    !sess.is_tool_auto_approved(&tc.name)
+                                }
+                                ApprovalRequirement::Always => true,
+                            };
+
+                            if needs_approval {
+                                approval_needed = Some((idx, tc, tool));
+                                break; // remaining tools are deferred
+                            }
                         }
 
                         let preflight_idx = preflight.len();
@@ -910,9 +907,9 @@ mod tests {
     }
 
     #[test]
-    fn test_shell_destructive_command_requires_approval_for() {
-        // ShellTool::requires_approval_for should detect destructive commands.
-        // This exercises the same code path used inline in run_agentic_loop.
+    fn test_shell_destructive_command_requires_explicit_approval() {
+        // requires_explicit_approval() detects destructive commands that
+        // should return ApprovalRequirement::Always from ShellTool.
         use crate::tools::builtin::shell::requires_explicit_approval;
 
         let destructive_cmds = [
