@@ -640,6 +640,32 @@ impl Agent {
                                             &message.metadata,
                                         )
                                         .await;
+
+                                    // Check for image_generated sentinel and emit SSE event
+                                    if let Ok(result_json) =
+                                        serde_json::from_str::<serde_json::Value>(output)
+                                        && let Some("image_generated") =
+                                            result_json.get("type").and_then(|v| v.as_str())
+                                        && let (Some(data), Some(media_type), Some(path)) = (
+                                            result_json.get("data").and_then(|v| v.as_str()),
+                                            result_json.get("media_type").and_then(|v| v.as_str()),
+                                            result_json.get("path").and_then(|v| v.as_str()),
+                                        )
+                                    {
+                                        let data_url =
+                                            format!("data:{};base64,{}", media_type, data);
+                                        let _ = self
+                                            .channels
+                                            .send_status(
+                                                &message.channel,
+                                                StatusUpdate::ImageGenerated {
+                                                    data_url,
+                                                    path: path.to_string(),
+                                                },
+                                                &message.metadata,
+                                            )
+                                            .await;
+                                    }
                                 }
 
                                 // Record result in thread

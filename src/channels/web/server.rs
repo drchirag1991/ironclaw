@@ -43,6 +43,7 @@ use crate::channels::web::types::*;
 use crate::channels::web::util::{build_turns_from_db_messages, truncate_preview};
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
+use crate::llm::ImageAttachment;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
@@ -625,6 +626,17 @@ async fn chat_send_handler(
         msg = msg.with_thread(thread_id);
         msg = msg.with_metadata(serde_json::json!({"thread_id": thread_id}));
     }
+
+    // Convert image data to ImageAttachment
+    let images: Vec<ImageAttachment> = req
+        .images
+        .into_iter()
+        .map(|img| ImageAttachment {
+            media_type: img.media_type,
+            data: img.data,
+        })
+        .collect();
+    msg = msg.with_images(images);
 
     let msg_id = msg.id;
     tracing::debug!(

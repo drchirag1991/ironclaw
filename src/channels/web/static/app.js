@@ -41,6 +41,9 @@ const SLASH_COMMANDS = [
 let _slashSelected = -1;
 let _slashMatches = [];
 
+// --- Image Attachments ---
+let stagedImages = []; // Array of { media_type, data, previewUrl }
+
 // --- Tool Activity State ---
 let _activeGroup = null;
 let _activeToolCards = {};
@@ -112,6 +115,78 @@ document.getElementById('token-input').addEventListener('keydown', (e) => {
     authenticate();
   }
 })();
+
+// --- Image Attachment Handlers ---
+
+// Handle file picker selection
+document.getElementById('image-input').addEventListener('change', (e) => {
+  const files = e.target.files;
+  if (files) {
+    for (let file of files) {
+      if (file.type.startsWith('image/')) {
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+          const base64Data = evt.target.result.split(',')[1]; // Remove data URL prefix
+          stagedImages.push({
+            media_type: file.type,
+            data: base64Data,
+            previewUrl: evt.target.result,
+          });
+          renderImagePreviews();
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+  }
+  // Reset file input so the same file can be selected again
+  e.target.value = '';
+});
+
+// Handle paste event
+document.getElementById('chat-input').addEventListener('paste', (e) => {
+  const items = e.clipboardData.items;
+  for (let item of items) {
+    if (item.type.startsWith('image/')) {
+      e.preventDefault();
+      const file = item.getAsFile();
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        const base64Data = evt.target.result.split(',')[1];
+        stagedImages.push({
+          media_type: item.type,
+          data: base64Data,
+          previewUrl: evt.target.result,
+        });
+        renderImagePreviews();
+      };
+      reader.readAsDataURL(file);
+    }
+  }
+});
+
+function renderImagePreviews() {
+  const strip = document.getElementById('image-preview-strip');
+  if (stagedImages.length === 0) {
+    strip.style.display = 'none';
+    return;
+  }
+  strip.style.display = 'flex';
+  strip.innerHTML = '';
+  stagedImages.forEach((img, idx) => {
+    const container = document.createElement('div');
+    container.className = 'image-preview';
+    container.innerHTML = `
+      <img src="${img.previewUrl}" alt="Preview">
+      <button class="image-preview-remove" onclick="removeImage(${idx})" title="Remove">×</button>
+    `;
+    strip.appendChild(container);
+  });
+}
+
+function removeImage(idx) {
+  stagedImages.splice(idx, 1);
+  renderImagePreviews();
+}
 
 // --- API helper ---
 
@@ -315,6 +390,12 @@ function connectSSE() {
     setToolCardOutput(data.name, data.preview);
   });
 
+  eventSource.addEventListener('image_generated', (e) => {
+    const data = JSON.parse(e.data);
+    if (!isCurrentThread(data.thread_id)) return;
+    addGeneratedImage(data.data_url, data.path);
+  });
+
   eventSource.addEventListener('stream_chunk', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
@@ -430,19 +511,28 @@ function sendMessage() {
     return;
   }
   const content = input.value.trim();
-  if (!content) return;
+  if (!content && stagedImages.length === 0) return;
 
   addMessage('user', content);
   input.value = '';
   autoResizeTextarea(input);
   input.focus();
 
+  const images = stagedImages.map(img => ({
+    media_type: img.media_type,
+    data: img.data,
+  }));
+
   apiFetch('/api/chat/send', {
     method: 'POST',
-    body: { content, thread_id: currentThreadId || undefined },
+    body: { content, thread_id: currentThreadId || undefined, images },
   }).catch((err) => {
     addMessage('system', 'Failed to send: ' + err.message);
   });
+
+  // Clear staged images after sending
+  stagedImages = [];
+  renderImagePreviews();
 }
 
 function enableChatInput() {
@@ -856,6 +946,26 @@ function finalizeActivityGroup() {
 
   _activeGroup = null;
   _activeToolCards = {};
+}
+
+function addGeneratedImage(dataUrl, path) {
+  const container = document.getElementById('chat-messages');
+  const card = document.createElement('div');
+  card.className = 'generated-image-card';
+
+  const img = document.createElement('img');
+  img.src = dataUrl;
+  img.alt = 'Generated image';
+  img.className = 'generated-image';
+
+  const pathLabel = document.createElement('div');
+  pathLabel.className = 'generated-image-path';
+  pathLabel.textContent = 'Saved to: ' + path;
+
+  card.appendChild(img);
+  card.appendChild(pathLabel);
+  container.appendChild(card);
+  container.scrollTop = container.scrollHeight;
 }
 
 function showApproval(data) {
