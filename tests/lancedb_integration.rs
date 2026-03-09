@@ -57,7 +57,7 @@ async fn setup_workspace() -> (Workspace, TempDir, TempDir) {
     libsql.run_migrations().await.unwrap();
 
     let lancedb_dir = TempDir::new().unwrap();
-    let store = LanceDbVectorStore::new(lancedb_dir.path()).await.unwrap();
+    let store = LanceDbVectorStore::new(lancedb_dir.path(), None).await.unwrap();
 
     let embedding = make_embedding(1.0);
     let ws = Workspace::new_with_db("test_user", Arc::new(libsql) as Arc<dyn Database>)

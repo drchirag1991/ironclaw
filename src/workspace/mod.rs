@@ -868,26 +868,32 @@ impl Workspace {
                 None
             };
 
+            // When an external vector store is active, skip writing embeddings
+            // to the DB (they'd never be queried from there).
+            let db_embedding = if self.vector_store.is_some() {
+                None
+            } else {
+                embedding.as_deref()
+            };
+
             let chunk_id = self
                 .storage
-                .insert_chunk(document_id, index as i32, &content, embedding.as_deref())
+                .insert_chunk(document_id, index as i32, &content, db_embedding)
                 .await?;
 
-            // Sync embedding to external vector store
-            if let (Some(vs), Some(emb)) = (&self.vector_store, &embedding)
-                && let Err(e) = vs
-                    .store_embedding(
-                        chunk_id,
-                        document_id,
-                        &doc.path,
-                        &doc.user_id,
-                        doc.agent_id,
-                        &content,
-                        emb,
-                    )
-                    .await
-            {
-                tracing::warn!("Failed to store embedding in vector store: {}", e);
+            // Sync embedding to external vector store (propagate errors to
+            // avoid leaving a document with deleted-then-missing embeddings).
+            if let (Some(vs), Some(emb)) = (&self.vector_store, &embedding) {
+                vs.store_embedding(
+                    chunk_id,
+                    document_id,
+                    &doc.path,
+                    &doc.user_id,
+                    doc.agent_id,
+                    &content,
+                    emb,
+                )
+                .await?;
             }
         }
 
@@ -1133,6 +1139,23 @@ impl Workspace {
             .get_chunks_without_embeddings(&self.user_id, self.agent_id, 100)
             .await?;
 
+        // Prefetch document metadata to avoid N+1 queries when syncing to vector store
+        let doc_map: std::collections::HashMap<Uuid, crate::workspace::document::MemoryDocument> =
+            if self.vector_store.is_some() {
+                let mut map = std::collections::HashMap::new();
+                for chunk in &chunks {
+                    if !map.contains_key(&chunk.document_id)
+                        && let Ok(doc) =
+                            self.storage.get_document_by_id(chunk.document_id).await
+                    {
+                        map.insert(doc.id, doc);
+                    }
+                }
+                map
+            } else {
+                std::collections::HashMap::new()
+            };
+
         let mut count = 0;
         for chunk in chunks {
             match provider.embed(&chunk.content).await {
@@ -1142,9 +1165,9 @@ impl Workspace {
                         .await?;
 
                     // Sync to external vector store
-                    if let Some(ref vs) = self.vector_store {
-                        let doc = self.storage.get_document_by_id(chunk.document_id).await?;
-                        if let Err(e) = vs
+                    if let Some(ref vs) = self.vector_store
+                        && let Some(doc) = doc_map.get(&chunk.document_id)
+                        && let Err(e) = vs
                             .update_embedding(
                                 chunk.id,
                                 chunk.document_id,
@@ -1155,13 +1178,12 @@ impl Workspace {
                                 &embedding,
                             )
                             .await
-                        {
-                            tracing::warn!(
-                                "Failed to sync embedding to vector store for chunk {}: {}",
-                                chunk.id,
-                                e
-                            );
-                        }
+                    {
+                        tracing::warn!(
+                            "Failed to sync embedding to vector store for chunk {}: {}",
+                            chunk.id,
+                            e
+                        );
                     }
 
                     count += 1;

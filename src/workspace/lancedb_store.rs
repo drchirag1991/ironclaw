@@ -8,8 +8,8 @@
 //!   LANCEDB_PATH=~/.ironclaw/lancedb   # Default
 //!   VECTOR_BACKEND=lancedb             # Use LanceDB for vector search
 
-/// Embedding dimension (text-embedding-3-small default).
-/// Must match the embedding model used.
+/// Default embedding dimension (text-embedding-3-small).
+/// Override by passing the actual provider dimension to `LanceDbVectorStore::new()`.
 pub const DEFAULT_EMBEDDING_DIM: i32 = 1536;
 
 #[cfg(feature = "lancedb")]
@@ -38,15 +38,28 @@ mod impl_lancedb {
     }
 
     /// LanceDB-backed vector store.
+    ///
+    /// The `update_embedding` method uses delete-then-insert (not atomic).
+    /// LanceDB does not support transactions, so a crash between the two
+    /// operations can lose the embedding for that chunk. This is acceptable
+    /// for personal workspace sizes where data can be reindexed.
     pub struct LanceDbVectorStore {
         db: Arc<lancedb::Connection>,
         table_name: String,
         embedding_dim: i32,
+        schema: Arc<Schema>,
+        table: tokio::sync::OnceCell<lancedb::Table>,
     }
 
     impl LanceDbVectorStore {
         /// Create a new LanceDB store at the given path.
-        pub async fn new(path: impl AsRef<std::path::Path>) -> Result<Self, WorkspaceError> {
+        ///
+        /// `embedding_dim` should match `EmbeddingProvider::dimension()`.
+        /// Pass `None` to use the default (1536, text-embedding-3-small).
+        pub async fn new(
+            path: impl AsRef<std::path::Path>,
+            embedding_dim: Option<usize>,
+        ) -> Result<Self, WorkspaceError> {
             let path_str = path
                 .as_ref()
                 .to_str()
@@ -60,10 +73,15 @@ mod impl_lancedb {
                 }
             })?;
 
+            let dim = embedding_dim.unwrap_or(DEFAULT_EMBEDDING_DIM as usize) as i32;
+            let schema = Arc::new(Self::build_schema(dim));
+
             let store = Self {
                 db: Arc::new(db),
                 table_name: TABLE_NAME.to_string(),
-                embedding_dim: DEFAULT_EMBEDDING_DIM,
+                embedding_dim: dim,
+                schema,
+                table: tokio::sync::OnceCell::new(),
             };
 
             store.ensure_table().await?;
@@ -81,9 +99,8 @@ mod impl_lancedb {
                 return Ok(());
             }
 
-            let schema = Arc::new(self.schema());
             self.db
-                .create_empty_table(&self.table_name, schema.clone())
+                .create_empty_table(&self.table_name, self.schema.clone())
                 .execute()
                 .await
                 .map_err(|e| WorkspaceError::SearchFailed {
@@ -96,7 +113,22 @@ mod impl_lancedb {
             Ok(())
         }
 
-        fn schema(&self) -> Schema {
+        /// Get or open the cached table handle.
+        async fn table(&self) -> Result<&lancedb::Table, WorkspaceError> {
+            self.table
+                .get_or_try_init(|| async {
+                    self.db
+                        .open_table(&self.table_name)
+                        .execute()
+                        .await
+                        .map_err(|e| WorkspaceError::SearchFailed {
+                            reason: format!("Failed to open table: {}", e),
+                        })
+                })
+                .await
+        }
+
+        fn build_schema(embedding_dim: i32) -> Schema {
             Schema::new(vec![
                 Field::new("chunk_id", DataType::Utf8, false),
                 Field::new("document_id", DataType::Utf8, false),
@@ -108,7 +140,7 @@ mod impl_lancedb {
                     "vector",
                     DataType::FixedSizeList(
                         Arc::new(Field::new("item", DataType::Float32, true)),
-                        self.embedding_dim,
+                        embedding_dim,
                     ),
                     false,
                 ),
@@ -138,14 +170,7 @@ mod impl_lancedb {
                 });
             }
 
-            let table = self
-                .db
-                .open_table(&self.table_name)
-                .execute()
-                .await
-                .map_err(|e| WorkspaceError::SearchFailed {
-                    reason: format!("Failed to open table: {}", e),
-                })?;
+            let table = self.table().await?;
 
             let chunk_ids = StringArray::from(vec![chunk_id.to_string()]);
             let document_ids = StringArray::from(vec![document_id.to_string()]);
@@ -160,7 +185,7 @@ mod impl_lancedb {
             );
 
             let batch = RecordBatch::try_new(
-                Arc::new(self.schema()),
+                self.schema.clone(),
                 vec![
                     Arc::new(chunk_ids),
                     Arc::new(document_ids),
@@ -171,19 +196,19 @@ mod impl_lancedb {
                     Arc::new(vectors),
                 ],
             )
-            .map_err(|e| WorkspaceError::ChunkingFailed {
+            .map_err(|e| WorkspaceError::EmbeddingFailed {
                 reason: format!("Failed to create record batch: {}", e),
             })?;
 
             let batches =
-                RecordBatchIterator::new(vec![Ok(batch)].into_iter(), Arc::new(self.schema()));
+                RecordBatchIterator::new(vec![Ok(batch)].into_iter(), self.schema.clone());
 
             table
                 .add(Box::new(batches) as Box<dyn arrow_array::RecordBatchReader + Send>)
                 .execute()
                 .await
-                .map_err(|e| WorkspaceError::ChunkingFailed {
-                    reason: format!("Failed to insert chunk: {}", e),
+                .map_err(|e| WorkspaceError::EmbeddingFailed {
+                    reason: format!("Failed to store embedding: {}", e),
                 })?;
 
             Ok(())
@@ -199,14 +224,7 @@ mod impl_lancedb {
             content: &str,
             embedding: &[f32],
         ) -> Result<(), WorkspaceError> {
-            let table = self
-                .db
-                .open_table(&self.table_name)
-                .execute()
-                .await
-                .map_err(|e| WorkspaceError::SearchFailed {
-                    reason: format!("Failed to open table: {}", e),
-                })?;
+            let table = self.table().await?;
 
             table
                 .delete(&format!(
@@ -231,14 +249,7 @@ mod impl_lancedb {
         }
 
         async fn delete_embeddings(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
-            let table = self
-                .db
-                .open_table(&self.table_name)
-                .execute()
-                .await
-                .map_err(|e| WorkspaceError::SearchFailed {
-                    reason: format!("Failed to open table: {}", e),
-                })?;
+            let table = self.table().await?;
 
             table
                 .delete(&format!(
@@ -246,8 +257,8 @@ mod impl_lancedb {
                     escape_predicate_value(&document_id.to_string())
                 ))
                 .await
-                .map_err(|e| WorkspaceError::ChunkingFailed {
-                    reason: format!("Failed to delete chunks: {}", e),
+                .map_err(|e| WorkspaceError::EmbeddingFailed {
+                    reason: format!("Failed to delete embeddings: {}", e),
                 })?;
 
             Ok(())
@@ -260,14 +271,7 @@ mod impl_lancedb {
             embedding: &[f32],
             limit: usize,
         ) -> Result<Vec<RankedResult>, WorkspaceError> {
-            let table = self
-                .db
-                .open_table(&self.table_name)
-                .execute()
-                .await
-                .map_err(|e| WorkspaceError::SearchFailed {
-                    reason: format!("Failed to open table: {}", e),
-                })?;
+            let table = self.table().await?;
 
             let filter = if let Some(aid) = agent_id {
                 format!(
@@ -407,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_and_vector_search() {
         let dir = TempDir::new().unwrap();
-        let store = LanceDbVectorStore::new(dir.path()).await.unwrap();
+        let store = LanceDbVectorStore::new(dir.path(), None).await.unwrap();
 
         let chunk_id = Uuid::new_v4();
         let document_id = Uuid::new_v4();
@@ -443,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_multiple_and_search_returns_ordered() {
         let dir = TempDir::new().unwrap();
-        let store = LanceDbVectorStore::new(dir.path()).await.unwrap();
+        let store = LanceDbVectorStore::new(dir.path(), None).await.unwrap();
 
         let doc_id = Uuid::new_v4();
         let user_id = "user1";
@@ -479,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_chunks() {
         let dir = TempDir::new().unwrap();
-        let store = LanceDbVectorStore::new(dir.path()).await.unwrap();
+        let store = LanceDbVectorStore::new(dir.path(), None).await.unwrap();
 
         let doc_id = Uuid::new_v4();
         let user_id = "user1";
@@ -515,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_chunk_embedding() {
         let dir = TempDir::new().unwrap();
-        let store = LanceDbVectorStore::new(dir.path()).await.unwrap();
+        let store = LanceDbVectorStore::new(dir.path(), None).await.unwrap();
 
         let chunk_id = Uuid::new_v4();
         let doc_id = Uuid::new_v4();
@@ -560,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn test_vector_search_filters_by_user_and_agent() {
         let dir = TempDir::new().unwrap();
-        let store = LanceDbVectorStore::new(dir.path()).await.unwrap();
+        let store = LanceDbVectorStore::new(dir.path(), None).await.unwrap();
 
         let doc_id = Uuid::new_v4();
         let embedding = make_embedding(1.0);
@@ -615,7 +619,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_rejects_wrong_embedding_dim() {
         let dir = TempDir::new().unwrap();
-        let store = LanceDbVectorStore::new(dir.path()).await.unwrap();
+        let store = LanceDbVectorStore::new(dir.path(), None).await.unwrap();
 
         let wrong_dim: Vec<f32> = vec![1.0; 100];
 

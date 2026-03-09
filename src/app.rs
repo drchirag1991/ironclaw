@@ -397,7 +397,8 @@ impl AppBuilder {
                         .lancedb_path
                         .clone()
                         .unwrap_or_else(crate::config::default_lancedb_path);
-                    match crate::workspace::LanceDbVectorStore::new(path).await {
+                    let dim = embeddings.as_ref().map(|p| p.dimension());
+                    match crate::workspace::LanceDbVectorStore::new(path, dim).await {
                         Ok(store) => {
                             tracing::info!("LanceDB vector store connected for workspace search");
                             Some(Arc::new(store) as Arc<dyn crate::workspace::VectorStore>)
