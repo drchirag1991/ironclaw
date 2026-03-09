@@ -551,6 +551,10 @@ fn validate_tool_name(name: &str) -> anyhow::Result<()> {
 }
 
 /// Initialize the secrets store from environment config.
+///
+/// **Known Issue:** This function crashes with "invalid connection string" on libSQL deployments
+/// when called from `tool setup` or `secret set` subcommands. See `src/db/mod.rs` `create_secrets_store()`
+/// documentation for details and workaround.
 async fn init_secrets_store() -> anyhow::Result<Arc<dyn SecretsStore + Send + Sync>> {
     let config = Config::from_env().await?;
     let master_key = config.secrets.master_key().ok_or_else(|| {

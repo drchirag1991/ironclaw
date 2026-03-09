@@ -647,14 +647,15 @@ Key test patterns:
 
 ## Current Limitations / TODOs
 
-1. **Domain-specific tools** - `marketplace.rs`, `restaurant.rs`, `taskrabbit.rs`, `ecommerce.rs` return placeholder responses; need real API integrations
-2. **Integration tests** - Need testcontainers setup for PostgreSQL
-3. **MCP stdio transport** - Only HTTP transport implemented
-4. **WIT bindgen integration** - Auto-extract tool description/schema from WASM modules (stubbed)
-5. **Capability granting after tool build** - Built tools get empty capabilities; need UX for granting HTTP/secrets access
-6. **Tool versioning workflow** - No version tracking or rollback for dynamically built tools
-7. **Full channel status view** - Gateway status widget exists, but no per-channel connection dashboard
-8. **Observability backends** - Only `log` and `noop` implemented; OpenTelemetry/Prometheus not yet supported
+1. **libSQL CLI connection crash** - `ironclaw tool setup` and `ironclaw secret set` crash with "invalid connection string" error on libSQL deployments. Blocks all interactive setup flows. Workaround: manually encrypt secrets via Python. See `src/db/mod.rs` `create_secrets_store()` doc comment. Related: #655 (libSQL backend gaps).
+2. **Domain-specific tools** - `marketplace.rs`, `restaurant.rs`, `taskrabbit.rs`, `ecommerce.rs` return placeholder responses; need real API integrations
+3. **Integration tests** - Need testcontainers setup for PostgreSQL
+4. **MCP stdio transport** - Only HTTP transport implemented
+5. **WIT bindgen integration** - Auto-extract tool description/schema from WASM modules (stubbed)
+6. **Capability granting after tool build** - Built tools get empty capabilities; need UX for granting HTTP/secrets access
+7. **Tool versioning workflow** - No version tracking or rollback for dynamically built tools
+8. **Full channel status view** - Gateway status widget exists, but no per-channel connection dashboard
+9. **Observability backends** - Only `log` and `noop` implemented; OpenTelemetry/Prometheus not yet supported
 
 ## Tool Architecture
 

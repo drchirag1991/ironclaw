@@ -96,6 +96,24 @@ pub async fn connect_from_config(
 /// This is the shared factory for CLI commands and other call sites that need
 /// a `SecretsStore` without going through the full `AppBuilder`. Mirrors the
 /// pattern of [`connect_from_config`] but returns a secrets-specific store.
+///
+/// ## Known Issue: libSQL CLI Connection Crash
+///
+/// Running `ironclaw tool setup` or `ironclaw secret set` crashes with an
+/// "invalid connection string" error when DATABASE_BACKEND=libsql. This blocks
+/// all interactive setup flows on libSQL deployments (the default for hosted agents).
+///
+/// **Workaround:** Manually read the master key from `/proc/PID/environ`, encrypt
+/// secrets with AES-256-GCM via Python ctypes, and write directly to the secrets table.
+///
+/// **Related Issue:** #655 (libSQL backend gaps)
+///
+/// **Root Cause:** Unclear; the local libSQL database opens fine for the main process,
+/// but CLI subcommands fail when calling `LibSqlBackend::new_local(path)`. Likely
+/// relates to path resolution, file permissions, or WAL mode conflicts in concurrent
+/// connection scenarios.
+///
+/// **TODO:** Debug why libSQL connection fails in CLI context while working in main.rs.
 pub async fn create_secrets_store(
     config: &crate::config::DatabaseConfig,
     crypto: Arc<crate::secrets::SecretsCrypto>,

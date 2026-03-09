@@ -627,6 +627,11 @@ async fn save_servers(
 }
 
 /// Initialize and return the secrets store.
+/// Get the secrets store for MCP authentication operations.
+///
+/// **Known Issue:** This function crashes with "invalid connection string" on libSQL deployments
+/// when called from `mcp auth` subcommands. See `src/db/mod.rs` `create_secrets_store()`
+/// documentation for details and workaround.
 async fn get_secrets_store() -> anyhow::Result<Arc<dyn SecretsStore + Send + Sync>> {
     let config = Config::from_env().await?;
 
