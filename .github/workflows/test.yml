@@ -117,9 +117,7 @@ jobs:
   version-check:
     name: Version Bump Check
     runs-on: ubuntu-latest
-    if: >
-      github.event_name == 'pull_request' &&
-      contains(github.event.pull_request.labels.*.name, 'staging-promotion')
+    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6

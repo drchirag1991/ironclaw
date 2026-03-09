@@ -298,6 +298,15 @@ jobs:
             exit 0
           fi
 
+          # Check for "No issues found" first (clean pass)
+          NO_ISSUES=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq '[.[] | select(.user.login == "claude[bot]") | select(.body | test("No issues found"))] | length' 2>/dev/null || echo "0")
+          if [ "$NO_ISSUES" -gt 0 ]; then
+            echo "Claude review found no issues — gate passes"
+            echo "has_blocking=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Get the last Claude comment that contains findings
           JQ_FILTER='[.[] | select(.user.login == "claude[bot]") | select(.body | test("Found [0-9]+ issue"))] | last'
           BODY=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
