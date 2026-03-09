@@ -3,6 +3,7 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened]
+  workflow_dispatch:
 
 permissions:
   contents: read
