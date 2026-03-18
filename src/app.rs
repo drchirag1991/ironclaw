@@ -686,10 +686,10 @@ impl AppBuilder {
         // Post-init validation: backends with dedicated config (nearai, gemini_oauth,
         // bedrock) handle their own credential resolution. For registry-based backends,
         // fail early if no provider config was resolved.
-        if self.config.llm.backend != "nearai"
-            && self.config.llm.backend != "gemini_oauth"
-            && self.config.llm.backend != "bedrock"
-            && self.config.llm.provider.is_none()
+        if !matches!(
+            self.config.llm.backend.as_str(),
+            "nearai" | "gemini_oauth" | "bedrock"
+        ) && self.config.llm.provider.is_none()
         {
             let backend = &self.config.llm.backend;
             anyhow::bail!(

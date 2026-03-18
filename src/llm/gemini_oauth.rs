@@ -88,28 +88,78 @@ fn default_safety_settings() -> Vec<serde_json::Value> {
 }
 
 /// Parse `GEMINI_CLI_CUSTOM_HEADERS` env var in format `key:value,key:value`.
-/// Commas inside values are preserved (splits only on commas followed by a header key pattern).
+/// Commas inside values are preserved — splits only on commas followed by a
+/// valid HTTP header name pattern (ASCII alphanumeric/hyphen, then `:`).
 fn parse_custom_headers() -> std::collections::HashMap<String, String> {
     let mut headers = std::collections::HashMap::new();
     let env_val = match std::env::var("GEMINI_CLI_CUSTOM_HEADERS") {
         Ok(v) if !v.is_empty() => v,
         _ => return headers,
     };
-    // Split on commas followed by a header-key pattern (word chars + colon)
-    for entry in env_val.split(',') {
-        let trimmed = entry.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some(sep_idx) = trimmed.find(':') {
-            let name = trimmed[..sep_idx].trim();
-            let value = trimmed[sep_idx + 1..].trim();
-            if !name.is_empty() {
-                headers.insert(name.to_string(), value.to_string());
+
+    // Manual split: a comma is a separator only when followed (after optional
+    // whitespace) by `<header-name>:` where header-name is `[A-Za-z0-9\-]+`.
+    let bytes = env_val.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b',' {
+            // Check if the text after the comma looks like a header name + colon
+            let rest = &env_val[i + 1..];
+            let trimmed = rest.trim_start();
+            let hdr_len = trimmed
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+                .count();
+            if hdr_len > 0 && trimmed.as_bytes().get(hdr_len) == Some(&b':') {
+                // This comma is a real separator
+                let entry = env_val[start..i].trim();
+                if let Some(sep) = entry.find(':') {
+                    let name = entry[..sep].trim();
+                    let value = entry[sep + 1..].trim();
+                    if !name.is_empty() {
+                        headers.insert(name.to_string(), value.to_string());
+                    }
+                }
+                start = i + 1;
             }
+        }
+        i += 1;
+    }
+    // Last entry
+    let entry = env_val[start..].trim();
+    if let Some(sep) = entry.find(':') {
+        let name = entry[..sep].trim();
+        let value = entry[sep + 1..].trim();
+        if !name.is_empty() {
+            headers.insert(name.to_string(), value.to_string());
         }
     }
     headers
+}
+
+/// Return the context window length for a known Gemini model.
+/// Uses explicit match on known model IDs, with a fallback heuristic
+/// for unrecognized models.
+fn gemini_context_length(model: &str) -> u32 {
+    match model {
+        // Pro models — 2M context
+        "gemini-2.5-pro"
+        | "gemini-3-pro-preview"
+        | "gemini-3.1-pro-preview"
+        | "gemini-3.1-pro-preview-customtools" => 2_000_000,
+        // Flash / Flash-Lite — 1M context
+        "gemini-2.5-flash"
+        | "gemini-2.5-flash-lite"
+        | "gemini-3-flash-preview"
+        | "gemini-3.1-flash-lite-preview" => 1_000_000,
+        // Legacy
+        "gemini-1.5-pro" => 2_000_000,
+        "gemini-1.5-flash" => 1_000_000,
+        "gemini-2.0-flash" => 1_000_000,
+        // Fallback for unknown models
+        _ => 1_000_000,
+    }
 }
 
 /// Determine whether a model supports "modern features" (thought signatures, etc.).
@@ -1311,6 +1361,16 @@ impl GeminiOauthProvider {
                 let mut candidates_tokens: i64 = 0;
                 let mut tool_calls_parts = Vec::<serde_json::Value>::new();
 
+                // Metadata (collected in the same pass)
+                let mut model_version: Option<String> = None;
+                let mut prompt_feedback: Option<serde_json::Value> = None;
+                let mut grounding_metadata: Option<serde_json::Value> = None;
+                let mut citation_metadata: Option<serde_json::Value> = None;
+                let mut cached_content_token_count: Option<u32> = None;
+                let mut total_token_count: Option<u32> = None;
+                let mut consumed_credits: Vec<GeminiCredits> = Vec::new();
+                let mut remaining_credits: Vec<GeminiCredits> = Vec::new();
+
                 for line in body_str.lines() {
                     let Some(json_str) = line.strip_prefix("data:") else {
                         continue;
@@ -1320,11 +1380,29 @@ impl GeminiOauthProvider {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+
+                    // Credits from Cloud Code wrapper (top-level, outside "response")
+                    if let Some(cc) = chunk.get("consumedCredits").and_then(|c| c.as_array()) {
+                        for c in cc {
+                            if let Ok(credit) = serde_json::from_value::<GeminiCredits>(c.clone()) {
+                                consumed_credits.push(credit);
+                            }
+                        }
+                    }
+                    if let Some(rc) = chunk.get("remainingCredits").and_then(|c| c.as_array()) {
+                        for c in rc {
+                            if let Ok(credit) = serde_json::from_value::<GeminiCredits>(c.clone()) {
+                                remaining_credits.push(credit);
+                            }
+                        }
+                    }
+
                     let resp = match chunk.get("response") {
                         Some(r) => r,
                         None => continue,
                     };
 
+                    // Content extraction
                     if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array())
                         && let Some(first) = candidates.first()
                     {
@@ -1353,75 +1431,7 @@ impl GeminiOauthProvider {
                         if let Some(fr) = first.get("finishReason").and_then(|fr| fr.as_str()) {
                             finish_reason = fr.to_string();
                         }
-                    }
-
-                    if let Some(usage) = resp.get("usageMetadata") {
-                        if let Some(pt) = usage.get("promptTokenCount").and_then(|pt| pt.as_i64()) {
-                            prompt_tokens = pt;
-                        }
-                        if let Some(ct) =
-                            usage.get("candidatesTokenCount").and_then(|ct| ct.as_i64())
-                        {
-                            candidates_tokens = ct;
-                        }
-                    }
-                }
-
-                // Collect metadata from SSE chunks
-                let mut model_version: Option<String> = None;
-                let mut prompt_feedback: Option<serde_json::Value> = None;
-                let mut grounding_metadata: Option<serde_json::Value> = None;
-                let mut citation_metadata: Option<serde_json::Value> = None;
-                let mut cached_content_token_count: Option<u32> = None;
-                let mut total_token_count: Option<u32> = None;
-                let mut consumed_credits: Vec<GeminiCredits> = Vec::new();
-                let mut remaining_credits: Vec<GeminiCredits> = Vec::new();
-
-                // Re-parse SSE for metadata (iterate again)
-                for line in body_str.lines() {
-                    let Some(json_str) = line.strip_prefix("data:") else {
-                        continue;
-                    };
-                    let json_str = json_str.trim();
-                    let chunk: serde_json::Value = match serde_json::from_str(json_str) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    // Credits from Cloud Code wrapper
-                    if let Some(cc) = chunk.get("consumedCredits").and_then(|c| c.as_array()) {
-                        for c in cc {
-                            if let Ok(credit) = serde_json::from_value::<GeminiCredits>(c.clone()) {
-                                consumed_credits.push(credit);
-                            }
-                        }
-                    }
-                    if let Some(rc) = chunk.get("remainingCredits").and_then(|c| c.as_array()) {
-                        for c in rc {
-                            if let Ok(credit) = serde_json::from_value::<GeminiCredits>(c.clone()) {
-                                remaining_credits.push(credit);
-                            }
-                        }
-                    }
-
-                    let resp = match chunk.get("response") {
-                        Some(r) => r,
-                        None => continue,
-                    };
-
-                    if model_version.is_none()
-                        && let Some(mv) = resp.get("modelVersion").and_then(|v| v.as_str())
-                    {
-                        model_version = Some(mv.to_string());
-                    }
-                    if prompt_feedback.is_none()
-                        && let Some(pf) = resp.get("promptFeedback")
-                    {
-                        prompt_feedback = Some(pf.clone());
-                    }
-                    if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array())
-                        && let Some(first) = candidates.first()
-                    {
+                        // Per-candidate metadata
                         if grounding_metadata.is_none()
                             && let Some(gm) = first.get("groundingMetadata")
                         {
@@ -1433,7 +1443,27 @@ impl GeminiOauthProvider {
                             citation_metadata = Some(cm.clone());
                         }
                     }
+
+                    // Response-level metadata
+                    if model_version.is_none()
+                        && let Some(mv) = resp.get("modelVersion").and_then(|v| v.as_str())
+                    {
+                        model_version = Some(mv.to_string());
+                    }
+                    if prompt_feedback.is_none()
+                        && let Some(pf) = resp.get("promptFeedback")
+                    {
+                        prompt_feedback = Some(pf.clone());
+                    }
                     if let Some(usage) = resp.get("usageMetadata") {
+                        if let Some(pt) = usage.get("promptTokenCount").and_then(|pt| pt.as_i64()) {
+                            prompt_tokens = pt;
+                        }
+                        if let Some(ct) =
+                            usage.get("candidatesTokenCount").and_then(|ct| ct.as_i64())
+                        {
+                            candidates_tokens = ct;
+                        }
                         if let Some(ct) = usage
                             .get("cachedContentTokenCount")
                             .and_then(|t| t.as_u64())
@@ -1977,16 +2007,8 @@ impl LlmProvider for GeminiOauthProvider {
     }
 
     async fn model_metadata(&self) -> Result<ModelMetadata, LlmError> {
-        // Assumption: no Gemini model name contains both "pro" and "flash"
-        // (e.g. "gemini-3.1-pro-flash"). If such a model appears, this
-        // ordering gives "pro" priority (2M context). Update as needed.
-        let context_length = if self.config.model.contains("pro") {
-            Some(2_000_000)
-        } else if self.config.model.contains("flash") {
-            Some(1_000_000)
-        } else {
-            None
-        };
+        let model = self.config.model.as_str();
+        let context_length = Some(gemini_context_length(model));
 
         Ok(ModelMetadata {
             id: self.config.model.clone(),
