@@ -78,7 +78,7 @@ GEMINI_MODEL=gemini-2.5-flash
 |---|---|---|
 | Function calling | ✅ | `functionDeclarations` / `functionCall` / `functionResponse` |
 | `generationConfig` | ✅ | `temperature`, `maxOutputTokens` passed from request |
-| `thinkingConfig` | ✅ | `includeThoughts: true` for `gemini-3`/`thinking` models |
+| `thinkingConfig` | ✅ | `thinkingBudget`/`thinkingLevel` for thinking-capable models |
 | `toolConfig` | ✅ | `functionCallingConfig.mode`: `AUTO`/`ANY`/`NONE` |
 | SSE streaming | ✅ | Cloud Code API with `streamGenerateContent?alt=sse` |
 | Token refresh | ✅ | Automatic via refresh token |

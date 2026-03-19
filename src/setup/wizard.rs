@@ -1037,7 +1037,7 @@ impl SetupWizard {
             } else {
                 match current.as_str() {
                     "nearai" => "NEAR AI".to_string(),
-                    "gemini_oauth" => "Gemini API (OAuth)".to_string(),
+                    "gemini_oauth" | "gemini-oauth" => "Gemini API (OAuth)".to_string(),
                     _ => {
                         if let Some(def) = registry.find(&current) {
                             def.setup
@@ -1055,6 +1055,7 @@ impl SetupWizard {
             let is_known = current == "nearai"
                 || current == "bedrock"
                 || current == "gemini_oauth"
+                || current == "gemini-oauth"
                 || registry.is_known(&current);
 
             if is_known && confirm("Keep current provider?", true).map_err(SetupError::Io)? {
@@ -1062,7 +1063,7 @@ impl SetupWizard {
                     print_info("Keeping existing AWS Bedrock configuration.");
                     return Ok(());
                 }
-                if current == "gemini_oauth" {
+                if current == "gemini_oauth" || current == "gemini-oauth" {
                     print_info("Keeping existing Gemini CLI OAuth configuration.");
                     return Ok(());
                 }

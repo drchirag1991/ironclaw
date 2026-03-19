@@ -89,7 +89,7 @@ fn default_safety_settings() -> Vec<serde_json::Value> {
 
 /// Parse `GEMINI_CLI_CUSTOM_HEADERS` env var in format `key:value,key:value`.
 /// Commas inside values are preserved — splits only on commas followed by a
-/// valid HTTP header name pattern (ASCII alphanumeric/hyphen, then `:`).
+/// valid HTTP header name pattern (ASCII alphanumeric/hyphen/underscore, then `:`).
 fn parse_custom_headers() -> std::collections::HashMap<String, String> {
     let mut headers = std::collections::HashMap::new();
     let env_val = match std::env::var("GEMINI_CLI_CUSTOM_HEADERS") {
@@ -397,7 +397,9 @@ impl CredentialManager {
                 if let Some(pid) = self.discover_project_id(&updated.access_token).await {
                     info!(project_id = %pid, "Discovered Cloud Code project");
                     updated.project_id = Some(pid);
-                    let _ = self.save_credential(&updated).await;
+                    if let Err(e) = self.save_credential(&updated).await {
+                        warn!(error = %e, "Failed to persist discovered project_id to credentials file");
+                    }
                 }
                 return Ok(updated);
             }
@@ -1617,7 +1619,13 @@ impl GeminiOauthProvider {
                     }));
                 }
                 Role::Assistant => {
-                    let mut parts = vec![serde_json::json!({ "text": msg.content })];
+                    let mut parts = Vec::new();
+                    // Only add text part if content is non-empty (assistant messages
+                    // with tool calls often have empty content, and curate_contents
+                    // would drop the entire turn if it sees an empty text part).
+                    if !msg.content.is_empty() {
+                        parts.push(serde_json::json!({ "text": msg.content }));
+                    }
                     if let Some(ref calls) = msg.tool_calls {
                         for call in calls {
                             parts.push(serde_json::json!({
@@ -1627,6 +1635,11 @@ impl GeminiOauthProvider {
                                 }
                             }));
                         }
+                    }
+                    // Fallback: if no parts at all, add empty text to avoid
+                    // sending a turn with zero parts (API rejects it).
+                    if parts.is_empty() {
+                        parts.push(serde_json::json!({ "text": "" }));
                     }
                     contents.push(serde_json::json!({
                         "role": "model",
@@ -2080,8 +2093,8 @@ impl LlmProvider for GeminiOauthProvider {
             input_tokens: response.input_tokens,
             output_tokens: response.output_tokens,
             tool_calls,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: response.cache_read_input_tokens,
+            cache_creation_input_tokens: response.cache_creation_input_tokens,
         })
     }
 }
