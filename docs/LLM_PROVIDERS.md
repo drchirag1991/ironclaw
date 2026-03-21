@@ -17,6 +17,7 @@ the most common configurations.
 | Yandex AI Studio | `yandex` | `YANDEX_API_KEY` | YandexGPT models |
 | MiniMax | `minimax` | `MINIMAX_API_KEY` | MiniMax-M2.7 models |
 | Cloudflare Workers AI | `cloudflare` | `CLOUDFLARE_API_KEY` | Access to Workers AI |
+| GitHub Copilot | `github_copilot` | `GITHUB_COPILOT_TOKEN` | Multi-models |
 | Ollama | `ollama` | No | Local inference |
 | AWS Bedrock | `bedrock` | AWS credentials | Native Converse API |
 | OpenRouter | `openai_compatible` | `LLM_API_KEY` | 300+ models |
@@ -78,7 +79,7 @@ GEMINI_MODEL=gemini-2.5-flash
 |---|---|---|
 | Function calling | ✅ | `functionDeclarations` / `functionCall` / `functionResponse` |
 | `generationConfig` | ✅ | `temperature`, `maxOutputTokens` passed from request |
-| `thinkingConfig` | ✅ | `thinkingBudget`/`thinkingLevel` for thinking-capable models |
+| `thinkingConfig` | ✅ | `thinkingBudget`/`thinkingLevel` for thinking-capable models (does NOT set `includeThoughts`) |
 | `toolConfig` | ✅ | `functionCallingConfig.mode`: `AUTO`/`ANY`/`NONE` |
 | SSE streaming | ✅ | Cloud Code API with `streamGenerateContent?alt=sse` |
 | Token refresh | ✅ | Automatic via refresh token |
@@ -103,6 +104,34 @@ as any `gemini-` model with major version >= 2, route through the Cloud Code
 API (`cloudcode-pa.googleapis.com`) which supports SSE streaming
 and project-scoped access. Other models use the standard Generative Language
 API (`generativelanguage.googleapis.com`).
+
+---
+
+## GitHub Copilot
+
+GitHub Copilot exposes chat endpoint at
+`https://api.githubcopilot.com`. IronClaw uses that endpoint directly through the
+built-in `github_copilot` provider.
+
+```env
+LLM_BACKEND=github_copilot
+GITHUB_COPILOT_TOKEN=gho_...
+GITHUB_COPILOT_MODEL=gpt-4o
+# Optional advanced headers if your setup needs them:
+# GITHUB_COPILOT_EXTRA_HEADERS=Copilot-Integration-Id:vscode-chat
+```
+
+`ironclaw onboard` can acquire this token for you using GitHub device login. If you
+already signed into Copilot through VS Code or a JetBrains IDE, you can also reuse
+the `oauth_token` stored in `~/.config/github-copilot/apps.json`. If you prefer,
+`LLM_BACKEND=github-copilot` also works as an alias.
+
+Popular models vary by subscription, but `gpt-4o` is a safe default. IronClaw keeps
+model entry manual for this provider because GitHub Copilot model listing may require
+extra integration headers on some clients. IronClaw automatically injects the standard
+VS Code identity headers (`User-Agent`, `Editor-Version`, `Editor-Plugin-Version`,
+`Copilot-Integration-Id`) and lets you override them with
+`GITHUB_COPILOT_EXTRA_HEADERS`.
 
 ---
 

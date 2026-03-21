@@ -1,5 +1,69 @@
 // IronClaw Web Gateway - Client
 
+// --- Theme Management (dark / light / system) ---
+// Icon switching is handled by pure CSS via data-theme-mode on <html>.
+
+function getSystemTheme() {
+  return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+}
+
+const VALID_THEME_MODES = { dark: true, light: true, system: true };
+
+function getThemeMode() {
+  const stored = localStorage.getItem('ironclaw-theme');
+  return (stored && VALID_THEME_MODES[stored]) ? stored : 'system';
+}
+
+function resolveTheme(mode) {
+  return mode === 'system' ? getSystemTheme() : mode;
+}
+
+function applyTheme(mode) {
+  const resolved = resolveTheme(mode);
+  document.documentElement.setAttribute('data-theme', resolved);
+  document.documentElement.setAttribute('data-theme-mode', mode);
+  const titleKeys = { dark: 'theme.tooltipDark', light: 'theme.tooltipLight', system: 'theme.tooltipSystem' };
+  const btn = document.getElementById('theme-toggle');
+  if (btn) btn.title = (typeof I18n !== 'undefined' && titleKeys[mode]) ? I18n.t(titleKeys[mode]) : ('Theme: ' + mode);
+  const announce = document.getElementById('theme-announce');
+  if (announce) announce.textContent = (typeof I18n !== 'undefined') ? I18n.t('theme.announce', { mode: mode }) : ('Theme: ' + mode);
+}
+
+function toggleTheme() {
+  const cycle = { dark: 'light', light: 'system', system: 'dark' };
+  const current = getThemeMode();
+  const next = cycle[current] || 'dark';
+  localStorage.setItem('ironclaw-theme', next);
+  applyTheme(next);
+}
+
+// Apply theme immediately (FOUC prevention is done via inline script in <head>,
+// but we call again here to ensure tooltip is set after DOM is ready).
+applyTheme(getThemeMode());
+
+// Delay enabling theme transition to avoid flash on initial load.
+requestAnimationFrame(function() {
+  requestAnimationFrame(function() {
+    document.body.classList.add('theme-transition');
+  });
+});
+
+// Listen for OS theme changes — only re-apply when in 'system' mode.
+const mql = window.matchMedia('(prefers-color-scheme: light)');
+const onSchemeChange = function() {
+  if (getThemeMode() === 'system') {
+    applyTheme('system');
+  }
+};
+if (mql.addEventListener) {
+  mql.addEventListener('change', onSchemeChange);
+} else if (mql.addListener) {
+  mql.addListener(onSchemeChange);
+}
+
+// Bind theme toggle button (CSP-compliant — no inline onclick).
+document.getElementById('theme-toggle').addEventListener('click', toggleTheme);
+
 let token = '';
 let eventSource = null;
 let logEventSource = null;
@@ -99,6 +163,30 @@ function authenticate() {
 document.getElementById('token-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') authenticate();
 });
+
+// --- Static element event bindings (CSP-compliant, no inline handlers) ---
+document.getElementById('auth-connect-btn').addEventListener('click', () => authenticate());
+document.getElementById('restart-overlay').addEventListener('click', () => cancelRestart());
+document.getElementById('restart-close-btn').addEventListener('click', () => cancelRestart());
+document.getElementById('restart-cancel-btn').addEventListener('click', () => cancelRestart());
+document.getElementById('restart-confirm-btn').addEventListener('click', () => confirmRestart());
+document.getElementById('language-btn').addEventListener('click', () => toggleLanguageMenu());
+// Language option clicks handled by delegated data-action="switch-language" handler.
+document.getElementById('restart-btn').addEventListener('click', () => triggerRestart());
+document.getElementById('thread-new-btn').addEventListener('click', () => createNewThread());
+document.getElementById('thread-toggle-btn').addEventListener('click', () => toggleThreadSidebar());
+document.getElementById('assistant-thread').addEventListener('click', () => switchToAssistant());
+document.getElementById('send-btn').addEventListener('click', () => sendMessage());
+document.getElementById('memory-edit-btn').addEventListener('click', () => startMemoryEdit());
+document.getElementById('memory-save-btn').addEventListener('click', () => saveMemoryEdit());
+document.getElementById('memory-cancel-btn').addEventListener('click', () => cancelMemoryEdit());
+document.getElementById('logs-server-level').addEventListener('change', function() { setServerLogLevel(this.value); });
+document.getElementById('logs-pause-btn').addEventListener('click', () => toggleLogsPause());
+document.getElementById('logs-clear-btn').addEventListener('click', () => clearLogs());
+document.getElementById('wasm-install-btn').addEventListener('click', () => installWasmExtension());
+document.getElementById('mcp-add-btn').addEventListener('click', () => addMcpServer());
+document.getElementById('skill-search-btn').addEventListener('click', () => searchClawHub());
+document.getElementById('skill-install-btn').addEventListener('click', () => installSkillFromForm());
 
 // Auto-authenticate from URL param or saved session
 (function autoAuth() {
@@ -2703,16 +2791,18 @@ function removeExtension(name) {
 function showConfigureModal(name) {
   apiFetch('/api/extensions/' + encodeURIComponent(name) + '/setup')
     .then((setup) => {
-      if (!setup.secrets || setup.secrets.length === 0) {
+      const secrets = Array.isArray(setup.secrets) ? setup.secrets : [];
+      const setupFields = Array.isArray(setup.fields) ? setup.fields : [];
+      if (secrets.length === 0 && setupFields.length === 0) {
         showToast('No configuration needed for ' + name, 'info');
         return;
       }
-      renderConfigureModal(name, setup.secrets);
+      renderConfigureModal(name, secrets, setupFields);
     })
     .catch((err) => showToast('Failed to load setup: ' + err.message, 'error'));
 }
 
-function renderConfigureModal(name, secrets) {
+function renderConfigureModal(name, secrets, setupFields) {
   closeConfigureModal();
   const overlay = document.createElement('div');
   overlay.className = 'configure-overlay';
@@ -2785,7 +2875,46 @@ function renderConfigureModal(name, secrets) {
 
     field.appendChild(inputRow);
     form.appendChild(field);
-    fields.push({ name: secret.name, input: input });
+    fields.push({ kind: 'secret', name: secret.name, input: input });
+  }
+
+  for (const setupField of setupFields) {
+    const field = document.createElement('div');
+    field.className = 'configure-field';
+
+    const label = document.createElement('label');
+    label.textContent = setupField.prompt;
+    if (setupField.optional) {
+      const opt = document.createElement('span');
+      opt.className = 'field-optional';
+      opt.textContent = I18n.t('config.optional');
+      label.appendChild(opt);
+    }
+    field.appendChild(label);
+
+    const inputRow = document.createElement('div');
+    inputRow.className = 'configure-input-row';
+
+    const input = document.createElement('input');
+    input.type = setupField.input_type === 'password' ? 'password' : 'text';
+    input.name = setupField.name;
+    input.placeholder = setupField.provided ? I18n.t('config.alreadySet') : '';
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitConfigureModal(name, fields);
+    });
+    inputRow.appendChild(input);
+
+    if (setupField.provided) {
+      const badge = document.createElement('span');
+      badge.className = 'field-provided';
+      badge.textContent = '\u2713';
+      badge.title = I18n.t('config.alreadyConfigured');
+      inputRow.appendChild(badge);
+    }
+
+    field.appendChild(inputRow);
+    form.appendChild(field);
+    fields.push({ kind: 'field', name: setupField.name, input: input });
   }
 
   modal.appendChild(form);
@@ -2927,9 +3056,16 @@ function startTelegramAutoVerify(name, fields) {
 function submitConfigureModal(name, fields, options) {
   options = options || {};
   const secrets = {};
+  const setupFields = {};
   for (const f of fields) {
-    if (f.input.value.trim()) {
-      secrets[f.name] = f.input.value.trim();
+    const value = f.input.value.trim();
+    if (!value) {
+      continue;
+    }
+    if (f.kind === 'secret') {
+      secrets[f.name] = value;
+    } else {
+      setupFields[f.name] = value;
     }
   }
 
@@ -2946,7 +3082,7 @@ function submitConfigureModal(name, fields, options) {
 
   apiFetch('/api/extensions/' + encodeURIComponent(name) + '/setup', {
     method: 'POST',
-    body: { secrets },
+    body: { secrets, fields: setupFields },
   })
     .then((res) => {
       if (res.success) {
@@ -2976,6 +3112,8 @@ function submitConfigureModal(name, fields, options) {
           showToast('Opening OAuth authorization for ' + name, 'info');
           openOAuthUrl(res.auth_url);
           refreshCurrentSettingsTab();
+        } else if (res.needs_restart) {
+          showToast('Configured ' + name + '. Restart IronClaw to apply all changes.', 'info');
         }
         // For non-OAuth success: the server always broadcasts auth_completed SSE,
         // which will show the toast and refresh extensions — no need to do it here too.
@@ -3854,7 +3992,6 @@ function renderRoutineDetail(routine) {
       + '<pre class="action-json">' + escapeHtml(JSON.stringify(routine.trigger, null, 2)) + '</pre></div>';
   }
 
-  // Action config
   html += '<div class="job-description"><h3>Action</h3>'
     + '<pre class="action-json">' + escapeHtml(JSON.stringify(routine.action, null, 2)) + '</pre></div>';
 
@@ -3925,7 +4062,7 @@ function formatRelativeTime(isoString) {
   const absDiff = Math.abs(diffMs);
   const future = diffMs < 0;
 
-  if (absDiff < 60000) 
+  if (absDiff < 60000)
     return future ? I18n.t('time.lessThan1MinuteFromNow') : I18n.t('time.lessThan1MinuteAgo');
   if (absDiff < 3600000) {
     const m = Math.floor(absDiff / 60000);
@@ -4873,7 +5010,14 @@ function renderStructuredSettingsRow(def, value, activeValue) {
   inputWrap.style.gap = '8px';
 
   var ariaLabel = I18n.t(def.label) + (def.description ? '. ' + I18n.t(def.description) : '');
-  var placeholderText = activeValue ? I18n.t('settings.envValue', { value: activeValue }) : (def.placeholder || I18n.t('settings.envDefault'));
+  function formatSettingValue(raw) {
+    if (Array.isArray(raw)) return raw.join(', ');
+    if (raw === null || raw === undefined) return '';
+    return String(raw);
+  }
+
+  var activeValueText = formatSettingValue(activeValue);
+  var placeholderText = activeValueText ? I18n.t('settings.envValue', { value: activeValueText }) : (def.placeholder || I18n.t('settings.envDefault'));
 
   if (def.type === 'boolean') {
     var boolSel = document.createElement('select');
@@ -4945,6 +5089,26 @@ function renderStructuredSettingsRow(def, value, activeValue) {
       };
     })(def.key, numInp));
     inputWrap.appendChild(numInp);
+  } else if (def.type === 'list') {
+    var listInp = document.createElement('input');
+    listInp.type = 'text';
+    listInp.className = 'settings-input';
+    listInp.setAttribute('aria-label', ariaLabel);
+    var listValue = '';
+    if (Array.isArray(value)) listValue = value.join(', ');
+    else if (typeof value === 'string') listValue = value;
+    listInp.value = listValue;
+    if (!listValue) listInp.placeholder = placeholderText;
+    listInp.addEventListener('change', (function(k, el) {
+      return function() {
+        if (el.value.trim() === '') return saveSetting(k, null);
+        var items = el.value.split(/[\n,]/).map(function(item) {
+          return item.trim();
+        }).filter(Boolean);
+        saveSetting(k, items);
+      };
+    })(def.key, listInp));
+    inputWrap.appendChild(listInp);
   } else {
     var textInp = document.createElement('input');
     textInp.type = 'text';

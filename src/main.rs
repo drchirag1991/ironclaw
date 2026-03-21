@@ -139,6 +139,47 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .await;
         }
+        Some(Command::Login { openai_codex }) => {
+            init_cli_tracing();
+            if *openai_codex {
+                // Resolve codex config so OPENAI_CODEX_* env overrides are
+                // honoured even when LLM_BACKEND isn't set to openai_codex.
+                let codex_config = {
+                    let config = Config::from_env()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    config.llm.openai_codex.unwrap_or_else(|| {
+                        use ironclaw::llm::OpenAiCodexConfig;
+                        let mut cfg = OpenAiCodexConfig::default();
+                        if let Ok(v) = std::env::var("OPENAI_CODEX_AUTH_URL") {
+                            cfg.auth_endpoint = v;
+                        }
+                        if let Ok(v) = std::env::var("OPENAI_CODEX_API_URL") {
+                            cfg.api_base_url = v;
+                        }
+                        if let Ok(v) = std::env::var("OPENAI_CODEX_CLIENT_ID") {
+                            cfg.client_id = v;
+                        }
+                        if let Ok(v) = std::env::var("OPENAI_CODEX_SESSION_PATH") {
+                            cfg.session_path = std::path::PathBuf::from(v);
+                        }
+                        cfg
+                    })
+                };
+                let mgr = ironclaw::llm::OpenAiCodexSessionManager::new(codex_config)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                mgr.device_code_login()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                println!(
+                    "OpenAI Codex authentication complete. Set LLM_BACKEND=openai_codex to use it."
+                );
+            } else {
+                println!("Specify a provider to authenticate with:");
+                println!("  ironclaw login --openai-codex   (ChatGPT subscription)");
+            }
+            return Ok(());
+        }
         Some(Command::Onboard {
             skip_auth,
             channels_only,
@@ -271,6 +312,21 @@ async fn async_main() -> anyhow::Result<()> {
     let job_event_tx = orch.job_event_tx;
     let prompt_queue = orch.prompt_queue;
     let docker_status = orch.docker_status;
+
+    // Derive user-facing warning from docker_status for channel notification
+    let docker_user_warning: Option<String> = match docker_status {
+        ironclaw::sandbox::DockerStatus::NotInstalled => Some(
+            "Sandbox is enabled but Docker is not installed -- \
+             full_job routines will fail until Docker is available."
+                .to_string(),
+        ),
+        ironclaw::sandbox::DockerStatus::NotRunning => Some(
+            "Sandbox is enabled but Docker is not running -- \
+             full_job routines will fail until Docker is started."
+                .to_string(),
+        ),
+        _ => None,
+    };
 
     // ── Channel setup ──────────────────────────────────────────────────
 
@@ -748,9 +804,17 @@ async fn async_main() -> anyhow::Result<()> {
         document_extraction: Some(Arc::new(
             ironclaw::document_extraction::DocumentExtractionMiddleware::new(),
         )),
+        sandbox_readiness: if !config.sandbox.enabled {
+            ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig
+        } else if docker_status.is_ok() {
+            ironclaw::agent::routine_engine::SandboxReadiness::Available
+        } else {
+            ironclaw::agent::routine_engine::SandboxReadiness::DockerUnavailable
+        },
         builder: components.builder,
     };
 
+    let channels_for_warnings = Arc::clone(&channels);
     let mut agent = Agent::new(
         config.agent.clone(),
         deps,
@@ -954,6 +1018,27 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                 }
             }
+        });
+    }
+
+    // Notify user if sandbox is unavailable (Docker missing/not running)
+    if let Some(warning) = docker_user_warning {
+        let channels_ref = Arc::clone(&channels_for_warnings);
+        tokio::spawn(async move {
+            // Delay to let channels finish connecting before sending the warning.
+            // 5s is generous but avoids the message being lost on slow startups.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tracing::debug!("Sending sandbox-unavailable warning to connected channels");
+            let response = ironclaw::channels::OutgoingResponse {
+                content: format!("Warning: {warning}"),
+                thread_id: None,
+                attachments: Vec::new(),
+                metadata: serde_json::json!({
+                    "source": "system",
+                    "type": "warning",
+                }),
+            };
+            let _ = channels_ref.broadcast_all("default", response).await;
         });
     }
 

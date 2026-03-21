@@ -939,6 +939,7 @@ impl Agent {
                 JobContext::with_user(&message.user_id, "chat", "Interactive chat session")
                     .with_requester_id(&message.sender_id);
             job_ctx.http_interceptor = self.deps.http_interceptor.clone();
+            job_ctx.metadata = crate::agent::agent_loop::chat_tool_execution_metadata(message);
             // Prefer a valid timezone from the approval message, fall back to the
             // resolved timezone stored when the approval was originally requested.
             let tz_candidate = message
@@ -1961,7 +1962,7 @@ mod tests {
             context_messages: vec![],
             deferred_tool_calls: vec![],
             user_timezone: None,
-            allow_always: true,
+            allow_always: false,
         };
         thread.await_approval(pending);
 
