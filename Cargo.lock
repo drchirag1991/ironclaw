@@ -3532,6 +3532,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironclaw_engine"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ironclaw_safety"
 version = "0.1.0"
 dependencies = [
