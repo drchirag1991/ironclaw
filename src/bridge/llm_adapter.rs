@@ -257,3 +257,103 @@ fn extract_code_block(text: &str) -> Option<String> {
 
     Some(all_code.join("\n\n"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── extract_code_block tests ────────────────────────────
+
+    #[test]
+    fn extract_repl_block() {
+        let text = "Some explanation\n```repl\nx = 1 + 2\nprint(x)\n```\nMore text";
+        let code = extract_code_block(text).unwrap();
+        assert_eq!(code, "x = 1 + 2\nprint(x)");
+    }
+
+    #[test]
+    fn extract_python_block() {
+        let text = "Let me compute:\n```python\nresult = sum([1,2,3])\n```";
+        let code = extract_code_block(text).unwrap();
+        assert_eq!(code, "result = sum([1,2,3])");
+    }
+
+    #[test]
+    fn extract_py_block() {
+        let text = "```py\nprint('hello')\n```";
+        let code = extract_code_block(text).unwrap();
+        assert_eq!(code, "print('hello')");
+    }
+
+    #[test]
+    fn extract_bare_backtick_block() {
+        let text = "Here's the code:\n```\nx = 42\nFINAL(x)\n```";
+        let code = extract_code_block(text).unwrap();
+        assert_eq!(code, "x = 42\nFINAL(x)");
+    }
+
+    #[test]
+    fn skip_non_python_language() {
+        let text = "```json\n{\"key\": \"value\"}\n```\nThat's the config.";
+        assert!(extract_code_block(text).is_none());
+    }
+
+    #[test]
+    fn no_code_blocks_returns_none() {
+        let text = "Just a plain text response with no code.";
+        assert!(extract_code_block(text).is_none());
+    }
+
+    #[test]
+    fn multiple_code_blocks_concatenated() {
+        let text = "\
+Let me search first:\n\
+```repl\nresult = web_search(query=\"test\")\nprint(result)\n```\n\
+Now let's process:\n\
+```repl\nFINAL(result['title'])\n```";
+        let code = extract_code_block(text).unwrap();
+        assert!(code.contains("web_search"));
+        assert!(code.contains("FINAL"));
+        // Two blocks joined by double newline
+        assert!(code.contains("\n\n"));
+    }
+
+    #[test]
+    fn mixed_thinking_and_code() {
+        // Simulates a model that outputs explanation + code (the Hyperliquid case)
+        let text = "\
+Let me help you explore the relationship between Hyperliquid's price and revenue.\n\
+\n\
+First, let's gather some data:\n\
+\n\
+```python\nsearch_results = web_search(\n    query=\"Hyperliquid revenue\",\n    count=5\n)\nprint(search_results)\n```\n\
+\n\
+And also check the token price:\n\
+\n\
+```python\ntoken_data = web_search(\n    query=\"Hyperliquid token price\",\n    count=3\n)\nprint(token_data)\n```";
+        let code = extract_code_block(text).unwrap();
+        assert!(code.contains("web_search"));
+        assert!(code.contains("Hyperliquid revenue"));
+        assert!(code.contains("Hyperliquid token price"));
+    }
+
+    #[test]
+    fn repl_preferred_over_bare() {
+        // If both ```repl and bare ``` exist, prefer ```repl
+        let text = "```\nignored\n```\n```repl\nused = True\n```";
+        let code = extract_code_block(text).unwrap();
+        assert_eq!(code, "used = True");
+    }
+
+    #[test]
+    fn empty_code_block_skipped() {
+        let text = "```python\n\n```\nThat was empty.";
+        assert!(extract_code_block(text).is_none());
+    }
+
+    #[test]
+    fn unclosed_block_returns_none() {
+        let text = "```python\nprint('no closing fence')";
+        assert!(extract_code_block(text).is_none());
+    }
+}
