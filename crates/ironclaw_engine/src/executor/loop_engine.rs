@@ -831,4 +831,217 @@ mod tests {
             }
         ));
     }
+
+    // ── CodeAct / RLM tests ─────────────────────────────────
+
+    fn code_response(code: &str) -> LlmOutput {
+        LlmOutput {
+            response: LlmResponse::Code {
+                code: code.into(),
+                content: Some(format!("```repl\n{code}\n```")),
+            },
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 80,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn codeact_simple_final() {
+        // LLM outputs Python code that calls FINAL()
+        let (mut exec, _tx) = make_loop(
+            vec![code_response("FINAL('The answer is 42')")],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "The answer is 42")
+        );
+        assert_eq!(exec.thread.step_count, 1);
+    }
+
+    #[tokio::test]
+    async fn codeact_tool_call_then_final() {
+        // LLM outputs code that calls a tool, then uses the result
+        let (mut exec, _tx) = make_loop(
+            vec![
+                code_response("result = test_tool()\nprint(result)\nFINAL('got result')"),
+            ],
+            vec![Ok(ActionResult {
+                call_id: "code_call_1".into(),
+                action_name: "test_tool".into(),
+                output: serde_json::json!({"data": "hello from tool"}),
+                is_error: false,
+                duration: Duration::from_millis(5),
+            })],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "got result")
+        );
+        // Should have at least 1 action result recorded
+        assert!(!exec.thread.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn codeact_pure_python_computation() {
+        // LLM outputs pure Python with no tool calls — just computation + FINAL
+        let (mut exec, _tx) = make_loop(
+            vec![code_response(
+                "numbers = [1, 2, 3, 4, 5]\ntotal = sum(numbers)\nFINAL(f'Sum is {total}')",
+            )],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Sum is 15")
+        );
+    }
+
+    #[tokio::test]
+    async fn codeact_multi_step() {
+        // First iteration: code runs but no FINAL — returns output
+        // Second iteration: LLM sees output and calls FINAL
+        let (mut exec, _tx) = make_loop(
+            vec![
+                code_response("x = 10 + 20\nprint(f'x = {x}')"),
+                code_response("FINAL('done, x was 30')"),
+            ],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "done, x was 30")
+        );
+        assert_eq!(exec.thread.step_count, 2);
+        // The output metadata from first step should be in messages
+        assert!(exec.thread.messages.iter().any(|m| m.content.contains("x = 30")));
+    }
+
+    #[tokio::test]
+    async fn codeact_error_recovery() {
+        // First iteration: code has an error (NameError)
+        // Second iteration: LLM sees the error and fixes it
+        let (mut exec, _tx) = make_loop(
+            vec![
+                code_response("result = undefined_var + 1"),
+                code_response("FINAL('recovered')"),
+            ],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "recovered"));
+        assert_eq!(exec.thread.step_count, 2);
+        // First step should have error in output metadata
+        assert!(exec.thread.messages.iter().any(|m| {
+            m.content.contains("NameError") || m.content.contains("Error")
+        }));
+    }
+
+    #[tokio::test]
+    async fn codeact_context_variables_available() {
+        // Code accesses the `goal` and `context` variables injected by the engine
+        let (mut exec, _tx) = make_loop(
+            vec![code_response(
+                "FINAL(f'Goal: {goal}, Messages: {len(context)}')",
+            )],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        // Should have access to goal="test goal" and context (list of messages)
+        match outcome {
+            ThreadOutcome::Completed { response: Some(r) } => {
+                assert!(r.contains("Goal: test goal"), "got: {r}");
+                assert!(r.contains("Messages:"), "got: {r}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codeact_multiple_tool_calls_in_loop() {
+        // Code calls a tool 3 times in a for loop
+        let (mut exec, _tx) = make_loop(
+            vec![code_response(
+                "results = []\nfor i in range(3):\n    r = test_tool()\n    results.append(r)\nFINAL(f'Got {len(results)} results')",
+            )],
+            vec![
+                Ok(ActionResult {
+                    call_id: "code_call_1".into(),
+                    action_name: "test_tool".into(),
+                    output: serde_json::json!({"i": 0}),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+                Ok(ActionResult {
+                    call_id: "code_call_2".into(),
+                    action_name: "test_tool".into(),
+                    output: serde_json::json!({"i": 1}),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+                Ok(ActionResult {
+                    call_id: "code_call_3".into(),
+                    action_name: "test_tool".into(),
+                    output: serde_json::json!({"i": 2}),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+            ],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Got 3 results")
+        );
+    }
+
+    #[tokio::test]
+    async fn codeact_llm_query_recursive() {
+        // Code calls llm_query() — which calls the MockLlm recursively.
+        // The MockLlm will return the next response in its queue for the sub-call.
+        let (mut exec, _tx) = make_loop(
+            vec![
+                // First response: code that calls llm_query
+                code_response("answer = llm_query('What is 2+2?')\nFINAL(f'Sub-agent said: {answer}')"),
+                // This text response will be consumed by the llm_query sub-call
+                // (MockLlm pops from the same queue)
+            ],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        // llm_query will get "(no more responses)" since the queue only had
+        // the code response. That's fine — it tests the plumbing.
+        match outcome {
+            ThreadOutcome::Completed { response: Some(r) } => {
+                assert!(r.contains("Sub-agent said:"), "got: {r}");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
 }
