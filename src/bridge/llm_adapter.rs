@@ -58,17 +58,40 @@ impl LlmBackend for LlmBridgeAdapter {
             actions.iter().map(action_def_to_tool_def).collect()
         };
 
-        // Build request
-        let mut request = ToolCompletionRequest::new(chat_messages, tools);
-        if let Some(max_tokens) = config.max_tokens {
-            request = request.with_max_tokens(max_tokens);
+        // Build request — match the existing Reasoning.respond_with_tools() defaults
+        let max_tokens = config.max_tokens.unwrap_or(4096);
+        let temperature = config.temperature.unwrap_or(0.7);
+
+        if tools.is_empty() {
+            // No tools: use plain completion (matches existing no-tools path)
+            let mut request = crate::llm::CompletionRequest::new(chat_messages)
+                .with_max_tokens(max_tokens)
+                .with_temperature(temperature);
+            request.metadata = config.metadata.clone();
+
+            let response = provider
+                .complete(request)
+                .await
+                .map_err(|e| EngineError::Llm {
+                    reason: e.to_string(),
+                })?;
+
+            return Ok(LlmOutput {
+                response: LlmResponse::Text(response.content),
+                usage: TokenUsage {
+                    input_tokens: u64::from(response.input_tokens),
+                    output_tokens: u64::from(response.output_tokens),
+                    cache_read_tokens: u64::from(response.cache_read_input_tokens),
+                    cache_write_tokens: u64::from(response.cache_creation_input_tokens),
+                },
+            });
         }
-        if let Some(temp) = config.temperature {
-            request = request.with_temperature(temp);
-        }
-        if config.force_text {
-            request = request.with_tool_choice("none");
-        }
+
+        // With tools: use tool completion (matches existing tools path)
+        let mut request = ToolCompletionRequest::new(chat_messages, tools)
+            .with_max_tokens(max_tokens)
+            .with_temperature(temperature)
+            .with_tool_choice("auto");
         request.metadata = config.metadata.clone();
 
         // Call provider
