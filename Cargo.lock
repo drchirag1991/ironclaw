@@ -3651,6 +3651,7 @@ dependencies = [
  "hyper-util",
  "iana-time-zone",
  "insta",
+ "ironclaw_engine",
  "ironclaw_safety",
  "json5",
  "libsql",

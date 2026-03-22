@@ -283,20 +283,20 @@ impl Agent {
         self.deps.store.as_ref()
     }
 
-    pub(super) fn llm(&self) -> &Arc<dyn LlmProvider> {
+    pub(crate) fn llm(&self) -> &Arc<dyn LlmProvider> {
         &self.deps.llm
     }
 
     /// Get the cheap/fast LLM provider, falling back to the main one.
-    pub(super) fn cheap_llm(&self) -> &Arc<dyn LlmProvider> {
+    pub(crate) fn cheap_llm(&self) -> &Arc<dyn LlmProvider> {
         self.deps.cheap_llm.as_ref().unwrap_or(&self.deps.llm)
     }
 
-    pub(super) fn safety(&self) -> &Arc<SafetyLayer> {
+    pub(crate) fn safety(&self) -> &Arc<SafetyLayer> {
         &self.deps.safety
     }
 
-    pub(super) fn tools(&self) -> &Arc<ToolRegistry> {
+    pub(crate) fn tools(&self) -> &Arc<ToolRegistry> {
         &self.deps.tools
     }
 
@@ -1001,6 +1001,13 @@ impl Agent {
                 }
                 _ => {} // Continue, fail-open errors already logged in registry
             }
+        }
+
+        // Engine V2 routing (Strategy C: parallel deployment)
+        if let Submission::UserInput { ref content } = submission
+            && crate::bridge::is_engine_v2_enabled()
+        {
+            return crate::bridge::handle_with_engine(self, message, content).await;
         }
 
         // Hydrate thread from DB if it's a historical thread not in memory
