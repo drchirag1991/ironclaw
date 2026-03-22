@@ -76,8 +76,17 @@ impl LlmBackend for LlmBridgeAdapter {
                     reason: e.to_string(),
                 })?;
 
+            // Check for code blocks in the response (CodeAct/RLM pattern)
+            let llm_response = match extract_code_block(&response.content) {
+                Some(code) => LlmResponse::Code {
+                    code,
+                    content: Some(response.content),
+                },
+                None => LlmResponse::Text(response.content),
+            };
+
             return Ok(LlmOutput {
-                response: LlmResponse::Text(response.content),
+                response: llm_response,
                 usage: TokenUsage {
                     input_tokens: u64::from(response.input_tokens),
                     output_tokens: u64::from(response.output_tokens),
@@ -190,28 +199,61 @@ fn action_def_to_tool_def(action: &ActionDef) -> ToolDefinition {
     }
 }
 
-/// Extract Python code from ```repl or ```python fenced blocks.
+/// Extract Python code from fenced code blocks in the LLM response.
 ///
-/// Matches the pattern used by RLM implementations (fast-rlm uses ```repl,
-/// official RLM uses ```repl, some models output ```python).
+/// Tries these markers in order: ```repl, ```python, ```py, then bare ```
+/// (if the content looks like Python). Collects ALL code blocks in the
+/// response and concatenates them (models sometimes split code across
+/// multiple blocks with explanation text between them).
 fn extract_code_block(text: &str) -> Option<String> {
-    // Try ```repl first (preferred), then ```python
-    for marker in ["```repl", "```python"] {
-        if let Some(start) = text.find(marker) {
-            let code_start = start + marker.len();
-            // Skip to next line
-            let code_start = text[code_start..]
+    let mut all_code = Vec::new();
+
+    // Try specific markers first, then bare backticks
+    for marker in ["```repl", "```python", "```py", "```"] {
+        let mut search_from = 0;
+        while let Some(start) = text[search_from..].find(marker) {
+            let abs_start = search_from + start;
+            let after_marker = abs_start + marker.len();
+
+            // For bare ```, skip if it's actually ```someotherlang
+            if marker == "```" && text[after_marker..].starts_with(|c: char| c.is_alphabetic()) {
+                let lang: String = text[after_marker..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                    .collect();
+                if !["repl", "python", "py"].contains(&lang.as_str()) {
+                    search_from = after_marker;
+                    continue;
+                }
+            }
+
+            // Skip to next line after the marker
+            let code_start = text[after_marker..]
                 .find('\n')
-                .map(|i| code_start + i + 1)
-                .unwrap_or(code_start);
+                .map(|i| after_marker + i + 1)
+                .unwrap_or(after_marker);
+
             // Find closing ```
             if let Some(end) = text[code_start..].find("```") {
                 let code = text[code_start..code_start + end].trim();
                 if !code.is_empty() {
-                    return Some(code.to_string());
+                    all_code.push(code.to_string());
                 }
+                search_from = code_start + end + 3;
+            } else {
+                break;
             }
         }
+
+        // If we found code with a specific marker, use it (don't fall through to bare)
+        if !all_code.is_empty() {
+            break;
+        }
     }
-    None
+
+    if all_code.is_empty() {
+        return None;
+    }
+
+    Some(all_code.join("\n\n"))
 }
