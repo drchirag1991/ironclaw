@@ -228,6 +228,13 @@ impl ExecutionLoop {
                     step.status = StepStatus::Executing;
                     step.tier = ExecutionTier::Scripting;
 
+                    // Inject Step 0 orientation preamble on first code step
+                    if self.thread.step_count == 0 {
+                        let preamble =
+                            crate::executor::scripting::build_orientation_preamble(&self.thread);
+                        self.thread.add_message(ThreadMessage::system(preamble));
+                    }
+
                     let exec_ctx = ThreadExecutionContext {
                         thread_id: self.thread.id,
                         thread_type: self.thread.thread_type,
@@ -236,7 +243,7 @@ impl ExecutionLoop {
                         step_id: step.id,
                     };
 
-                    // Execute via Monty (with LLM for recursive llm_query)
+                    // Execute via Monty
                     let code_result = crate::executor::scripting::execute_code(
                         &code,
                         &self.thread,
@@ -250,8 +257,7 @@ impl ExecutionLoop {
                     .await?;
 
                     // Track recursive LLM token usage
-                    self.thread.total_tokens_used +=
-                        code_result.recursive_tokens.total();
+                    self.thread.total_tokens_used += code_result.recursive_tokens.total();
 
                     // Record events
                     for event_kind in code_result.events {
@@ -269,8 +275,7 @@ impl ExecutionLoop {
 
                     step.action_results = code_result.action_results;
 
-                    // Use compact metadata for output (RLM pattern:
-                    // keep LLM context lean, full data in REPL variables)
+                    // Compact output metadata (RLM pattern: truncated, not full)
                     let metadata = crate::executor::scripting::compact_output_metadata(
                         &code_result.stdout,
                         &code_result.return_value,
@@ -285,12 +290,26 @@ impl ExecutionLoop {
                     });
                     self.thread.step_count += 1;
 
+                    // Check FINAL() termination
+                    if let Some(answer) = code_result.final_answer {
+                        self.thread.transition_to(
+                            ThreadState::Completed,
+                            Some("FINAL() called".into()),
+                        )?;
+                        return Ok(ThreadOutcome::Completed {
+                            response: Some(answer),
+                        });
+                    }
+
                     // Check if approval is needed
                     if let Some(outcome) = code_result.need_approval {
                         self.thread
                             .transition_to(ThreadState::Waiting, Some("awaiting approval".into()))?;
                         return Ok(outcome);
                     }
+
+                    // If code had errors, the error text is already in the
+                    // metadata message — the LLM can self-correct on next turn.
                 }
             }
         }

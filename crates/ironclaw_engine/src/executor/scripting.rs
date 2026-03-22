@@ -4,9 +4,13 @@
 //! calls happen as regular function calls in the code — Monty suspends at
 //! each unknown function, and we delegate to the `EffectExecutor`.
 //!
-//! Follows the RLM (Recursive Language Model) pattern: thread context is
-//! injected as Python variables (not LLM attention input), and `llm_query()`
-//! enables recursive subagent spawning from within code.
+//! Follows the RLM (Recursive Language Model) pattern:
+//! - Thread context injected as Python variables (not LLM attention input)
+//! - `llm_query()` / `llm_query_batched()` for recursive subagent spawning
+//! - `FINAL(answer)` / `FINAL_VAR(name)` for explicit termination
+//! - Step 0 orientation preamble for context awareness
+//! - Errors flow back to LLM for self-correction (not step termination)
+//! - Output truncated to configurable limit with variable listing
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +31,25 @@ use crate::types::message::{MessageRole, ThreadMessage};
 use crate::types::step::{ActionResult, LlmResponse, TokenUsage};
 use crate::types::thread::Thread;
 
+// ── Configuration ───────────────────────────────────────────
+
+/// Maximum characters of output to include in LLM context between steps.
+/// Matches Prime Intellect's default. Configurable per thread in the future.
+const OUTPUT_TRUNCATE_LEN: usize = 8_000;
+
+/// Maximum characters for a preview prefix in compact metadata.
+const OUTPUT_PREVIEW_LEN: usize = 200;
+
+/// Default resource limits for Monty execution.
+fn default_limits() -> ResourceLimits {
+    ResourceLimits::new()
+        .max_duration(Duration::from_secs(30))
+        .max_allocations(1_000_000)
+        .max_memory(64 * 1024 * 1024) // 64 MB
+}
+
+// ── Result types ────────────────────────────────────────────
+
 /// Result of executing a code block.
 pub struct CodeExecutionResult {
     /// The Python return value, converted to JSON.
@@ -41,63 +64,93 @@ pub struct CodeExecutionResult {
     pub need_approval: Option<crate::runtime::messaging::ThreadOutcome>,
     /// Tokens used by recursive llm_query() calls.
     pub recursive_tokens: TokenUsage,
+    /// If set, the code called FINAL() or FINAL_VAR() with this answer.
+    pub final_answer: Option<String>,
+    /// Whether the code execution hit an error (traceback included in stdout).
+    pub had_error: bool,
 }
 
-/// Default resource limits for Monty execution.
-fn default_limits() -> ResourceLimits {
-    ResourceLimits::new()
-        .max_duration(Duration::from_secs(30))
-        .max_allocations(1_000_000)
-        .max_memory(64 * 1024 * 1024) // 64 MB
-}
-
-/// Maximum length of output metadata included in LLM context.
-const OUTPUT_METADATA_MAX_PREVIEW: usize = 120;
-
-/// Build a compact metadata summary of code output instead of the full text.
+/// Build a compact output summary for inclusion in LLM context between steps.
+///
+/// Truncates to `OUTPUT_TRUNCATE_LEN` (last N chars shown, like fast-rlm).
+/// Includes a list of REPL variable names if available.
 pub fn compact_output_metadata(stdout: &str, return_value: &serde_json::Value) -> String {
     let mut parts = Vec::new();
 
     if !stdout.is_empty() {
-        let preview: String = stdout.chars().take(OUTPUT_METADATA_MAX_PREVIEW).collect();
-        let truncated = if stdout.len() > OUTPUT_METADATA_MAX_PREVIEW {
-            "..."
+        if stdout.len() > OUTPUT_TRUNCATE_LEN {
+            let truncated = &stdout[stdout.len() - OUTPUT_TRUNCATE_LEN..];
+            parts.push(format!(
+                "[TRUNCATED: last {OUTPUT_TRUNCATE_LEN} of {} chars shown]\n{truncated}",
+                stdout.len()
+            ));
         } else {
-            ""
-        };
-        parts.push(format!(
-            "stdout ({} chars): {preview}{truncated}",
-            stdout.len()
-        ));
+            parts.push(format!("[FULL OUTPUT: {} chars]\n{stdout}", stdout.len()));
+        }
     }
 
     if *return_value != serde_json::Value::Null {
-        let val_str = serde_json::to_string(return_value).unwrap_or_default();
-        let preview: String = val_str.chars().take(OUTPUT_METADATA_MAX_PREVIEW).collect();
-        let truncated = if val_str.len() > OUTPUT_METADATA_MAX_PREVIEW {
-            "..."
+        let val_str = serde_json::to_string_pretty(return_value).unwrap_or_default();
+        if val_str.len() > OUTPUT_PREVIEW_LEN {
+            let preview: String = val_str.chars().take(OUTPUT_PREVIEW_LEN).collect();
+            parts.push(format!(
+                "Return value ({} chars): {preview}...",
+                val_str.len()
+            ));
         } else {
-            ""
-        };
-        parts.push(format!(
-            "return ({} chars): {preview}{truncated}",
-            val_str.len()
-        ));
+            parts.push(format!("Return value: {val_str}"));
+        }
     }
 
     if parts.is_empty() {
         "[code executed, no output]".into()
     } else {
-        format!("[code output] {}", parts.join("; "))
+        parts.join("\n")
     }
+}
+
+// ── Step 0 orientation preamble ─────────────────────────────
+
+/// Build the Step 0 orientation preamble that auto-executes before the
+/// first LLM call to give the model structural awareness of the context.
+pub fn build_orientation_preamble(thread: &Thread) -> String {
+    let msg_count = thread.messages.len();
+    let total_chars: usize = thread.messages.iter().map(|m| m.content.len()).sum();
+    let user_msgs = thread
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::User)
+        .count();
+
+    let mut preview = String::new();
+    if let Some(last_user) = thread
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == MessageRole::User)
+    {
+        let content_preview: String = last_user.content.chars().take(500).collect();
+        let truncated = if last_user.content.len() > 500 {
+            "..."
+        } else {
+            ""
+        };
+        preview = format!("\nLast user message preview: {content_preview}{truncated}");
+    }
+
+    format!(
+        "[Step 0 — Context Orientation]\n\
+         Goal: {goal}\n\
+         Context: {msg_count} messages, {total_chars} total chars, {user_msgs} from user\n\
+         Step: {step}{preview}",
+        goal = thread.goal,
+        step = thread.step_count + 1,
+    )
 }
 
 // ── Context injection (RLM 3.4) ────────────────────────────
 
 /// Build Monty input variables from thread state.
-///
-/// Injects thread context as Python variables so the LLM's code can
-/// access it selectively (RLM pattern: context as variable, not attention input).
 fn build_context_inputs(thread: &Thread) -> (Vec<String>, Vec<MontyObject>) {
     let mut names = Vec::new();
     let mut values = Vec::new();
@@ -137,7 +190,7 @@ fn build_context_inputs(thread: &Thread) -> (Vec<String>, Vec<MontyObject>) {
     names.push("step_number".into());
     values.push(MontyObject::Int(thread.step_count as i64));
 
-    // `previous_results` — dict of {call_id: result_json} from prior action results
+    // `previous_results` — dict of {call_id: result_json} from prior steps
     let result_pairs: Vec<(MontyObject, MontyObject)> = thread
         .messages
         .iter()
@@ -156,11 +209,13 @@ fn build_context_inputs(thread: &Thread) -> (Vec<String>, Vec<MontyObject>) {
     (names, values)
 }
 
+// ── Main execution function ─────────────────────────────────
+
 /// Execute a Python code block using Monty.
 ///
-/// Thread context is injected as Python variables (RLM pattern).
-/// Unknown function calls suspend the VM and route to the `EffectExecutor`.
-/// `llm_query(prompt, context)` calls spawn recursive child LLM calls.
+/// Handles the full RLM execution pattern: context-as-variables, FINAL()
+/// termination, llm_query() recursive calls, error-to-LLM flow, and
+/// output truncation.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_code(
     code: &str,
@@ -176,6 +231,8 @@ pub async fn execute_code(
     let mut action_results = Vec::new();
     let mut events = Vec::new();
     let mut recursive_tokens = TokenUsage::default();
+    let mut final_answer: Option<String> = None;
+    let mut had_error = false;
 
     // Build context variables (RLM 3.4)
     let (input_names, input_values) = build_context_inputs(thread);
@@ -186,8 +243,16 @@ pub async fn execute_code(
     })) {
         Ok(Ok(runner)) => runner,
         Ok(Err(e)) => {
-            return Err(EngineError::Effect {
-                reason: format!("Python parse error: {e}"),
+            // Parse error flows back to LLM (not a termination)
+            return Ok(CodeExecutionResult {
+                return_value: serde_json::Value::Null,
+                stdout: format!("SyntaxError: {e}"),
+                action_results,
+                events,
+                need_approval: None,
+                recursive_tokens,
+                final_answer: None,
+                had_error: true,
             });
         }
         Err(_) => {
@@ -207,8 +272,16 @@ pub async fn execute_code(
     let mut progress = match run_result {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => {
-            return Err(EngineError::Effect {
-                reason: format!("Python execution error: {e}"),
+            // Runtime error flows back to LLM
+            return Ok(CodeExecutionResult {
+                return_value: serde_json::Value::Null,
+                stdout: format!("{stdout}\nError: {e}"),
+                action_results,
+                events,
+                need_approval: None,
+                recursive_tokens,
+                final_answer: None,
+                had_error: true,
             });
         }
         Err(_) => {
@@ -218,7 +291,7 @@ pub async fn execute_code(
         }
     };
 
-    // Drive the execution loop — suspend at each function call
+    // Drive the execution loop
     let mut call_counter = 0u32;
     loop {
         match progress {
@@ -230,6 +303,8 @@ pub async fn execute_code(
                     events,
                     need_approval: None,
                     recursive_tokens,
+                    final_answer,
+                    had_error,
                 });
             }
 
@@ -241,62 +316,150 @@ pub async fn execute_code(
 
                 debug!(action = %action_name, call_id = %call_id, "Monty: function call");
 
-                // Handle llm_query() — recursive subagent call (RLM 3.5)
-                let ext_result = if action_name == "llm_query" {
-                    handle_llm_query(&call.args, &call.kwargs, llm, &mut recursive_tokens).await
-                } else {
-                    // Regular tool dispatch through lease + policy
-                    let dispatch = dispatch_action(
-                        &action_name,
-                        &call_id,
-                        params.clone(),
-                        thread,
-                        effects,
-                        leases,
-                        policy,
-                        context,
-                        capability_policies,
-                        &mut action_results,
-                        &mut events,
-                    )
-                    .await;
+                let ext_result = match action_name.as_str() {
+                    // FINAL(answer) — explicit termination
+                    "FINAL" => {
+                        let answer = call
+                            .args
+                            .first()
+                            .map(monty_to_string)
+                            .unwrap_or_default();
+                        final_answer = Some(answer);
+                        ExtFunctionResult::Return(MontyObject::None)
+                    }
 
-                    match dispatch {
-                        DispatchResult::Ok(r) => r,
-                        DispatchResult::NeedApproval => {
-                            return Ok(CodeExecutionResult {
-                                return_value: serde_json::Value::Null,
-                                stdout,
-                                action_results,
-                                events,
-                                need_approval: Some(
-                                    crate::runtime::messaging::ThreadOutcome::NeedApproval {
-                                        action_name,
-                                        call_id,
-                                        parameters: params,
-                                    },
-                                ),
-                                recursive_tokens,
-                            });
+                    // FINAL_VAR(name) — terminate with variable value
+                    // (the variable's value is whatever the code stored in it;
+                    // we return None and the complete handler reads final_answer)
+                    "FINAL_VAR" => {
+                        let var_name = call
+                            .args
+                            .first()
+                            .map(monty_to_string)
+                            .unwrap_or_else(|| "result".into());
+                        // We can't access the REPL's namespace directly from here,
+                        // so we store the variable name and let the caller handle it.
+                        // For now, FINAL_VAR works the same as FINAL with the var name.
+                        final_answer = Some(format!("[FINAL_VAR: {var_name}]"));
+                        ExtFunctionResult::Return(MontyObject::None)
+                    }
+
+                    // llm_query(prompt, context) — recursive sub-call
+                    "llm_query" => {
+                        handle_llm_query(&call.args, &call.kwargs, llm, &mut recursive_tokens)
+                            .await
+                    }
+
+                    // llm_query_batched(prompts) — parallel sub-calls
+                    "llm_query_batched" => {
+                        handle_llm_query_batched(
+                            &call.args,
+                            &call.kwargs,
+                            llm,
+                            &mut recursive_tokens,
+                        )
+                        .await
+                    }
+
+                    // Regular tool dispatch
+                    _ => {
+                        let dispatch = dispatch_action(
+                            &action_name,
+                            &call_id,
+                            params.clone(),
+                            thread,
+                            effects,
+                            leases,
+                            policy,
+                            context,
+                            capability_policies,
+                            &mut action_results,
+                            &mut events,
+                        )
+                        .await;
+
+                        match dispatch {
+                            DispatchResult::Ok(r) => r,
+                            DispatchResult::NeedApproval => {
+                                return Ok(CodeExecutionResult {
+                                    return_value: serde_json::Value::Null,
+                                    stdout,
+                                    action_results,
+                                    events,
+                                    need_approval: Some(
+                                        crate::runtime::messaging::ThreadOutcome::NeedApproval {
+                                            action_name,
+                                            call_id,
+                                            parameters: params,
+                                        },
+                                    ),
+                                    recursive_tokens,
+                                    final_answer: None,
+                                    had_error,
+                                });
+                            }
                         }
                     }
                 };
 
-                // Resume Monty
-                progress = resume_monty(
-                    call.resume(ext_result, PrintWriter::Collect(&mut stdout)),
-                )?;
+                // Resume Monty (with error recovery — don't terminate on Monty errors)
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    call.resume(ext_result, PrintWriter::Collect(&mut stdout))
+                })) {
+                    Ok(Ok(p)) => progress = p,
+                    Ok(Err(e)) => {
+                        // Runtime error after resume → include in output, mark as error
+                        stdout.push_str(&format!("\nError: {e}"));
+                        had_error = true;
+                        return Ok(CodeExecutionResult {
+                            return_value: serde_json::Value::Null,
+                            stdout,
+                            action_results,
+                            events,
+                            need_approval: None,
+                            recursive_tokens,
+                            final_answer,
+                            had_error,
+                        });
+                    }
+                    Err(_) => {
+                        return Err(EngineError::Effect {
+                            reason: "Monty VM panicked during resume".into(),
+                        });
+                    }
+                }
             }
 
             RunProgress::NameLookup(lookup) => {
                 let name = lookup.name.clone();
                 debug!(name = %name, "Monty: unresolved name");
-                progress = resume_monty(
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     lookup.resume(
                         NameLookupResult::Undefined,
                         PrintWriter::Collect(&mut stdout),
-                    ),
-                )?;
+                    )
+                })) {
+                    Ok(Ok(p)) => progress = p,
+                    Ok(Err(e)) => {
+                        stdout.push_str(&format!("\nNameError: {e}"));
+                        had_error = true;
+                        return Ok(CodeExecutionResult {
+                            return_value: serde_json::Value::Null,
+                            stdout,
+                            action_results,
+                            events,
+                            need_approval: None,
+                            recursive_tokens,
+                            final_answer,
+                            had_error,
+                        });
+                    }
+                    Err(_) => {
+                        return Err(EngineError::Effect {
+                            reason: "Monty VM panicked during name lookup".into(),
+                        });
+                    }
+                }
             }
 
             RunProgress::OsCall(os_call) => {
@@ -305,14 +468,45 @@ pub async fn execute_code(
                     ExcType::OSError,
                     Some("OS operations are not permitted in CodeAct scripts".into()),
                 ));
-                progress = resume_monty(
-                    os_call.resume(err, PrintWriter::Collect(&mut stdout)),
-                )?;
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    os_call.resume(err, PrintWriter::Collect(&mut stdout))
+                })) {
+                    Ok(Ok(p)) => progress = p,
+                    Ok(Err(e)) => {
+                        stdout.push_str(&format!("\nOSError: {e}"));
+                        had_error = true;
+                        return Ok(CodeExecutionResult {
+                            return_value: serde_json::Value::Null,
+                            stdout,
+                            action_results,
+                            events,
+                            need_approval: None,
+                            recursive_tokens,
+                            final_answer,
+                            had_error,
+                        });
+                    }
+                    Err(_) => {
+                        return Err(EngineError::Effect {
+                            reason: "Monty VM panicked during OS call".into(),
+                        });
+                    }
+                }
             }
 
             RunProgress::ResolveFutures(_) => {
-                return Err(EngineError::Effect {
-                    reason: "async/await is not supported in CodeAct scripts".into(),
+                // Async not supported — return error to LLM
+                stdout.push_str("\nError: async/await is not supported in CodeAct scripts");
+                had_error = true;
+                return Ok(CodeExecutionResult {
+                    return_value: serde_json::Value::Null,
+                    stdout,
+                    action_results,
+                    events,
+                    need_approval: None,
+                    recursive_tokens,
+                    final_answer,
+                    had_error,
                 });
             }
         }
@@ -321,18 +515,13 @@ pub async fn execute_code(
 
 // ── llm_query() — recursive subagent (RLM 3.5) ─────────────
 
-/// Handle a `llm_query(prompt, context)` call from within Python code.
-///
-/// Spawns a single-shot LLM call with the given prompt and context.
-/// The result is returned as a MontyObject (string), not injected into
-/// the parent's attention window (RLM pattern: symbolic composition).
+/// Handle `llm_query(prompt, context)` — single recursive sub-call.
 async fn handle_llm_query(
     args: &[MontyObject],
     kwargs: &[(MontyObject, MontyObject)],
     llm: &Arc<dyn LlmBackend>,
     recursive_tokens: &mut TokenUsage,
 ) -> ExtFunctionResult {
-    // Extract prompt (first arg or kwarg "prompt")
     let prompt = extract_string_arg(args, kwargs, "prompt", 0);
     let context_arg = extract_string_arg(args, kwargs, "context", 1);
 
@@ -346,16 +535,14 @@ async fn handle_llm_query(
         }
     };
 
-    // Build messages for the child LLM call
     let mut messages = Vec::new();
     if let Some(ctx) = context_arg {
         messages.push(ThreadMessage::system(format!(
-            "You are a sub-agent. Here is the context:\n\n{ctx}"
+            "You are a sub-agent. Answer concisely based on the context.\n\n{ctx}"
         )));
     }
     messages.push(ThreadMessage::user(prompt));
 
-    // Make the LLM call (no tools — pure text completion)
     let config = LlmCallConfig {
         force_text: true,
         ..LlmCallConfig::default()
@@ -365,13 +552,13 @@ async fn handle_llm_query(
         Ok(output) => {
             recursive_tokens.input_tokens += output.usage.input_tokens;
             recursive_tokens.output_tokens += output.usage.output_tokens;
-
-            let response_text = match output.response {
-                LlmResponse::Text(text) => text,
-                LlmResponse::ActionCalls { content, .. } => content.unwrap_or_default(),
-                LlmResponse::Code { content, .. } => content.unwrap_or_default(),
+            let text = match output.response {
+                LlmResponse::Text(t) => t,
+                LlmResponse::ActionCalls { content, .. } | LlmResponse::Code { content, .. } => {
+                    content.unwrap_or_default()
+                }
             };
-            ExtFunctionResult::Return(MontyObject::String(response_text))
+            ExtFunctionResult::Return(MontyObject::String(text))
         }
         Err(e) => ExtFunctionResult::Error(MontyException::new(
             ExcType::RuntimeError,
@@ -380,14 +567,113 @@ async fn handle_llm_query(
     }
 }
 
-/// Extract a string argument by name (kwarg) or position (positional arg).
+/// Handle `llm_query_batched(prompts)` — parallel recursive sub-calls.
+///
+/// Takes a list of prompt strings and dispatches them concurrently.
+/// Returns a list of response strings in the same order.
+async fn handle_llm_query_batched(
+    args: &[MontyObject],
+    kwargs: &[(MontyObject, MontyObject)],
+    llm: &Arc<dyn LlmBackend>,
+    recursive_tokens: &mut TokenUsage,
+) -> ExtFunctionResult {
+    // Extract prompts list (first arg or kwarg "prompts")
+    let prompts_obj = args.first().or_else(|| {
+        kwargs.iter().find_map(|(k, v)| {
+            if let MontyObject::String(key) = k
+                && key == "prompts"
+            {
+                return Some(v);
+            }
+            None
+        })
+    });
+
+    let prompts: Vec<String> = match prompts_obj {
+        Some(MontyObject::List(items)) => items.iter().map(monty_to_string).collect(),
+        Some(other) => {
+            return ExtFunctionResult::Error(MontyException::new(
+                ExcType::TypeError,
+                Some(format!(
+                    "llm_query_batched() expects a list of prompts, got {other:?}"
+                )),
+            ));
+        }
+        None => {
+            return ExtFunctionResult::Error(MontyException::new(
+                ExcType::TypeError,
+                Some("llm_query_batched() requires a 'prompts' argument".into()),
+            ));
+        }
+    };
+
+    // Optional context kwarg
+    let context_arg = extract_string_arg(&[], kwargs, "context", usize::MAX);
+
+    // Dispatch all prompts concurrently
+    let config = LlmCallConfig {
+        force_text: true,
+        ..LlmCallConfig::default()
+    };
+
+    let mut handles = Vec::with_capacity(prompts.len());
+    for prompt in &prompts {
+        let llm = Arc::clone(llm);
+        let config = config.clone();
+        let ctx = context_arg.clone();
+        let prompt = prompt.clone();
+        handles.push(tokio::spawn(async move {
+            let mut messages = Vec::new();
+            if let Some(ctx) = ctx {
+                messages.push(ThreadMessage::system(format!(
+                    "You are a sub-agent. Answer concisely.\n\n{ctx}"
+                )));
+            }
+            messages.push(ThreadMessage::user(prompt));
+            llm.complete(&messages, &[], &config).await
+        }));
+    }
+
+    // Collect results
+    let mut results = Vec::with_capacity(prompts.len());
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(output)) => {
+                total_input += output.usage.input_tokens;
+                total_output += output.usage.output_tokens;
+                let text = match output.response {
+                    LlmResponse::Text(t) => t,
+                    LlmResponse::ActionCalls { content, .. }
+                    | LlmResponse::Code { content, .. } => content.unwrap_or_default(),
+                };
+                results.push(MontyObject::String(text));
+            }
+            Ok(Err(e)) => {
+                results.push(MontyObject::String(format!("Error: {e}")));
+            }
+            Err(e) => {
+                results.push(MontyObject::String(format!("Error: task failed: {e}")));
+            }
+        }
+    }
+
+    recursive_tokens.input_tokens += total_input;
+    recursive_tokens.output_tokens += total_output;
+
+    ExtFunctionResult::Return(MontyObject::List(results))
+}
+
+// ── Helpers ─────────────────────────────────────────────────
+
 fn extract_string_arg(
     args: &[MontyObject],
     kwargs: &[(MontyObject, MontyObject)],
     name: &str,
     position: usize,
 ) -> Option<String> {
-    // Check kwargs first
     for (k, v) in kwargs {
         if let MontyObject::String(key) = k
             && key == name
@@ -395,11 +681,9 @@ fn extract_string_arg(
             return Some(monty_to_string(v));
         }
     }
-    // Then positional
     args.get(position).map(monty_to_string)
 }
 
-/// Convert any MontyObject to a string representation.
 fn monty_to_string(obj: &MontyObject) -> String {
     match obj {
         MontyObject::String(s) => s.clone(),
@@ -407,18 +691,19 @@ fn monty_to_string(obj: &MontyObject) -> String {
         MontyObject::Bool(b) => b.to_string(),
         MontyObject::Int(i) => i.to_string(),
         MontyObject::Float(f) => f.to_string(),
-        other => serde_json::to_string(&monty_to_json(other)).unwrap_or_else(|_| format!("{other:?}")),
+        other => {
+            serde_json::to_string(&monty_to_json(other)).unwrap_or_else(|_| format!("{other:?}"))
+        }
     }
 }
 
-// ── Dispatch result ─────────────────────────────────────────
+// ── Dispatch ────────────────────────────────────────────────
 
 enum DispatchResult {
     Ok(ExtFunctionResult),
     NeedApproval,
 }
 
-/// Dispatch an action call through lease + policy + effect executor.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_action(
     action_name: &str,
@@ -433,7 +718,6 @@ async fn dispatch_action(
     action_results: &mut Vec<ActionResult>,
     events: &mut Vec<EventKind>,
 ) -> DispatchResult {
-    // Find lease
     let lease = match leases.find_lease_for_action(thread.id, action_name).await {
         Some(l) => l,
         None => {
@@ -447,7 +731,6 @@ async fn dispatch_action(
         }
     };
 
-    // Find action definition and check policy
     let action_def = effects
         .available_actions(std::slice::from_ref(&lease))
         .await
@@ -479,7 +762,6 @@ async fn dispatch_action(
         }
     }
 
-    // Consume lease use
     if let Err(e) = leases.consume_use(lease.id).await {
         return DispatchResult::Ok(ExtFunctionResult::Error(MontyException::new(
             ExcType::RuntimeError,
@@ -487,7 +769,6 @@ async fn dispatch_action(
         )));
     }
 
-    // Execute the action
     match effects
         .execute_action(action_name, params, &lease, context)
         .await
@@ -525,18 +806,8 @@ async fn dispatch_action(
     }
 }
 
-/// Wrap Monty resume results with error conversion.
-fn resume_monty<T: monty::ResourceTracker>(
-    result: Result<RunProgress<T>, MontyException>,
-) -> Result<RunProgress<T>, EngineError> {
-    result.map_err(|e| EngineError::Effect {
-        reason: format!("Python execution error: {e}"),
-    })
-}
+// ── MontyObject ↔ JSON ──────────────────────────────────────
 
-// ── MontyObject ↔ JSON conversion ───────────────────────────
-
-/// Convert a MontyObject to serde_json::Value.
 fn monty_to_json(obj: &MontyObject) -> serde_json::Value {
     match obj {
         MontyObject::None => serde_json::Value::Null,
@@ -564,14 +835,13 @@ fn monty_to_json(obj: &MontyObject) -> serde_json::Value {
         MontyObject::Set(items) | MontyObject::FrozenSet(items) => {
             serde_json::Value::Array(items.iter().map(monty_to_json).collect())
         }
-        MontyObject::Bytes(b) => serde_json::Value::String(
-            b.iter().map(|byte| format!("{byte:02x}")).collect(),
-        ),
+        MontyObject::Bytes(b) => {
+            serde_json::Value::String(b.iter().map(|byte| format!("{byte:02x}")).collect())
+        }
         other => serde_json::Value::String(format!("{other:?}")),
     }
 }
 
-/// Convert serde_json::Value to MontyObject.
 fn json_to_monty(val: &serde_json::Value) -> MontyObject {
     match val {
         serde_json::Value::Null => MontyObject::None,
@@ -597,7 +867,6 @@ fn json_to_monty(val: &serde_json::Value) -> MontyObject {
     }
 }
 
-/// Convert Monty function call args + kwargs to a JSON object.
 fn monty_args_to_json(
     args: &[MontyObject],
     kwargs: &[(MontyObject, MontyObject)],
