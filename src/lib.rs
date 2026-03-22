@@ -73,7 +73,6 @@ pub mod skills;
 pub mod timezone;
 pub mod tools;
 pub mod tracing_fmt;
-pub mod transcription;
 pub mod tunnel;
 pub mod util;
 pub mod webhooks;

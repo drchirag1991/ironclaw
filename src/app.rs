@@ -386,7 +386,7 @@ impl AppBuilder {
             let b = tools
                 .register_builder_tool(llm.clone(), Some(self.config.builder.to_builder_config()))
                 .await;
-            tracing::info!("Builder mode enabled");
+            tracing::debug!("Builder mode enabled");
             Some(b)
         } else {
             None
@@ -536,7 +536,7 @@ impl AppBuilder {
                                             server_name,
                                             e
                                         );
-                                        return;
+                                        return None;
                                     }
                                 };
 
@@ -553,6 +553,10 @@ impl AppBuilder {
                                                     tool_count,
                                                     server_name
                                                 );
+                                                return Some((
+                                                    server_name,
+                                                    Arc::new(client),
+                                                ));
                                             }
                                             Err(e) => {
                                                 tracing::warn!(
@@ -583,14 +587,27 @@ impl AppBuilder {
                                         }
                                     }
                                 }
+                                None
                             });
                         }
 
+                        let mut startup_clients = Vec::new();
                         while let Some(result) = join_set.join_next().await {
-                            if let Err(e) = result {
-                                tracing::warn!("MCP server loading task panicked: {}", e);
+                            match result {
+                                Ok(Some(client_pair)) => {
+                                    startup_clients.push(client_pair);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    if e.is_panic() {
+                                        tracing::error!("MCP server loading task panicked: {}", e);
+                                    } else {
+                                        tracing::warn!("MCP server loading task failed: {}", e);
+                                    }
+                                }
                             }
                         }
+                        return startup_clients;
                     }
                     Err(e) => {
                         if matches!(
@@ -608,10 +625,12 @@ impl AppBuilder {
                         }
                     }
                 }
+                Vec::new()
             }
         };
 
-        let (dev_loaded_tool_names, _) = tokio::join!(wasm_tools_future, mcp_servers_future);
+        let (dev_loaded_tool_names, startup_mcp_clients) =
+            tokio::join!(wasm_tools_future, mcp_servers_future);
 
         // Load registry catalog entries for extension discovery
         let mut catalog_entries = match crate::registry::RegistryCatalog::load_or_embedded() {
@@ -673,6 +692,17 @@ impl AppBuilder {
             ));
             tools.register_extension_tools(Arc::clone(&manager));
             tracing::debug!("Extension manager initialized with in-chat discovery tools");
+
+            if !startup_mcp_clients.is_empty() {
+                tracing::info!(
+                    count = startup_mcp_clients.len(),
+                    "Injecting startup MCP clients into extension manager"
+                );
+                for (name, client) in startup_mcp_clients {
+                    manager.inject_mcp_client(name, client).await;
+                }
+            }
+
             Some(manager)
         };
 
@@ -699,13 +729,13 @@ impl AppBuilder {
         self.init_database().await?;
         self.init_secrets().await?;
 
-        // Post-init validation: if a non-nearai backend was selected but
-        // credentials were never resolved (deferred resolution found no keys),
-        // fail early with a clear error instead of a confusing runtime failure.
-        if self.config.llm.backend != "nearai"
-            && self.config.llm.backend != "bedrock"
-            && self.config.llm.backend != "openai_codex"
-            && self.config.llm.provider.is_none()
+        // Post-init validation: backends with dedicated config (nearai, gemini_oauth,
+        // bedrock, openai_codex) handle their own credential resolution. For registry-based
+        // backends, fail early if no provider config was resolved.
+        if !matches!(
+            self.config.llm.backend.as_str(),
+            "nearai" | "gemini_oauth" | "bedrock" | "openai_codex"
+        ) && self.config.llm.provider.is_none()
         {
             let backend = &self.config.llm.backend;
             anyhow::bail!(
