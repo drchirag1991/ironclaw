@@ -53,9 +53,14 @@ pub use capability::policy::{PolicyDecision, PolicyEngine};
 
 // ── Re-exports: runtime ───────────────────────────────────────
 
+pub use runtime::conversation::ConversationManager;
 pub use runtime::manager::ThreadManager;
 pub use runtime::messaging::ThreadOutcome;
 pub use runtime::tree::ThreadTree;
+
+pub use types::conversation::{
+    ConversationEntry, ConversationId, ConversationSurface, EntrySender,
+};
 
 // ── Re-exports: executor ──────────────────────────────────────
 

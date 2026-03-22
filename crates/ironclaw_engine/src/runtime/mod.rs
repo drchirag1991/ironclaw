@@ -4,10 +4,12 @@
 //! - [`ThreadTree`] — parent-child relationship tracking
 //! - [`messaging`] — inter-thread signal channel
 
+pub mod conversation;
 pub mod manager;
 pub mod messaging;
 pub mod tree;
 
+pub use conversation::ConversationManager;
 pub use manager::ThreadManager;
 pub use messaging::ThreadOutcome;
 pub use tree::ThreadTree;

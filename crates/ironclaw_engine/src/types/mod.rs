@@ -4,6 +4,7 @@
 //! validation logic.
 
 pub mod capability;
+pub mod conversation;
 pub mod error;
 pub mod event;
 pub mod memory;
