@@ -38,6 +38,8 @@ pub struct ThreadManager {
     pub policy: Arc<PolicyEngine>,
     tree: RwLock<ThreadTree>,
     running: RwLock<HashMap<ThreadId, RunningThread>>,
+    /// Broadcast channel for thread events (for live status updates).
+    event_tx: tokio::sync::broadcast::Sender<crate::types::event::ThreadEvent>,
 }
 
 impl ThreadManager {
@@ -49,6 +51,7 @@ impl ThreadManager {
         leases: Arc<LeaseManager>,
         policy: Arc<PolicyEngine>,
     ) -> Self {
+        let (event_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             llm,
             effects,
@@ -58,7 +61,13 @@ impl ThreadManager {
             policy,
             tree: RwLock::new(ThreadTree::new()),
             running: RwLock::new(HashMap::new()),
+            event_tx,
         }
+    }
+
+    /// Subscribe to thread events for live status updates.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<crate::types::event::ThreadEvent> {
+        self.event_tx.subscribe()
     }
 
     /// Spawn a new thread and start executing it.
@@ -142,7 +151,8 @@ impl ThreadManager {
         let leases = Arc::clone(&self.leases);
         let policy = Arc::clone(&self.policy);
 
-        let exec_loop = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, user_id);
+        let exec_loop = ExecutionLoop::new(thread, llm, effects, leases, policy, rx, user_id)
+            .with_event_tx(self.event_tx.clone());
 
         // Spawn background task
         let handle = tokio::spawn(async move {

@@ -14,7 +14,7 @@ use crate::agent::Agent;
 use crate::bridge::effect_adapter::EffectBridgeAdapter;
 use crate::bridge::llm_adapter::LlmBridgeAdapter;
 use crate::bridge::store_adapter::InMemoryStore;
-use crate::channels::IncomingMessage;
+use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::error::Error;
 
 /// Check if the engine v2 is enabled via `ENGINE_V2=true` environment variable.
@@ -144,6 +144,16 @@ pub async fn handle_with_engine(
         "engine v2: handling message"
     );
 
+    // Send "Thinking..." status to the channel
+    let _ = agent
+        .channels
+        .send_status(
+            &message.channel,
+            StatusUpdate::Thinking("Processing...".into()),
+            &message.metadata,
+        )
+        .await;
+
     // Get or create conversation for this channel+user
     let conv_id = state
         .conversation_manager
@@ -168,19 +178,43 @@ pub async fn handle_with_engine(
             })
         })?;
 
-    debug!(thread_id = %thread_id, "engine v2: thread active, waiting for completion");
+    debug!(thread_id = %thread_id, "engine v2: thread spawned");
 
-    // Wait for the thread to complete
-    let outcome = state
-        .thread_manager
-        .join_thread(thread_id)
-        .await
-        .map_err(|e| {
-            crate::error::Error::from(crate::error::JobError::ContextError {
-                id: uuid::Uuid::nil(),
-                reason: format!("engine v2 join error: {e}"),
-            })
-        })?;
+    // Subscribe to live events for progress updates
+    let mut event_rx = state.thread_manager.subscribe_events();
+    let channels = &agent.channels;
+    let channel_name = &message.channel;
+    let metadata = &message.metadata;
+
+    // Forward events to the channel while waiting for thread completion
+    loop {
+        tokio::select! {
+            // Check for events from the execution loop
+            event = event_rx.recv() => {
+                match event {
+                    Ok(ref evt) if evt.thread_id == thread_id => {
+                        forward_event_to_channel(evt, channels, channel_name, metadata).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    _ => {} // Event for a different thread, or lagged
+                }
+            }
+            // Also check if the thread has finished (in case we miss the events)
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if !state.thread_manager.is_running(thread_id).await {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Join the thread to get the outcome
+    let outcome = state.thread_manager.join_thread(thread_id).await.map_err(|e| {
+        crate::error::Error::from(crate::error::JobError::ContextError {
+            id: uuid::Uuid::nil(),
+            reason: format!("engine v2 join error: {e}"),
+        })
+    })?;
 
     // Record outcome in conversation
     state
@@ -206,5 +240,72 @@ pub async fn handle_with_engine(
         } => Ok(Some(format!(
             "Action '{action_name}' requires approval (not yet supported in engine v2)"
         ))),
+    }
+}
+
+/// Forward an engine ThreadEvent to the channel as a StatusUpdate.
+async fn forward_event_to_channel(
+    event: &ironclaw_engine::ThreadEvent,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    channel_name: &str,
+    metadata: &serde_json::Value,
+) {
+    use ironclaw_engine::EventKind;
+
+    match &event.kind {
+        EventKind::StepStarted { .. } => {
+            let _ = channels
+                .send_status(
+                    channel_name,
+                    StatusUpdate::Thinking("Thinking...".into()),
+                    metadata,
+                )
+                .await;
+        }
+        EventKind::ActionExecuted {
+            action_name,
+            ..
+        } => {
+            let _ = channels
+                .send_status(
+                    channel_name,
+                    StatusUpdate::ToolCompleted {
+                        name: action_name.clone(),
+                        success: true,
+                        error: None,
+                        parameters: None,
+                    },
+                    metadata,
+                )
+                .await;
+        }
+        EventKind::ActionFailed {
+            action_name,
+            error,
+            ..
+        } => {
+            let _ = channels
+                .send_status(
+                    channel_name,
+                    StatusUpdate::ToolCompleted {
+                        name: action_name.clone(),
+                        success: false,
+                        error: Some(error.clone()),
+                        parameters: None,
+                    },
+                    metadata,
+                )
+                .await;
+        }
+        EventKind::StepCompleted { .. } => {
+            let _ = channels
+                .send_status(
+                    channel_name,
+                    StatusUpdate::Thinking("Processing results...".into()),
+                    metadata,
+                )
+                .await;
+        }
+        _ => {} // Other events don't need channel status
     }
 }

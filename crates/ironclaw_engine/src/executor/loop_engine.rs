@@ -33,6 +33,8 @@ pub struct ExecutionLoop {
     policy: Arc<PolicyEngine>,
     signal_rx: SignalReceiver,
     user_id: String,
+    /// Optional broadcast sender for live event streaming.
+    event_tx: Option<tokio::sync::broadcast::Sender<crate::types::event::ThreadEvent>>,
 }
 
 impl ExecutionLoop {
@@ -53,7 +55,27 @@ impl ExecutionLoop {
             policy,
             signal_rx,
             user_id,
+            event_tx: None,
         }
+    }
+
+    /// Set the event broadcast sender for live status updates.
+    pub fn with_event_tx(
+        mut self,
+        tx: tokio::sync::broadcast::Sender<crate::types::event::ThreadEvent>,
+    ) -> Self {
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// Add an event to the thread and broadcast it for live status updates.
+    fn emit_event(&mut self, kind: EventKind) {
+        let event = crate::types::event::ThreadEvent::new(self.thread.id, kind);
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(event.clone());
+        }
+        self.thread.events.push(event);
+        self.thread.updated_at = chrono::Utc::now();
     }
 
     /// Run the execution loop to completion.
@@ -168,7 +190,7 @@ impl ExecutionLoop {
             // 6. Create step
             let mut step = Step::new(self.thread.id, iteration + 1);
             step.status = StepStatus::LlmCalling;
-            self.thread.add_event(EventKind::StepStarted {
+            self.emit_event(EventKind::StepStarted {
                 step_id: step.id,
             });
 
@@ -199,7 +221,7 @@ impl ExecutionLoop {
                             .add_message(ThreadMessage::assistant(text));
                         step.status = StepStatus::Completed;
                         step.completed_at = Some(chrono::Utc::now());
-                        self.thread.add_event(EventKind::StepCompleted {
+                        self.emit_event(EventKind::StepCompleted {
                             step_id: step.id,
                             tokens: step.tokens_used,
                         });
@@ -231,7 +253,7 @@ impl ExecutionLoop {
 
                         step.status = StepStatus::Completed;
                         step.completed_at = Some(chrono::Utc::now());
-                        self.thread.add_event(EventKind::StepCompleted {
+                        self.emit_event(EventKind::StepCompleted {
                             step_id: step.id,
                             tokens: step.tokens_used,
                         });
@@ -245,7 +267,7 @@ impl ExecutionLoop {
 
                     step.status = StepStatus::Completed;
                     step.completed_at = Some(chrono::Utc::now());
-                    self.thread.add_event(EventKind::StepCompleted {
+                    self.emit_event(EventKind::StepCompleted {
                         step_id: step.id,
                         tokens: step.tokens_used,
                     });
@@ -292,7 +314,7 @@ impl ExecutionLoop {
 
                     // Record events
                     for event_kind in batch.events {
-                        self.thread.add_event(event_kind);
+                        self.emit_event(event_kind);
                     }
 
                     // Add action results as messages
@@ -307,7 +329,7 @@ impl ExecutionLoop {
                     step.action_results = batch.results;
                     step.status = StepStatus::Completed;
                     step.completed_at = Some(chrono::Utc::now());
-                    self.thread.add_event(EventKind::StepCompleted {
+                    self.emit_event(EventKind::StepCompleted {
                         step_id: step.id,
                         tokens: step.tokens_used,
                     });
@@ -365,7 +387,7 @@ impl ExecutionLoop {
 
                     // Record events
                     for event_kind in code_result.events {
-                        self.thread.add_event(event_kind);
+                        self.emit_event(event_kind);
                     }
 
                     // Add action results as messages
@@ -388,7 +410,7 @@ impl ExecutionLoop {
 
                     step.status = StepStatus::Completed;
                     step.completed_at = Some(chrono::Utc::now());
-                    self.thread.add_event(EventKind::StepCompleted {
+                    self.emit_event(EventKind::StepCompleted {
                         step_id: step.id,
                         tokens: step.tokens_used,
                     });

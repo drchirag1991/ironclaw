@@ -175,7 +175,7 @@ pub struct AgentDeps {
 pub struct Agent {
     pub(super) config: AgentConfig,
     pub(super) deps: AgentDeps,
-    pub(super) channels: Arc<ChannelManager>,
+    pub(crate) channels: Arc<ChannelManager>,
     pub(super) context_manager: Arc<ContextManager>,
     pub(super) scheduler: Arc<Scheduler>,
     pub(super) router: Router,
