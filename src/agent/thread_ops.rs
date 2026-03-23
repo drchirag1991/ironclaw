@@ -25,6 +25,25 @@ use crate::tools::redact_params;
 
 const FORGED_THREAD_ID_ERROR: &str = "Invalid or unauthorized thread ID.";
 
+/// Result of attempting to hydrate a thread from the database.
+///
+/// Distinguishes between a thread that was fully hydrated into the session
+/// (messages loaded, thread registered) and one where we recognised the UUID
+/// but skipped hydration (e.g. already present in memory, or ownership could
+/// not be verified on a non-gateway channel).
+#[derive(Debug)]
+#[allow(dead_code)] // Inner UUIDs are part of the API contract for future callers
+pub(super) enum HydrationResult {
+    /// Thread hydrated and available in `sess.threads` / `thread_map`.
+    Ready(Uuid),
+    /// UUID is known but hydration was intentionally skipped.  The thread may
+    /// already be in memory, or the caller is on a channel that does not
+    /// require pre-existing threads so we fall through to `resolve_thread`.
+    Skipped(Uuid),
+    /// The external thread ID was not a valid UUID — nothing to hydrate.
+    NotFound,
+}
+
 fn requires_preexisting_uuid_thread(channel: &str) -> bool {
     // Gateway-style channels send server-issued conversation UUIDs.
     // Unknown UUIDs should be rejected instead of silently creating a new thread.
@@ -41,15 +60,24 @@ impl Agent {
     /// even when the conversation has zero messages (e.g. a brand-new
     /// assistant thread). Without this, `resolve_thread` would mint a
     /// fresh UUID and all messages would land in the wrong conversation.
+    ///
+    /// Returns [`HydrationResult::Ready`] when the thread was fully loaded
+    /// into the session, [`HydrationResult::Skipped`] when the UUID was
+    /// recognised but hydration was not performed (already in memory, or
+    /// ownership unverifiable on a non-gateway channel), and
+    /// [`HydrationResult::NotFound`] when the external ID is not a UUID.
+    ///
+    /// Returns `Err` only for hard rejections (forged / unauthorised thread
+    /// ID on a gateway channel).
     pub(super) async fn maybe_hydrate_thread(
         &self,
         message: &IncomingMessage,
         external_thread_id: &str,
-    ) -> Result<Option<Uuid>, String> {
+    ) -> Result<HydrationResult, String> {
         // Only hydrate UUID-shaped thread IDs (web gateway uses UUIDs)
         let thread_uuid = match Uuid::parse_str(external_thread_id) {
             Ok(id) => id,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(HydrationResult::NotFound),
         };
 
         // Check if already in memory
@@ -60,7 +88,7 @@ impl Agent {
         {
             let sess = session.lock().await;
             if sess.threads.contains_key(&thread_uuid) {
-                return Ok(Some(thread_uuid));
+                return Ok(HydrationResult::Skipped(thread_uuid));
             }
         }
 
@@ -85,7 +113,7 @@ impl Agent {
                     if requires_preexisting_uuid_thread(&message.channel) {
                         return Err(FORGED_THREAD_ID_ERROR.to_string());
                     }
-                    return Ok(Some(thread_uuid));
+                    return Ok(HydrationResult::Skipped(thread_uuid));
                 }
             };
             if !owned {
@@ -101,7 +129,7 @@ impl Agent {
                         if requires_preexisting_uuid_thread(&message.channel) {
                             return Err(FORGED_THREAD_ID_ERROR.to_string());
                         }
-                        return Ok(Some(thread_uuid));
+                        return Ok(HydrationResult::Skipped(thread_uuid));
                     }
                 };
 
@@ -122,7 +150,7 @@ impl Agent {
                     exists,
                     "Skipped hydration for thread id not owned by sender"
                 );
-                return Ok(Some(thread_uuid));
+                return Ok(HydrationResult::Skipped(thread_uuid));
             }
 
             let db_messages = store
@@ -169,7 +197,7 @@ impl Agent {
             msg_count
         );
 
-        Ok(Some(thread_uuid))
+        Ok(HydrationResult::Ready(thread_uuid))
     }
 
     pub(super) async fn process_user_input(
@@ -1424,7 +1452,7 @@ impl Agent {
                                 "Thread disappeared while preparing approval request"
                             );
                             return Ok(SubmissionResult::error(
-                                "Internal error: conversation thread no longer available. Please retry.",
+                                "The conversation thread was pruned during processing. Some actions may have already been executed. Please check results before retrying.",
                             ));
                         }
                     }
@@ -2261,7 +2289,7 @@ mod tests {
                 Ok("stored")
             }
             None => Err(format!(
-                "Internal error: conversation thread no longer available. Tool: {}",
+                "The conversation thread was pruned during processing. Some actions may have already been executed. Tool: {}",
                 tool_name,
             )),
         };
@@ -2269,8 +2297,8 @@ mod tests {
         assert!(result.is_err(), "Missing thread should produce an error");
         let err = result.unwrap_err();
         assert!(
-            err.contains("no longer available"),
-            "Error should mention thread unavailability. Got: {}",
+            err.contains("pruned during processing"),
+            "Error should mention thread was pruned. Got: {}",
             err
         );
     }
