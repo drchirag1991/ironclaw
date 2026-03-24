@@ -156,9 +156,7 @@ impl EffectExecutor for EffectBridgeAdapter {
                 .rate_limiter
                 .check_and_record(&context.user_id, lookup_name, &rl_config)
                 .await;
-            if let crate::tools::rate_limiter::RateLimitResult::Limited {
-                retry_after, ..
-            } = result
+            if let crate::tools::rate_limiter::RateLimitResult::Limited { retry_after, .. } = result
             {
                 return Err(EngineError::Effect {
                     reason: format!(

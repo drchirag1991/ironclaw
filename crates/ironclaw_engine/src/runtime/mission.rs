@@ -9,9 +9,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+use crate::memory::RetrievalEngine;
 use crate::runtime::manager::ThreadManager;
+use crate::runtime::messaging::ThreadOutcome;
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
+use crate::types::memory::MemoryDoc;
 use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
 use crate::types::project::ProjectId;
 use crate::types::thread::{ThreadConfig, ThreadId, ThreadType};
@@ -77,11 +80,15 @@ impl MissionManager {
         Ok(())
     }
 
-    /// Manually fire a mission — spawn a thread for it right now.
+    /// Fire a mission — build meta-prompt, spawn thread, process outcome.
+    ///
+    /// Optional `trigger_payload` carries webhook/event data that triggered this
+    /// fire. It's injected into the thread's context as `state["trigger_payload"]`.
     pub async fn fire_mission(
         &self,
         id: MissionId,
         user_id: &str,
+        trigger_payload: Option<serde_json::Value>,
     ) -> Result<Option<ThreadId>, EngineError> {
         let mission = self.store.load_mission(id).await?;
         let mission = match mission {
@@ -98,10 +105,25 @@ impl MissionManager {
             return Ok(None);
         }
 
+        // Check daily budget
+        if mission.max_threads_per_day > 0 && mission.threads_today >= mission.max_threads_per_day {
+            debug!(mission_id = %id, "daily thread budget exhausted");
+            return Ok(None);
+        }
+
+        // Build meta-prompt from mission state + project docs
+        let retrieval = RetrievalEngine::new(Arc::clone(&self.store));
+        let project_docs = retrieval
+            .retrieve_context(mission.project_id, &mission.goal, 10)
+            .await
+            .unwrap_or_default();
+        let meta_prompt = build_meta_prompt(&mission, &project_docs, &trigger_payload);
+
+        // Spawn thread with meta-prompt as initial user message
         let thread_id = self
             .thread_manager
             .spawn_thread(
-                &mission.goal,
+                &meta_prompt,
                 ThreadType::Mission,
                 mission.project_id,
                 ThreadConfig {
@@ -113,13 +135,55 @@ impl MissionManager {
             )
             .await?;
 
-        // Record the thread in mission history
+        // Record the thread + trigger payload in mission history
         let mut updated = mission;
         updated.record_thread(thread_id);
+        updated.threads_today += 1;
+        updated.last_trigger_payload = trigger_payload;
         self.store.save_mission(&updated).await?;
 
         debug!(mission_id = %id, thread_id = %thread_id, "mission fired");
+
+        // Wait for thread completion and process the outcome
+        let tm = Arc::clone(&self.thread_manager);
+        let store = Arc::clone(&self.store);
+        let mission_id = id;
+        tokio::spawn(async move {
+            match tm.join_thread(thread_id).await {
+                Ok(outcome) => {
+                    if let Err(e) =
+                        process_mission_outcome(&store, mission_id, thread_id, &outcome).await
+                    {
+                        warn!(mission_id = %mission_id, "failed to process outcome: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!(mission_id = %mission_id, "thread join failed: {e}");
+                }
+            }
+        });
+
         Ok(Some(thread_id))
+    }
+
+    /// Start a background cron ticker that fires due missions every 60 seconds.
+    pub fn start_cron_ticker(self: &Arc<Self>, user_id: String) {
+        let mgr = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                match mgr.tick(&user_id).await {
+                    Ok(spawned) if !spawned.is_empty() => {
+                        debug!(count = spawned.len(), "cron ticker spawned mission threads");
+                    }
+                    Err(e) => {
+                        warn!("cron ticker error: {e}");
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 
     /// List all missions in a project.
@@ -159,13 +223,150 @@ impl MissionManager {
                 | MissionCadence::Webhook { .. } => false,
             };
 
-            if should_fire && let Some(tid) = self.fire_mission(mid, user_id).await? {
+            if should_fire && let Some(tid) = self.fire_mission(mid, user_id, None).await? {
                 spawned.push(tid);
             }
         }
 
         Ok(spawned)
     }
+}
+
+// ── Meta-prompt generation ───────────────────────────────────
+
+/// Build the meta-prompt for a mission thread.
+///
+/// Assembles the mission's goal, current focus, approach history, and
+/// relevant project docs into a structured prompt that guides the thread.
+fn build_meta_prompt(
+    mission: &Mission,
+    project_docs: &[MemoryDoc],
+    trigger_payload: &Option<serde_json::Value>,
+) -> String {
+    let mut parts = Vec::new();
+
+    parts.push(format!(
+        "# Mission: {}\n\nGoal: {}",
+        mission.name, mission.goal
+    ));
+
+    if let Some(criteria) = &mission.success_criteria {
+        parts.push(format!("Success criteria: {criteria}"));
+    }
+
+    // Current focus
+    if let Some(focus) = &mission.current_focus {
+        parts.push(format!("\n## Current Focus\n{focus}"));
+    } else if mission.thread_history.is_empty() {
+        parts.push("\n## Current Focus\nThis is the first run. Start by understanding the goal and determining the first step.".into());
+    }
+
+    // Approach history
+    if !mission.approach_history.is_empty() {
+        parts.push("\n## Previous Approaches".into());
+        for (i, approach) in mission.approach_history.iter().enumerate() {
+            parts.push(format!("{}. {approach}", i + 1));
+        }
+    }
+
+    // Project knowledge (from reflection docs)
+    if !project_docs.is_empty() {
+        parts.push("\n## Knowledge from Prior Threads".into());
+        for doc in project_docs {
+            let label = format!("{:?}", doc.doc_type).to_uppercase();
+            let content: String = doc.content.chars().take(500).collect();
+            let truncated = if doc.content.chars().count() > 500 {
+                "..."
+            } else {
+                ""
+            };
+            parts.push(format!("[{label}] {}: {content}{truncated}", doc.title));
+        }
+    }
+
+    // Trigger payload
+    if let Some(payload) = trigger_payload {
+        let payload_str = serde_json::to_string_pretty(payload).unwrap_or_default();
+        let preview: String = payload_str.chars().take(1000).collect();
+        parts.push(format!("\n## Trigger Payload\n```json\n{preview}\n```"));
+    }
+
+    // Thread count
+    parts.push(format!(
+        "\nThis is thread #{} for this mission.",
+        mission.thread_history.len() + 1
+    ));
+
+    // Instructions
+    parts.push(
+        "\n## Instructions\nBased on the above context, take the next step toward the goal. \
+Use tools to gather information, analyze data, or take actions. \
+When done, call FINAL() with your response. Include:\n\
+1. What you accomplished in this step\n\
+2. What the next focus should be (for the next thread)\n\
+3. Whether the goal has been achieved (yes/no)"
+            .into(),
+    );
+
+    parts.join("\n")
+}
+
+/// Process a completed mission thread's outcome.
+///
+/// Extracts next_focus from the FINAL() response and updates the mission.
+async fn process_mission_outcome(
+    store: &Arc<dyn Store>,
+    mission_id: MissionId,
+    _thread_id: ThreadId,
+    outcome: &ThreadOutcome,
+) -> Result<(), EngineError> {
+    let mut mission = match store.load_mission(mission_id).await? {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+
+    match outcome {
+        ThreadOutcome::Completed { response } => {
+            if let Some(text) = response {
+                // Try to extract next focus and goal status from the response
+                let lower = text.to_lowercase();
+
+                // Check if goal achieved
+                if lower.contains("goal has been achieved: yes")
+                    || lower.contains("goal achieved: yes")
+                    || lower.contains("mission complete")
+                {
+                    debug!(mission_id = %mission_id, "goal achieved — completing mission");
+                    mission.status = MissionStatus::Completed;
+                }
+
+                // Extract next focus (look for "next focus:" pattern)
+                if let Some(focus_start) = lower.find("next focus:") {
+                    let after = &text[focus_start + "next focus:".len()..];
+                    let next_focus: String = after.lines().next().unwrap_or("").trim().to_string();
+                    if !next_focus.is_empty() {
+                        mission.current_focus = Some(next_focus);
+                    }
+                }
+
+                // Record approach
+                let accomplishment: String = text.chars().take(200).collect();
+                mission.approach_history.push(accomplishment);
+            }
+        }
+        ThreadOutcome::Failed { error } => {
+            mission.approach_history.push(format!("FAILED: {error}"));
+        }
+        ThreadOutcome::MaxIterations => {
+            mission
+                .approach_history
+                .push("Hit max iterations without completing".into());
+        }
+        _ => {}
+    }
+
+    mission.updated_at = chrono::Utc::now();
+    store.save_mission(&mission).await
 }
 
 #[cfg(test)]
@@ -487,7 +688,7 @@ mod tests {
             .await
             .unwrap();
 
-        let thread_id = mgr.fire_mission(id, "test-user").await.unwrap();
+        let thread_id = mgr.fire_mission(id, "test-user", None).await.unwrap();
         assert!(
             thread_id.is_some(),
             "fire_mission should return a thread ID"
@@ -520,7 +721,7 @@ mod tests {
         // Complete the mission so it becomes terminal
         mgr.complete_mission(id).await.unwrap();
 
-        let result = mgr.fire_mission(id, "test-user").await.unwrap();
+        let result = mgr.fire_mission(id, "test-user", None).await.unwrap();
         assert!(
             result.is_none(),
             "firing a terminal mission should return None"

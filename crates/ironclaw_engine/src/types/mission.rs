@@ -61,10 +61,7 @@ pub enum MissionCadence {
     /// Spawn in response to a channel message matching a pattern.
     OnEvent { event_pattern: String },
     /// Spawn in response to a structured system event (from tools or external).
-    OnSystemEvent {
-        source: String,
-        event_type: String,
-    },
+    OnSystemEvent { source: String, event_type: String },
     /// Spawn when an external webhook is received at a registered path.
     /// The bridge registers the webhook endpoint and routes payloads here.
     Webhook {
