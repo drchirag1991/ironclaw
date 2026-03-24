@@ -57,6 +57,9 @@ pub struct HeartbeatConfig {
     pub quiet_hours_end: Option<u32>,
     /// Timezone for fire_at and quiet hours evaluation (IANA name).
     pub timezone: Option<String>,
+    /// When true, cycle through all users with routines instead of
+    /// running heartbeat for a single user. Requires a database store.
+    pub multi_tenant: bool,
 }
 
 impl Default for HeartbeatConfig {
@@ -71,6 +74,7 @@ impl Default for HeartbeatConfig {
             quiet_hours_start: None,
             quiet_hours_end: None,
             timezone: None,
+            multi_tenant: false,
         }
     }
 }
@@ -396,7 +400,7 @@ impl HeartbeatRunner {
     }
 
     /// Send a notification about heartbeat findings.
-    async fn send_notification(&self, message: &str) {
+    pub(crate) async fn send_notification(&self, message: &str) {
         let Some(ref tx) = self.response_tx else {
             tracing::debug!("No response channel configured for heartbeat notifications");
             return;
@@ -505,6 +509,95 @@ pub fn spawn_heartbeat(
 
     tokio::spawn(async move {
         runner.run().await;
+    })
+}
+
+/// Spawn a multi-user heartbeat runner that cycles through all users with
+/// active routines. Each tick, it queries the DB for distinct user_ids that
+/// own routines, creates a per-user workspace, and runs a heartbeat check
+/// for each user.
+pub fn spawn_multi_user_heartbeat(
+    config: HeartbeatConfig,
+    hygiene_config: HygieneConfig,
+    llm: Arc<dyn LlmProvider>,
+    response_tx: Option<mpsc::Sender<OutgoingResponse>>,
+    store: Arc<dyn Database>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if !config.enabled {
+            tracing::info!("Multi-user heartbeat is disabled");
+            return;
+        }
+
+        let mut tick_interval = if config.fire_at.is_none() {
+            let mut iv = tokio::time::interval(config.interval);
+            iv.tick().await; // skip immediate tick
+            Some(iv)
+        } else {
+            None
+        };
+
+        tracing::info!("Starting multi-user heartbeat loop");
+
+        loop {
+            if let Some(fire_at) = config.fire_at {
+                let sleep_dur = duration_until_next_fire(fire_at, config.resolved_tz());
+                tokio::time::sleep(sleep_dur).await;
+            } else if let Some(ref mut iv) = tick_interval {
+                iv.tick().await;
+            }
+
+            if config.is_quiet_hours() {
+                continue;
+            }
+
+            // Get distinct user_ids from routines
+            let user_ids = match store.list_all_routines().await {
+                Ok(routines) => {
+                    let mut ids: Vec<String> = routines
+                        .iter()
+                        .map(|r| r.user_id.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    ids.sort();
+                    ids
+                }
+                Err(e) => {
+                    tracing::error!("Multi-user heartbeat: failed to list routines: {}", e);
+                    continue;
+                }
+            };
+
+            for user_id in &user_ids {
+                let workspace = Arc::new(Workspace::new_with_db(user_id, store.clone()));
+
+                let mut runner = HeartbeatRunner::new(
+                    config.clone(),
+                    hygiene_config.clone(),
+                    workspace,
+                    llm.clone(),
+                );
+                if let Some(ref tx) = response_tx {
+                    runner = runner.with_response_channel(tx.clone());
+                }
+                runner = runner.with_store(store.clone());
+
+                match runner.check_heartbeat().await {
+                    HeartbeatResult::Ok => {
+                        tracing::trace!(user_id, "Multi-user heartbeat OK");
+                    }
+                    HeartbeatResult::NeedsAttention(msg) => {
+                        tracing::info!(user_id, "Multi-user heartbeat needs attention");
+                        runner.send_notification(&msg).await;
+                    }
+                    HeartbeatResult::Skipped => {}
+                    HeartbeatResult::Failed(err) => {
+                        tracing::error!(user_id, "Multi-user heartbeat failed: {}", err);
+                    }
+                }
+            }
+        }
     })
 }
 

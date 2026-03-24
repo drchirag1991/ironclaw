@@ -331,13 +331,33 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         reason_ctx: &mut ReasoningContext,
         iteration: usize,
     ) -> Result<crate::llm::RespondOutput, Error> {
-        // Enforce cost guardrails before the LLM call
-        if let Err(limit) = self.agent.cost_guard().check_allowed().await {
+        // Enforce cost guardrails before the LLM call (global + per-user)
+        if let Err(limit) = self
+            .agent
+            .cost_guard()
+            .check_allowed_for_user(&self.message.user_id)
+            .await
+        {
             return Err(crate::error::LlmError::InvalidResponse {
                 provider: "agent".to_string(),
                 reason: limit.to_string(),
             }
             .into());
+        }
+
+        // Apply per-user model override from settings (first iteration only
+        // to avoid repeated DB lookups within the same agentic loop).
+        if iteration == 0
+            && let Some(store) = self.agent.store()
+            && let Ok(Some(value)) = store
+                .get_setting(&self.message.user_id, "preferred_model")
+                .await
+            && let Some(model) = value.as_str()
+        {
+            let model = model.trim();
+            if !model.is_empty() {
+                reason_ctx.model_override = Some(model.to_string());
+            }
         }
 
         let output = match reasoning.respond_with_tools(reason_ctx).await {
@@ -374,14 +394,15 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             Err(e) => return Err(e.into()),
         };
 
-        // Record cost and track token usage
+        // Record cost and track token usage (global + per-user)
         let model_name = self.agent.llm().active_model_name();
         let read_discount = self.agent.llm().cache_read_discount();
         let write_multiplier = self.agent.llm().cache_write_multiplier();
         let call_cost = self
             .agent
             .cost_guard()
-            .record_llm_call(
+            .record_llm_call_for_user(
+                &self.message.user_id,
                 &model_name,
                 output.usage.input_tokens,
                 output.usage.output_tokens,
@@ -1248,6 +1269,7 @@ mod tests {
                 allow_local_tools: false,
                 max_cost_per_day_cents: None,
                 max_actions_per_hour: None,
+                max_cost_per_user_per_day_cents: None,
                 max_tool_iterations: 50,
                 auto_approve_tools: false,
                 default_timezone: "UTC".to_string(),
@@ -2115,6 +2137,7 @@ mod tests {
                 allow_local_tools: false,
                 max_cost_per_day_cents: None,
                 max_actions_per_hour: None,
+                max_cost_per_user_per_day_cents: None,
                 max_tool_iterations,
                 auto_approve_tools: true,
                 default_timezone: "UTC".to_string(),
@@ -2235,6 +2258,7 @@ mod tests {
                     allow_local_tools: false,
                     max_cost_per_day_cents: None,
                     max_actions_per_hour: None,
+                    max_cost_per_user_per_day_cents: None,
                     max_tool_iterations: max_iter,
                     auto_approve_tools: true,
                     default_timezone: "UTC".to_string(),

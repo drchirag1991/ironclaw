@@ -13,7 +13,7 @@ use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::agent::context_monitor::ContextMonitor;
-use crate::agent::heartbeat::spawn_heartbeat;
+use crate::agent::heartbeat::{spawn_heartbeat, spawn_multi_user_heartbeat};
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
 use crate::agent::session_manager::SessionManager;
@@ -505,6 +505,7 @@ impl Agent {
                         .with_interval(std::time::Duration::from_secs(hb_config.interval_secs));
                     config.quiet_hours_start = hb_config.quiet_hours_start;
                     config.quiet_hours_end = hb_config.quiet_hours_end;
+                    config.multi_tenant = hb_config.multi_tenant;
                     config.timezone = hb_config
                         .timezone
                         .clone()
@@ -570,14 +571,29 @@ impl Agent {
                         .map(|h| h.to_workspace_config())
                         .unwrap_or_default();
 
-                    Some(spawn_heartbeat(
-                        config,
-                        hygiene,
-                        workspace.clone(),
-                        self.cheap_llm().clone(),
-                        Some(notify_tx),
-                        self.store().map(Arc::clone),
-                    ))
+                    if config.multi_tenant {
+                        if let Some(store) = self.store() {
+                            Some(spawn_multi_user_heartbeat(
+                                config,
+                                hygiene,
+                                self.cheap_llm().clone(),
+                                Some(notify_tx),
+                                Arc::clone(store),
+                            ))
+                        } else {
+                            tracing::warn!("Multi-tenant heartbeat requires a database store");
+                            None
+                        }
+                    } else {
+                        Some(spawn_heartbeat(
+                            config,
+                            hygiene,
+                            workspace.clone(),
+                            self.cheap_llm().clone(),
+                            Some(notify_tx),
+                            self.store().map(Arc::clone),
+                        ))
+                    }
                 } else {
                     tracing::warn!("Heartbeat enabled but no workspace available");
                     None

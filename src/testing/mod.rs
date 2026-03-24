@@ -532,6 +532,7 @@ impl TestHarnessBuilder {
         let cost_guard = Arc::new(CostGuard::new(CostGuardConfig {
             max_cost_per_day_cents: None,
             max_actions_per_hour: None,
+            max_cost_per_user_per_day_cents: None,
         }));
 
         let channel = if self.stub_channel {

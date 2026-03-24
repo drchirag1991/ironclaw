@@ -23,6 +23,8 @@ pub struct AgentConfig {
     pub max_cost_per_day_cents: Option<u64>,
     /// Maximum LLM/tool actions per hour. None = unlimited.
     pub max_actions_per_hour: Option<u64>,
+    /// Maximum daily LLM spend per user in cents. None = unlimited.
+    pub max_cost_per_user_per_day_cents: Option<u64>,
     /// Maximum tool-call iterations per agentic loop invocation. Default 50.
     pub max_tool_iterations: usize,
     /// When true, skip tool approval checks entirely. For benchmarks/CI.
@@ -49,6 +51,7 @@ impl AgentConfig {
             allow_local_tools: true,
             max_cost_per_day_cents: None,
             max_actions_per_hour: None,
+            max_cost_per_user_per_day_cents: None,
             max_tool_iterations: 10,
             auto_approve_tools: true,
             default_timezone: "UTC".to_string(),
@@ -87,6 +90,7 @@ impl AgentConfig {
             allow_local_tools: parse_bool_env("ALLOW_LOCAL_TOOLS", false)?,
             max_cost_per_day_cents: parse_option_env("MAX_COST_PER_DAY_CENTS")?,
             max_actions_per_hour: parse_option_env("MAX_ACTIONS_PER_HOUR")?,
+            max_cost_per_user_per_day_cents: parse_option_env("MAX_COST_PER_USER_PER_DAY_CENTS")?,
             max_tool_iterations: parse_optional_env(
                 "AGENT_MAX_TOOL_ITERATIONS",
                 settings.agent.max_tool_iterations,

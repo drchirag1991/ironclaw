@@ -821,11 +821,20 @@ impl RoutineEngine {
             created_at: Utc::now(),
         };
 
+        // Use per-user workspace so each routine executes in the correct
+        // user's context. Fall back to the engine-wide workspace when the
+        // routine belongs to the same user (avoids unnecessary allocation).
+        let routine_workspace = if routine.user_id == self.workspace.user_id() {
+            self.workspace.clone()
+        } else {
+            Arc::new(Workspace::new_with_db(&routine.user_id, self.store.clone()))
+        };
+
         let engine = EngineContext {
             config: self.config.clone(),
             store: self.store.clone(),
             llm: self.llm.clone(),
-            workspace: self.workspace.clone(),
+            workspace: routine_workspace,
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
