@@ -483,10 +483,8 @@ impl Channel for ReplChannel {
         // Interactive mode needs a sender handle so approval prompts can inject
         // responses back into the channel. Single-message mode should not keep
         // an extra sender alive or the receiver stream never closes.
-        if self.single_message.is_none() {
-            if let Ok(mut guard) = self.msg_tx.lock() {
-                *guard = Some(tx.clone());
-            }
+        if self.single_message.is_none() && let Ok(mut guard) = self.msg_tx.lock() {
+            *guard = Some(tx.clone());
         }
         let single_message = self.single_message.clone();
         let user_id = self.user_id.clone();
