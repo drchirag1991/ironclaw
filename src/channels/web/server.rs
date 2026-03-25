@@ -3158,6 +3158,230 @@ mod tests {
         assert_eq!(parsed["fields"], serde_json::json!([]));
     }
 
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_extensions_weixin_login_poll_broadcasts_auth_completed_and_activates() {
+        use axum::body::Body;
+        use tokio::time::{Duration, timeout};
+        use tower::ServiceExt;
+
+        let secrets = test_secrets_store();
+        let (ext_mgr, _wasm_tools_dir, wasm_channels_dir, db, _db_tmp) =
+            test_ext_mgr_with_db(secrets.clone()).await;
+
+        std::fs::write(wasm_channels_dir.path().join("weixin.wasm"), b"\0asm fake")
+            .expect("write fake weixin wasm");
+        let caps = serde_json::json!({
+            "type": "channel",
+            "name": "weixin",
+            "setup": {
+                "required_secrets": [
+                    {"name": "weixin_bot_token", "prompt": "Connect Weixin"}
+                ]
+            },
+            "capabilities": {
+                "channel": {
+                    "allowed_paths": ["/webhook/weixin"]
+                }
+            },
+            "config": {
+                "base_url": "https://ilinkai.weixin.qq.com",
+                "bot_type": "3"
+            }
+        });
+        std::fs::write(
+            wasm_channels_dir.path().join("weixin.capabilities.json"),
+            serde_json::to_string(&caps).expect("serialize weixin caps"),
+        )
+        .expect("write weixin capabilities");
+
+        let channel_manager = Arc::new(crate::channels::ChannelManager::new());
+        let runtime = Arc::new(
+            crate::channels::wasm::WasmChannelRuntime::new(
+                crate::channels::wasm::WasmChannelRuntimeConfig::for_testing(),
+            )
+            .expect("runtime"),
+        );
+        let pairing_store = Arc::new(crate::pairing::PairingStore::new());
+        let router = Arc::new(crate::channels::wasm::WasmChannelRouter::new());
+        ext_mgr
+            .set_channel_runtime(
+                Arc::clone(&channel_manager),
+                Arc::clone(&runtime),
+                Arc::clone(&pairing_store),
+                Arc::clone(&router),
+                std::collections::HashMap::new(),
+            )
+            .await;
+        ext_mgr
+            .set_test_wasm_channel_loader(Arc::new({
+                let runtime = Arc::clone(&runtime);
+                let pairing_store = Arc::clone(&pairing_store);
+                move |name| {
+                    Ok(make_test_loaded_channel(
+                        Arc::clone(&runtime),
+                        name,
+                        Arc::clone(&pairing_store),
+                    ))
+                }
+            }))
+            .await;
+        ext_mgr
+            .set_test_weixin_login_starter(Arc::new(|user_id, base_url, bot_type| {
+                Ok((
+                    crate::extensions::weixin_login::PendingWeixinLogin {
+                        user_id: user_id.to_string(),
+                        session_id: "weixin-session-42".to_string(),
+                        qrcode: "qr-42".to_string(),
+                        qr_code_url: "https://qr.example/42".to_string(),
+                        started_at: std::time::Instant::now(),
+                        base_url: base_url.to_string(),
+                        bot_type: bot_type.to_string(),
+                        refresh_count: 0,
+                    },
+                    crate::extensions::InteractiveLoginStartResult {
+                        session_id: "weixin-session-42".to_string(),
+                        status: "pending".to_string(),
+                        message: "Scan the QR code in Weixin to finish connecting.".to_string(),
+                        qr_code_url: Some("https://qr.example/42".to_string()),
+                        instructions: Some(
+                            "Keep this window open while you scan and confirm on your phone."
+                                .to_string(),
+                        ),
+                    },
+                ))
+            }))
+            .await;
+        ext_mgr
+            .set_test_weixin_login_poller(Arc::new(|session| {
+                if session.session_id != "weixin-session-42" {
+                    return Err(crate::extensions::ExtensionError::Other(format!(
+                        "unexpected session id: {}",
+                        session.session_id
+                    )));
+                }
+
+                Ok(
+                    crate::extensions::weixin_login::WeixinLoginPollOutcome::Confirmed(
+                        crate::extensions::weixin_login::ConfirmedWeixinLogin {
+                            bot_token: "weixin-token-42".to_string(),
+                            base_url: Some("https://weixin.example".to_string()),
+                            ilink_bot_id: "wx-bot-42".to_string(),
+                        },
+                    ),
+                )
+            }))
+            .await;
+
+        let state = test_gateway_state(Some(ext_mgr.clone()));
+        let mut receiver = state.sse.sender().subscribe();
+        let app = Router::new()
+            .route(
+                "/api/extensions/{name}/login/start",
+                post(extensions_login_start_handler),
+            )
+            .route(
+                "/api/extensions/{name}/login/poll",
+                post(extensions_login_poll_handler),
+            )
+            .with_state(state);
+
+        let mut start_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/extensions/weixin/login/start")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"force":true}"#))
+            .expect("start request");
+        start_req.extensions_mut().insert(UserIdentity {
+            user_id: "test".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let start_resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app.clone(), start_req)
+            .await
+            .expect("start response");
+        assert_eq!(start_resp.status(), StatusCode::OK);
+        let start_body = axum::body::to_bytes(start_resp.into_body(), 1024 * 64)
+            .await
+            .expect("start body");
+        let start_json: serde_json::Value =
+            serde_json::from_slice(&start_body).expect("start json response");
+        assert_eq!(start_json["success"], serde_json::Value::Bool(true));
+        assert_eq!(start_json["status"], "pending");
+        assert_eq!(start_json["session_id"], "weixin-session-42");
+        assert_eq!(start_json["qr_code_url"], "https://qr.example/42");
+
+        let mut poll_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/extensions/weixin/login/poll")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"session_id":"weixin-session-42"}"#))
+            .expect("poll request");
+        poll_req.extensions_mut().insert(UserIdentity {
+            user_id: "test".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let poll_resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, poll_req)
+            .await
+            .expect("poll response");
+        assert_eq!(poll_resp.status(), StatusCode::OK);
+        let poll_body = axum::body::to_bytes(poll_resp.into_body(), 1024 * 64)
+            .await
+            .expect("poll body");
+        let poll_json: serde_json::Value =
+            serde_json::from_slice(&poll_body).expect("poll json response");
+        assert_eq!(poll_json["success"], serde_json::Value::Bool(true));
+        assert_eq!(poll_json["status"], "succeeded");
+        assert_eq!(poll_json["activated"], serde_json::Value::Bool(true));
+        assert!(
+            poll_json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Weixin connected as wx-bot-42"),
+            "unexpected poll message: {poll_json:?}"
+        );
+
+        let auth_completed = timeout(Duration::from_secs(1), async {
+            loop {
+                match receiver.recv().await {
+                    Ok(scoped) => match scoped.event {
+                        crate::channels::web::types::SseEvent::AuthCompleted {
+                            extension_name,
+                            success,
+                            message,
+                        } => break (extension_name, success, message),
+                        _ => continue,
+                    },
+                    Err(error) => panic!("expected auth_completed event, got recv error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for auth_completed");
+        assert_eq!(auth_completed.0, "weixin");
+        assert!(auth_completed.1);
+        assert!(auth_completed.2.contains("Weixin connected as wx-bot-42"));
+
+        assert!(
+            secrets
+                .exists("test", "weixin_bot_token")
+                .await
+                .expect("check weixin secret"),
+            "weixin token should be stored after successful poll"
+        );
+        assert!(
+            channel_manager.get_channel("weixin").await.is_some(),
+            "weixin should be hot-added after successful poll"
+        );
+        assert_eq!(
+            db.get_setting("test", "extensions.weixin.base_url")
+                .await
+                .expect("get weixin base_url setting"),
+            Some(serde_json::json!("https://weixin.example"))
+        );
+    }
+
     #[tokio::test]
     async fn test_extensions_setup_submit_returns_failure_when_not_activated() {
         use axum::body::Body;
@@ -3858,6 +4082,66 @@ mod tests {
             vec![],
         ));
         (ext_mgr, wasm_tools_dir, wasm_channels_dir)
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn test_ext_mgr_with_db(
+        secrets: Arc<dyn crate::secrets::SecretsStore + Send + Sync>,
+    ) -> (
+        Arc<ExtensionManager>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<dyn crate::db::Database>,
+        tempfile::TempDir,
+    ) {
+        let tool_registry = Arc::new(ToolRegistry::new());
+        let mcp_sm = Arc::new(crate::tools::mcp::session::McpSessionManager::new());
+        let mcp_pm = Arc::new(crate::tools::mcp::process::McpProcessManager::new());
+        let wasm_tools_dir = tempfile::tempdir().expect("temp wasm tools dir");
+        let wasm_channels_dir = tempfile::tempdir().expect("temp wasm channels dir");
+        let (db, db_tmp) = crate::testing::test_db().await;
+        let ext_mgr = Arc::new(ExtensionManager::new(
+            mcp_sm,
+            mcp_pm,
+            secrets,
+            tool_registry,
+            None,
+            None,
+            wasm_tools_dir.path().to_path_buf(),
+            wasm_channels_dir.path().to_path_buf(),
+            None,
+            "test".to_string(),
+            Some(db.clone()),
+            vec![],
+        ));
+        (ext_mgr, wasm_tools_dir, wasm_channels_dir, db, db_tmp)
+    }
+
+    #[cfg(feature = "libsql")]
+    fn make_test_loaded_channel(
+        runtime: Arc<crate::channels::wasm::WasmChannelRuntime>,
+        name: &str,
+        pairing_store: Arc<crate::pairing::PairingStore>,
+    ) -> crate::channels::wasm::LoadedChannel {
+        let prepared = Arc::new(crate::channels::wasm::PreparedChannelModule::for_testing(
+            name,
+            format!("Mock channel: {name}"),
+        ));
+        let capabilities = crate::channels::wasm::ChannelCapabilities::for_channel(name)
+            .with_path(format!("/webhook/{name}"));
+
+        crate::channels::wasm::LoadedChannel {
+            channel: crate::channels::wasm::WasmChannel::new(
+                runtime,
+                prepared,
+                capabilities,
+                "default",
+                "{}".to_string(),
+                pairing_store,
+                None,
+            ),
+            capabilities_file: None,
+        }
     }
 
     #[tokio::test]

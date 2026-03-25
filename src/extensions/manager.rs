@@ -120,6 +120,20 @@ type TestWasmChannelLoader =
 #[cfg(test)]
 type TestTelegramBindingResolver =
     Arc<dyn Fn(&str, Option<i64>) -> Result<TelegramBindingResult, ExtensionError> + Send + Sync>;
+#[cfg(test)]
+type TestWeixinLoginStarter = Arc<
+    dyn Fn(
+            &str,
+            &str,
+            &str,
+        ) -> Result<(PendingWeixinLogin, InteractiveLoginStartResult), ExtensionError>
+        + Send
+        + Sync,
+>;
+#[cfg(test)]
+type TestWeixinLoginPoller = Arc<
+    dyn Fn(&mut PendingWeixinLogin) -> Result<WeixinLoginPollOutcome, ExtensionError> + Send + Sync,
+>;
 
 const TELEGRAM_OWNER_BIND_TIMEOUT_SECS: u64 = 120;
 const TELEGRAM_OWNER_BIND_CHALLENGE_TTL_SECS: u64 = 300;
@@ -442,6 +456,10 @@ pub struct ExtensionManager {
     test_wasm_channel_loader: RwLock<Option<TestWasmChannelLoader>>,
     #[cfg(test)]
     test_telegram_binding_resolver: RwLock<Option<TestTelegramBindingResolver>>,
+    #[cfg(test)]
+    test_weixin_login_starter: RwLock<Option<TestWeixinLoginStarter>>,
+    #[cfg(test)]
+    test_weixin_login_poller: RwLock<Option<TestWeixinLoginPoller>>,
 }
 
 /// Sanitize a URL for logging by removing query parameters and credentials.
@@ -556,17 +574,31 @@ impl ExtensionManager {
             test_wasm_channel_loader: RwLock::new(None),
             #[cfg(test)]
             test_telegram_binding_resolver: RwLock::new(None),
+            #[cfg(test)]
+            test_weixin_login_starter: RwLock::new(None),
+            #[cfg(test)]
+            test_weixin_login_poller: RwLock::new(None),
         }
     }
 
     #[cfg(test)]
-    async fn set_test_wasm_channel_loader(&self, loader: TestWasmChannelLoader) {
+    pub(crate) async fn set_test_wasm_channel_loader(&self, loader: TestWasmChannelLoader) {
         *self.test_wasm_channel_loader.write().await = Some(loader);
     }
 
     #[cfg(test)]
     async fn set_test_telegram_binding_resolver(&self, resolver: TestTelegramBindingResolver) {
         *self.test_telegram_binding_resolver.write().await = Some(resolver);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_test_weixin_login_starter(&self, starter: TestWeixinLoginStarter) {
+        *self.test_weixin_login_starter.write().await = Some(starter);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_test_weixin_login_poller(&self, poller: TestWeixinLoginPoller) {
+        *self.test_weixin_login_poller.write().await = Some(poller);
     }
 
     #[cfg(test)]
@@ -4743,7 +4775,17 @@ impl ExtensionManager {
 
         let base_url = self.resolve_weixin_base_url(user_id).await;
         let bot_type = self.resolve_weixin_bot_type().await;
-        let (session, result) = start_weixin_login(user_id, &base_url, &bot_type).await?;
+        #[cfg(test)]
+        let login_result =
+            if let Some(starter) = self.test_weixin_login_starter.read().await.as_ref() {
+                starter(user_id, &base_url, &bot_type)
+            } else {
+                start_weixin_login(user_id, &base_url, &bot_type).await
+            };
+        #[cfg(not(test))]
+        let login_result = start_weixin_login(user_id, &base_url, &bot_type).await;
+
+        let (session, result) = login_result?;
 
         self.pending_weixin_logins
             .write()
@@ -4789,7 +4831,15 @@ impl ExtensionManager {
             ));
         }
 
+        #[cfg(test)]
+        let outcome = if let Some(poller) = self.test_weixin_login_poller.read().await.as_ref() {
+            poller(session)
+        } else {
+            poll_weixin_login(session).await
+        }?;
+        #[cfg(not(test))]
         let outcome = poll_weixin_login(session).await?;
+
         match outcome {
             WeixinLoginPollOutcome::Pending(result) => {
                 if matches!(result.status.as_str(), "failed") {
@@ -5944,8 +5994,13 @@ mod tests {
         normalize_hosted_callback_url, send_telegram_text_message,
         telegram_message_matches_verification_code,
     };
+    use crate::extensions::weixin_login::{
+        ConfirmedWeixinLogin, PendingWeixinLogin, WEIXIN_BASE_URL_SETTING_PATH,
+        WeixinLoginPollOutcome,
+    };
     use crate::extensions::{
-        ExtensionError, ExtensionKind, ExtensionSource, InstallResult, VerificationChallenge,
+        ExtensionError, ExtensionKind, ExtensionSource, InstallResult, InteractiveLoginStartResult,
+        VerificationChallenge,
     };
     use crate::pairing::PairingStore;
 
@@ -6890,6 +6945,203 @@ mod tests {
             bot_username_setting,
             Some(serde_json::json!("test_hot_bot")),
             "bot username setting",
+        )
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_weixin_interactive_login_poll_persists_state_and_activates() -> Result<(), String>
+    {
+        let dir = tempfile::tempdir().map_err(|err| format!("temp dir: {err}"))?;
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&channels_dir).map_err(|err| format!("channels dir: {err}"))?;
+        std::fs::write(channels_dir.join("weixin.wasm"), b"mock")
+            .map_err(|err| format!("write wasm: {err}"))?;
+        std::fs::write(
+            channels_dir.join("weixin.capabilities.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "type": "channel",
+                "name": "weixin",
+                "setup": {
+                    "required_secrets": [
+                        {
+                            "name": "weixin_bot_token",
+                            "prompt": "Connect Weixin",
+                            "optional": false
+                        }
+                    ]
+                },
+                "capabilities": {
+                    "channel": {
+                        "allowed_paths": ["/webhook/weixin"]
+                    }
+                },
+                "config": {
+                    "base_url": "https://ilinkai.weixin.qq.com",
+                    "bot_type": "3"
+                }
+            }))
+            .map_err(|err| format!("serialize capabilities: {err}"))?,
+        )
+        .map_err(|err| format!("write capabilities: {err}"))?;
+
+        let (db, _db_tmp) = crate::testing::test_db().await;
+        let manager = {
+            use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+            use crate::testing::credentials::TEST_CRYPTO_KEY;
+            use crate::tools::ToolRegistry;
+            use crate::tools::mcp::process::McpProcessManager;
+            use crate::tools::mcp::session::McpSessionManager;
+
+            let master_key = secrecy::SecretString::from(TEST_CRYPTO_KEY.to_string());
+            let crypto = Arc::new(
+                SecretsCrypto::new(master_key)
+                    .unwrap_or_else(|err| panic!("failed to construct test crypto: {err}")),
+            );
+
+            Arc::new(ExtensionManager::new(
+                Arc::new(McpSessionManager::new()),
+                Arc::new(McpProcessManager::new()),
+                Arc::new(InMemorySecretsStore::new(crypto)),
+                Arc::new(ToolRegistry::new()),
+                None,
+                None,
+                dir.path().join("tools"),
+                channels_dir.clone(),
+                None,
+                "test".to_string(),
+                Some(db.clone()),
+                Vec::new(),
+            ))
+        };
+
+        let channel_manager = Arc::new(ChannelManager::new());
+        let runtime = Arc::new(
+            WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing())
+                .map_err(|err| format!("runtime: {err}"))?,
+        );
+        let pairing_store = Arc::new(PairingStore::with_base_dir(
+            dir.path().join("pairing-state"),
+        ));
+        let router = Arc::new(WasmChannelRouter::new());
+        manager
+            .set_channel_runtime(
+                Arc::clone(&channel_manager),
+                Arc::clone(&runtime),
+                Arc::clone(&pairing_store),
+                Arc::clone(&router),
+                std::collections::HashMap::new(),
+            )
+            .await;
+        manager
+            .set_test_wasm_channel_loader(Arc::new({
+                let runtime = Arc::clone(&runtime);
+                let pairing_store = Arc::clone(&pairing_store);
+                move |name| {
+                    Ok(make_test_loaded_channel(
+                        Arc::clone(&runtime),
+                        name,
+                        Arc::clone(&pairing_store),
+                    ))
+                }
+            }))
+            .await;
+        manager
+            .set_test_weixin_login_starter(Arc::new(|user_id, base_url, bot_type| {
+                Ok((
+                    PendingWeixinLogin {
+                        user_id: user_id.to_string(),
+                        session_id: "weixin-session-1".to_string(),
+                        qrcode: "qr-123".to_string(),
+                        qr_code_url: "https://qr.example/one".to_string(),
+                        started_at: std::time::Instant::now(),
+                        base_url: base_url.to_string(),
+                        bot_type: bot_type.to_string(),
+                        refresh_count: 0,
+                    },
+                    InteractiveLoginStartResult {
+                        session_id: "weixin-session-1".to_string(),
+                        status: "pending".to_string(),
+                        message: "Scan the QR code in Weixin to finish connecting.".to_string(),
+                        qr_code_url: Some("https://qr.example/one".to_string()),
+                        instructions: Some(
+                            "Keep this window open while you scan and confirm on your phone."
+                                .to_string(),
+                        ),
+                    },
+                ))
+            }))
+            .await;
+        manager
+            .set_test_weixin_login_poller(Arc::new(|session| {
+                if session.session_id != "weixin-session-1" {
+                    return Err(ExtensionError::Other(format!(
+                        "unexpected session id: {}",
+                        session.session_id
+                    )));
+                }
+                Ok(WeixinLoginPollOutcome::Confirmed(ConfirmedWeixinLogin {
+                    bot_token: "weixin-token-123".to_string(),
+                    base_url: Some("https://weixin.example".to_string()),
+                    ilink_bot_id: "wx-bot-1".to_string(),
+                }))
+            }))
+            .await;
+
+        let start = manager
+            .start_interactive_login("weixin", "test")
+            .await
+            .map_err(|err| format!("start interactive login: {err}"))?;
+        require_eq(
+            start.session_id.clone(),
+            "weixin-session-1".to_string(),
+            "start session id",
+        )?;
+        require_eq(start.status, "pending".to_string(), "start status")?;
+
+        let poll = manager
+            .poll_interactive_login("weixin", &start.session_id, "test")
+            .await
+            .map_err(|err| format!("poll interactive login: {err}"))?;
+
+        require_eq(poll.status, "succeeded".to_string(), "poll status")?;
+        require_eq(poll.activated, Some(true), "poll activated")?;
+        require(
+            poll.message.contains("Weixin connected as wx-bot-1"),
+            format!("unexpected poll message: {}", poll.message),
+        )?;
+        require(
+            manager.active_channel_names.read().await.contains("weixin"),
+            "weixin should be marked active after successful login",
+        )?;
+        require(
+            channel_manager.get_channel("weixin").await.is_some(),
+            "weixin should be hot-added to the running channel manager",
+        )?;
+        require_eq(
+            manager.load_persisted_active_channels("test").await,
+            vec!["weixin".to_string()],
+            "persisted active channels",
+        )?;
+        require(
+            manager
+                .secrets
+                .exists("test", "weixin_bot_token")
+                .await
+                .map_err(|err| format!("check stored weixin token: {err}"))?,
+            "weixin bot token should be stored after successful login",
+        )?;
+        let persisted_base_url = manager
+            .store
+            .as_ref()
+            .ok_or_else(|| "db-backed manager missing".to_string())?
+            .get_setting("test", WEIXIN_BASE_URL_SETTING_PATH)
+            .await
+            .map_err(|err| format!("weixin base_url setting query: {err}"))?;
+        require_eq(
+            persisted_base_url,
+            Some(serde_json::json!("https://weixin.example")),
+            "weixin base_url setting",
         )
     }
 
