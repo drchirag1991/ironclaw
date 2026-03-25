@@ -121,10 +121,6 @@ impl Agent {
                 if let Some(store) = tenant.store()
                     && let Ok(Some(ctx)) = store.get_job(uuid).await
                 {
-                    // Ownership check: ensure the job belongs to the requesting user.
-                    if ctx.user_id != user_id {
-                        return Err(crate::error::JobError::NotFound { id: uuid }.into());
-                    }
                     return Ok(format!(
                         "Job: {}\nStatus: {:?}\nCreated: {}\nStarted: {}\nActual cost: {}",
                         ctx.title,
@@ -163,14 +159,14 @@ impl Agent {
                     let mut failed = 0;
                     let mut stuck = 0;
 
-                    if let Ok(s) = store.agent_job_summary_for_user(user_id).await {
+                    if let Ok(s) = store.agent_job_summary().await {
                         total += s.total;
                         in_progress += s.in_progress;
                         completed += s.completed;
                         failed += s.failed;
                         stuck += s.stuck;
                     }
-                    if let Ok(s) = store.sandbox_job_summary_for_user(user_id).await {
+                    if let Ok(s) = store.sandbox_job_summary().await {
                         total += s.total;
                         in_progress += s.running;
                         completed += s.completed;
@@ -240,7 +236,7 @@ impl Agent {
                     Vec::new()
                 }
             };
-            let sandbox_jobs = match store.list_sandbox_jobs_for_user(user_id).await {
+            let sandbox_jobs = match store.list_sandbox_jobs().await {
                 Ok(jobs) => jobs,
                 Err(e) => {
                     tracing::warn!("Failed to list sandbox jobs: {}", e);
