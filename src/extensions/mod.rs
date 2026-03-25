@@ -19,6 +19,7 @@
 pub mod discovery;
 pub mod manager;
 pub mod registry;
+pub(crate) mod weixin_login;
 
 pub use discovery::OnlineDiscovery;
 pub use manager::ExtensionManager;
@@ -437,6 +438,52 @@ impl<'de> Deserialize<'de> for AuthResult {
             status,
         })
     }
+}
+
+/// Interactive login metadata surfaced to setup UIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractiveLoginInfo {
+    /// Login method identifier (for example `qr_code`).
+    pub method: String,
+    /// User-facing button label.
+    pub button_label: String,
+    /// Optional short instructions shown above the login control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Result of starting an interactive extension login flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractiveLoginStartResult {
+    /// Opaque session identifier used by follow-up poll requests.
+    pub session_id: String,
+    /// Flow status (`pending`, `error`).
+    pub status: String,
+    /// Human-readable message for the UI.
+    pub message: String,
+    /// Optional QR/image URL for browser display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qr_code_url: Option<String>,
+    /// Optional short instructions shown alongside the QR code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Result of polling an interactive extension login flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractiveLoginPollResult {
+    /// Session identifier associated with this poll result.
+    pub session_id: String,
+    /// Flow status (`pending`, `scanned`, `refreshed`, `succeeded`, `failed`).
+    pub status: String,
+    /// Human-readable message for the UI.
+    pub message: String,
+    /// Optional refreshed QR/image URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qr_code_url: Option<String>,
+    /// Whether the extension was successfully activated as part of login completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated: Option<bool>,
 }
 
 /// Result of activating an extension.

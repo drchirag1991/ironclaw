@@ -536,6 +536,8 @@ pub struct ExtensionSetupResponse {
     pub kind: String,
     pub secrets: Vec<SecretFieldInfo>,
     pub fields: Vec<SetupFieldInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interactive_login: Option<crate::extensions::InteractiveLoginInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -566,6 +568,32 @@ pub struct ExtensionSetupRequest {
     pub secrets: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub fields: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExtensionInteractiveLoginStartRequest {
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExtensionInteractiveLoginPollRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExtensionInteractiveLoginResponse {
+    pub success: bool,
+    pub status: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qr_code_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activated: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

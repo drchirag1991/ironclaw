@@ -17,9 +17,16 @@ use crate::channels::wasm::{
 use crate::channels::{ChannelManager, OutgoingResponse};
 use crate::extensions::discovery::OnlineDiscovery;
 use crate::extensions::registry::ExtensionRegistry;
+use crate::extensions::weixin_login::{
+    PendingWeixinLogin, WEIXIN_BASE_URL_SETTING_PATH, WEIXIN_CHANNEL_NAME, WEIXIN_DEFAULT_BASE_URL,
+    WEIXIN_DEFAULT_BOT_TYPE, WeixinLoginPollOutcome,
+    interactive_login_info as weixin_interactive_login_info, poll_login as poll_weixin_login,
+    purge_expired_logins as purge_expired_weixin_logins, start_login as start_weixin_login,
+};
 use crate::extensions::{
     ActivateResult, AuthResult, ConfigureResult, ExtensionError, ExtensionKind, ExtensionSource,
-    InstallResult, InstalledExtension, RegistryEntry, ResultSource, SearchResult, ToolAuthState,
+    InstallResult, InstalledExtension, InteractiveLoginInfo, InteractiveLoginPollResult,
+    InteractiveLoginStartResult, RegistryEntry, ResultSource, SearchResult, ToolAuthState,
     UpgradeOutcome, UpgradeResult, VerificationChallenge,
 };
 use crate::hooks::HookRegistry;
@@ -95,6 +102,7 @@ struct ChannelRuntimeState {
 pub struct ExtensionSetupSchema {
     pub secrets: Vec<crate::channels::web::types::SecretFieldInfo>,
     pub fields: Vec<crate::channels::web::types::SetupFieldInfo>,
+    pub interactive_login: Option<InteractiveLoginInfo>,
 }
 
 /// Only these global (non-namespaced) setting paths may be written by extension
@@ -429,6 +437,7 @@ pub struct ExtensionManager {
     /// Set by the web gateway at startup via `enable_gateway_mode()`.
     gateway_base_url: RwLock<Option<String>>,
     pending_telegram_verification: RwLock<HashMap<String, PendingTelegramVerificationChallenge>>,
+    pending_weixin_logins: RwLock<HashMap<String, PendingWeixinLogin>>,
     #[cfg(test)]
     test_wasm_channel_loader: RwLock<Option<TestWasmChannelLoader>>,
     #[cfg(test)]
@@ -542,6 +551,7 @@ impl ExtensionManager {
             gateway_mode: std::sync::atomic::AtomicBool::new(false),
             gateway_base_url: RwLock::new(None),
             pending_telegram_verification: RwLock::new(HashMap::new()),
+            pending_weixin_logins: RwLock::new(HashMap::new()),
             #[cfg(test)]
             test_wasm_channel_loader: RwLock::new(None),
             #[cfg(test)]
@@ -778,6 +788,16 @@ impl ExtensionManager {
             && !username.trim().is_empty()
         {
             overrides.insert("bot_username".to_string(), serde_json::json!(username));
+        }
+
+        if name == WEIXIN_CHANNEL_NAME
+            && let Some(store) = self.store.as_ref()
+            && let Ok(Some(serde_json::Value::String(base_url))) = store
+                .get_setting(&self.user_id, WEIXIN_BASE_URL_SETTING_PATH)
+                .await
+            && !base_url.trim().is_empty()
+        {
+            overrides.insert("base_url".to_string(), serde_json::json!(base_url));
         }
 
         overrides
@@ -3529,6 +3549,15 @@ impl ExtensionManager {
             return Ok(AuthResult::authenticated(name, ExtensionKind::WasmChannel));
         }
 
+        if name == WEIXIN_CHANNEL_NAME {
+            return Ok(AuthResult::awaiting_token(
+                name,
+                ExtensionKind::WasmChannel,
+                "Open the Weixin channel setup to scan a QR code and connect it.".to_string(),
+                cap_file.setup.setup_url.clone(),
+            ));
+        }
+
         // Prompt for the first missing secret
         let secret = &missing[0];
         Ok(AuthResult::awaiting_token(
@@ -4499,6 +4528,21 @@ impl ExtensionManager {
             }
             !expired
         });
+
+        let mut weixin_logins = self.pending_weixin_logins.write().await;
+        purge_expired_weixin_logins(&mut weixin_logins);
+    }
+
+    fn interactive_login_info_for_extension(
+        name: &str,
+        kind: ExtensionKind,
+    ) -> Option<InteractiveLoginInfo> {
+        match (kind, name) {
+            (ExtensionKind::WasmChannel, WEIXIN_CHANNEL_NAME) => {
+                Some(weixin_interactive_login_info())
+            }
+            _ => None,
+        }
     }
 
     /// Get the setup schema for an extension (secret/text fields and their status).
@@ -4518,6 +4562,10 @@ impl ExtensionManager {
                     return Ok(ExtensionSetupSchema {
                         secrets: Vec::new(),
                         fields: Vec::new(),
+                        interactive_login: Self::interactive_login_info_for_extension(
+                            name,
+                            ExtensionKind::WasmChannel,
+                        ),
                     });
                 }
                 let cap_bytes = tokio::fs::read(&cap_path)
@@ -4526,6 +4574,14 @@ impl ExtensionManager {
                 let cap_file =
                     crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&cap_bytes)
                         .map_err(|e| ExtensionError::Other(e.to_string()))?;
+
+                if name == WEIXIN_CHANNEL_NAME {
+                    return Ok(ExtensionSetupSchema {
+                        secrets: Vec::new(),
+                        fields: Vec::new(),
+                        interactive_login: Some(weixin_interactive_login_info()),
+                    });
+                }
 
                 let mut secrets = Vec::new();
                 for secret in &cap_file.setup.required_secrets {
@@ -4547,6 +4603,7 @@ impl ExtensionManager {
                 Ok(ExtensionSetupSchema {
                     secrets,
                     fields: Vec::new(),
+                    interactive_login: None,
                 })
             }
             ExtensionKind::WasmTool => {
@@ -4554,6 +4611,7 @@ impl ExtensionManager {
                     return Ok(ExtensionSetupSchema {
                         secrets: Vec::new(),
                         fields: Vec::new(),
+                        interactive_login: None,
                     });
                 };
 
@@ -4593,12 +4651,196 @@ impl ExtensionManager {
                         });
                     }
                 }
-                Ok(ExtensionSetupSchema { secrets, fields })
+                Ok(ExtensionSetupSchema {
+                    secrets,
+                    fields,
+                    interactive_login: None,
+                })
             }
             _ => Ok(ExtensionSetupSchema {
                 secrets: Vec::new(),
                 fields: Vec::new(),
+                interactive_login: None,
             }),
+        }
+    }
+
+    async fn resolve_weixin_base_url(&self, user_id: &str) -> String {
+        if let Some(store) = &self.store
+            && let Ok(Some(serde_json::Value::String(value))) = store
+                .get_setting(user_id, WEIXIN_BASE_URL_SETTING_PATH)
+                .await
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        let cap_path = self
+            .wasm_channels_dir
+            .join(format!("{}.capabilities.json", WEIXIN_CHANNEL_NAME));
+        if let Ok(cap_bytes) = tokio::fs::read(&cap_path).await
+            && let Ok(cap_file) =
+                crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&cap_bytes)
+            && let Some(value) = cap_file
+                .config
+                .get("base_url")
+                .and_then(|value| value.as_str())
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        WEIXIN_DEFAULT_BASE_URL.to_string()
+    }
+
+    async fn resolve_weixin_bot_type(&self) -> String {
+        let cap_path = self
+            .wasm_channels_dir
+            .join(format!("{}.capabilities.json", WEIXIN_CHANNEL_NAME));
+        if let Ok(cap_bytes) = tokio::fs::read(&cap_path).await
+            && let Ok(cap_file) =
+                crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&cap_bytes)
+            && let Some(value) = cap_file
+                .config
+                .get("bot_type")
+                .and_then(|value| value.as_str())
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        WEIXIN_DEFAULT_BOT_TYPE.to_string()
+    }
+
+    pub async fn start_interactive_login(
+        &self,
+        name: &str,
+        user_id: &str,
+    ) -> Result<InteractiveLoginStartResult, ExtensionError> {
+        Self::validate_extension_name(name)?;
+        let kind = self.determine_installed_kind(name, user_id).await?;
+        if Self::interactive_login_info_for_extension(name, kind).is_none() {
+            return Err(ExtensionError::AuthNotSupported(format!(
+                "Interactive login is not supported for '{}'",
+                name
+            )));
+        }
+
+        if name != WEIXIN_CHANNEL_NAME {
+            return Err(ExtensionError::AuthNotSupported(format!(
+                "Interactive login is not implemented for '{}'",
+                name
+            )));
+        }
+
+        self.cleanup_expired_auths().await;
+
+        let base_url = self.resolve_weixin_base_url(user_id).await;
+        let bot_type = self.resolve_weixin_bot_type().await;
+        let (session, result) = start_weixin_login(user_id, &base_url, &bot_type).await?;
+
+        self.pending_weixin_logins
+            .write()
+            .await
+            .insert(session.session_id.clone(), session);
+
+        Ok(result)
+    }
+
+    pub async fn poll_interactive_login(
+        &self,
+        name: &str,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<InteractiveLoginPollResult, ExtensionError> {
+        Self::validate_extension_name(name)?;
+        let kind = self.determine_installed_kind(name, user_id).await?;
+        if Self::interactive_login_info_for_extension(name, kind).is_none() {
+            return Err(ExtensionError::AuthNotSupported(format!(
+                "Interactive login is not supported for '{}'",
+                name
+            )));
+        }
+
+        if name != WEIXIN_CHANNEL_NAME {
+            return Err(ExtensionError::AuthNotSupported(format!(
+                "Interactive login is not implemented for '{}'",
+                name
+            )));
+        }
+
+        self.cleanup_expired_auths().await;
+
+        let mut sessions = self.pending_weixin_logins.write().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            return Err(ExtensionError::Other(
+                "This Weixin login session no longer exists. Start again.".to_string(),
+            ));
+        };
+        if session.user_id != user_id {
+            return Err(ExtensionError::AuthFailed(
+                "This Weixin login session belongs to another user".to_string(),
+            ));
+        }
+
+        let outcome = poll_weixin_login(session).await?;
+        match outcome {
+            WeixinLoginPollOutcome::Pending(result) => {
+                if matches!(result.status.as_str(), "failed") {
+                    sessions.remove(session_id);
+                }
+                Ok(result)
+            }
+            WeixinLoginPollOutcome::Confirmed(confirmed) => {
+                sessions.remove(session_id);
+                drop(sessions);
+
+                if let Some(base_url) = confirmed.base_url.as_deref()
+                    && let Some(store) = &self.store
+                {
+                    let _ = store
+                        .set_setting(
+                            user_id,
+                            WEIXIN_BASE_URL_SETTING_PATH,
+                            &serde_json::Value::String(base_url.to_string()),
+                        )
+                        .await;
+                }
+
+                let mut secrets = std::collections::HashMap::new();
+                secrets.insert("weixin_bot_token".to_string(), confirmed.bot_token);
+                let configure = self
+                    .configure(name, &secrets, &std::collections::HashMap::new(), user_id)
+                    .await?;
+
+                Ok(InteractiveLoginPollResult {
+                    session_id: session_id.to_string(),
+                    status: if configure.activated {
+                        "succeeded".to_string()
+                    } else {
+                        "failed".to_string()
+                    },
+                    message: if configure.activated {
+                        format!(
+                            "Weixin connected as {}. {}",
+                            confirmed.ilink_bot_id, configure.message
+                        )
+                    } else {
+                        format!(
+                            "Weixin login succeeded for {} but activation failed: {}",
+                            confirmed.ilink_bot_id, configure.message
+                        )
+                    },
+                    qr_code_url: None,
+                    activated: Some(configure.activated),
+                })
+            }
         }
     }
 

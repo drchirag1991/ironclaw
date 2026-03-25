@@ -469,6 +469,14 @@ pub async fn start_server(
             "/api/extensions/{name}/setup",
             get(extensions_setup_handler).post(extensions_setup_submit_handler),
         )
+        .route(
+            "/api/extensions/{name}/login/start",
+            post(extensions_login_start_handler),
+        )
+        .route(
+            "/api/extensions/{name}/login/poll",
+            post(extensions_login_poll_handler),
+        )
         // Pairing
         .route("/api/pairing/{channel}", get(pairing_list_handler))
         .route(
@@ -2437,7 +2445,91 @@ async fn extensions_setup_handler(
         kind,
         secrets: setup.secrets,
         fields: setup.fields,
+        interactive_login: setup.interactive_login,
     }))
+}
+
+async fn extensions_login_start_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(name): Path<String>,
+    Json(_req): Json<ExtensionInteractiveLoginStartRequest>,
+) -> Result<Json<ExtensionInteractiveLoginResponse>, (StatusCode, String)> {
+    let ext_mgr = state.extension_manager.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Extension manager not available (secrets store required)".to_string(),
+    ))?;
+
+    match ext_mgr.start_interactive_login(&name, &user.user_id).await {
+        Ok(result) => Ok(Json(ExtensionInteractiveLoginResponse {
+            success: true,
+            status: result.status,
+            message: result.message,
+            session_id: Some(result.session_id),
+            qr_code_url: result.qr_code_url,
+            instructions: result.instructions,
+            activated: None,
+        })),
+        Err(e) => Ok(Json(ExtensionInteractiveLoginResponse {
+            success: false,
+            status: "failed".to_string(),
+            message: e.to_string(),
+            session_id: None,
+            qr_code_url: None,
+            instructions: None,
+            activated: Some(false),
+        })),
+    }
+}
+
+async fn extensions_login_poll_handler(
+    State(state): State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+    Path(name): Path<String>,
+    Json(req): Json<ExtensionInteractiveLoginPollRequest>,
+) -> Result<Json<ExtensionInteractiveLoginResponse>, (StatusCode, String)> {
+    let ext_mgr = state.extension_manager.as_ref().ok_or((
+        StatusCode::NOT_IMPLEMENTED,
+        "Extension manager not available (secrets store required)".to_string(),
+    ))?;
+
+    match ext_mgr
+        .poll_interactive_login(&name, &req.session_id, &user.user_id)
+        .await
+    {
+        Ok(result) => {
+            if result.activated == Some(true) {
+                clear_auth_mode(&state, &user.user_id).await;
+                state.sse.broadcast_for_user(
+                    &user.user_id,
+                    SseEvent::AuthCompleted {
+                        extension_name: name.clone(),
+                        success: true,
+                        message: result.message.clone(),
+                    },
+                );
+            }
+
+            Ok(Json(ExtensionInteractiveLoginResponse {
+                success: result.status != "failed",
+                status: result.status,
+                message: result.message,
+                session_id: Some(result.session_id),
+                qr_code_url: result.qr_code_url,
+                instructions: None,
+                activated: result.activated,
+            }))
+        }
+        Err(e) => Ok(Json(ExtensionInteractiveLoginResponse {
+            success: false,
+            status: "failed".to_string(),
+            message: e.to_string(),
+            session_id: Some(req.session_id),
+            qr_code_url: None,
+            instructions: None,
+            activated: Some(false),
+        })),
+    }
 }
 
 async fn extensions_setup_submit_handler(
@@ -3001,6 +3093,69 @@ mod tests {
         Router::new()
             .route("/oauth/callback", get(oauth_callback_handler))
             .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_extensions_setup_returns_interactive_login_for_weixin() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let secrets = test_secrets_store();
+        let (ext_mgr, _wasm_tools_dir, wasm_channels_dir) = test_ext_mgr(secrets);
+
+        std::fs::write(wasm_channels_dir.path().join("weixin.wasm"), b"\0asm fake")
+            .expect("write fake weixin wasm");
+        let caps = serde_json::json!({
+            "type": "channel",
+            "name": "weixin",
+            "setup": {
+                "required_secrets": [
+                    {"name": "weixin_bot_token", "prompt": "Connect Weixin"}
+                ]
+            }
+        });
+        std::fs::write(
+            wasm_channels_dir.path().join("weixin.capabilities.json"),
+            serde_json::to_string(&caps).expect("serialize weixin caps"),
+        )
+        .expect("write weixin capabilities");
+
+        let state = test_gateway_state(Some(ext_mgr));
+        let app = Router::new()
+            .route(
+                "/api/extensions/{name}/setup",
+                get(extensions_setup_handler),
+            )
+            .with_state(state);
+
+        let mut req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/extensions/weixin/setup")
+            .body(Body::empty())
+            .expect("request");
+        req.extensions_mut().insert(UserIdentity {
+            user_id: "test".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+
+        assert_eq!(parsed["name"], "weixin");
+        assert_eq!(parsed["interactive_login"]["method"], "qr_code");
+        assert_eq!(
+            parsed["interactive_login"]["button_label"],
+            "Connect Weixin"
+        );
+        assert_eq!(parsed["secrets"], serde_json::json!([]));
+        assert_eq!(parsed["fields"], serde_json::json!([]));
     }
 
     #[tokio::test]

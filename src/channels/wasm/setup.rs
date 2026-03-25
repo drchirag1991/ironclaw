@@ -190,7 +190,20 @@ async fn register_channel(
         // The credential injection system only replaces placeholders in URLs
         // and headers, so channels like Feishu that exchange app_id + app_secret
         // for a tenant token need the raw values in their config.
-        inject_channel_secrets_into_config(&channel_name, secrets_store, &mut config_updates).await;
+        inject_channel_secrets_into_config(
+            &channel_name,
+            &config.owner_id,
+            secrets_store,
+            &mut config_updates,
+        )
+        .await;
+        inject_channel_settings_into_config(
+            &channel_name,
+            &config.owner_id,
+            settings_store,
+            &mut config_updates,
+        )
+        .await;
 
         if !config_updates.is_empty() {
             channel_arc.update_config(config_updates).await;
@@ -396,6 +409,7 @@ pub async fn inject_channel_credentials(
 /// `feishu_app_secret` are injected as config keys `app_id` and `app_secret`.
 async fn inject_channel_secrets_into_config(
     channel_name: &str,
+    owner_id: &str,
     secrets_store: &Option<Arc<dyn SecretsStore + Send + Sync>>,
     config_updates: &mut std::collections::HashMap<String, serde_json::Value>,
 ) {
@@ -413,7 +427,7 @@ async fn inject_channel_secrets_into_config(
     };
 
     for &(config_key, secret_name) in secret_config_mappings {
-        match secrets.get_decrypted("default", secret_name).await {
+        match secrets.get_decrypted(owner_id, secret_name).await {
             Ok(decrypted) => {
                 config_updates.insert(
                     config_key.to_string(),
@@ -440,5 +454,96 @@ async fn inject_channel_secrets_into_config(
                 }
             }
         }
+    }
+}
+
+/// Inject channel-specific settings into config for channels that persist
+/// runtime-discovered values (for example a custom API base URL after login).
+async fn inject_channel_settings_into_config(
+    channel_name: &str,
+    owner_id: &str,
+    settings_store: Option<&Arc<dyn crate::db::SettingsStore>>,
+    config_updates: &mut std::collections::HashMap<String, serde_json::Value>,
+) {
+    let Some(store) = settings_store else {
+        return;
+    };
+
+    let setting_mappings: &[(&str, &str)] = match channel_name {
+        "weixin" => &[("base_url", "extensions.weixin.base_url")],
+        _ => return,
+    };
+
+    for &(config_key, setting_path) in setting_mappings {
+        if let Ok(Some(serde_json::Value::String(value))) =
+            store.get_setting(owner_id, setting_path).await
+        {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            config_updates.insert(
+                config_key.to_string(),
+                serde_json::Value::String(trimmed.to_string()),
+            );
+            tracing::debug!(
+                channel = %channel_name,
+                config_key = %config_key,
+                setting_path = %setting_path,
+                "Injected setting into channel config"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::db::{Database, SettingsStore};
+
+    #[tokio::test]
+    async fn test_inject_channel_settings_uses_owner_scope() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
+        let db_path = dir.path().join("weixin-settings.db");
+        let db = Arc::new(
+            crate::db::libsql::LibSqlBackend::new_local(&db_path)
+                .await
+                .map_err(|e| format!("create local libsql backend failed: {e}"))?,
+        );
+        db.run_migrations()
+            .await
+            .map_err(|e| format!("run libsql migrations failed: {e}"))?;
+
+        db.set_setting(
+            "default",
+            "extensions.weixin.base_url",
+            &serde_json::json!("https://default.example"),
+        )
+        .await
+        .map_err(|e| format!("persist default setting failed: {e}"))?;
+        db.set_setting(
+            "owner-123",
+            "extensions.weixin.base_url",
+            &serde_json::json!("https://owner.example"),
+        )
+        .await
+        .map_err(|e| format!("persist owner setting failed: {e}"))?;
+
+        let settings_store: Arc<dyn crate::db::SettingsStore> = db;
+        let mut config_updates = std::collections::HashMap::new();
+        super::inject_channel_settings_into_config(
+            "weixin",
+            "owner-123",
+            Some(&settings_store),
+            &mut config_updates,
+        )
+        .await;
+
+        assert_eq!(
+            config_updates.get("base_url"),
+            Some(&serde_json::json!("https://owner.example"))
+        );
+        Ok(())
     }
 }
