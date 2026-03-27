@@ -5003,6 +5003,7 @@ impl ExtensionManager {
                         provided: current_url.is_some(),
                         input_type: crate::tools::wasm::ToolSetupFieldInputType::Text,
                     }],
+                    interactive_login: None,
                 })
             }
             _ => Ok(ExtensionSetupSchema {
