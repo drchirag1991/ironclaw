@@ -96,6 +96,30 @@ The pivotal architectural change. Motivated by the question: *"What if we move s
 
 **Final state**: 189 tests pass, zero clippy warnings. The Python orchestrator is the execution engine. The Rust layer is the kernel.
 
+## Session 7: Integration Scaling Research (2026-03-26)
+
+Studied [Pica](https://github.com/withoneai/pica) (formerly IntegrationOS, 200+ third-party API integrations) to understand how to rapidly scale the number of available integrations in IronClaw.
+
+**Pica's architecture**: Integrations are MongoDB documents, not code. Each platform has a `ConnectionDefinition` (identity + auth schema) and N `ConnectionModelDefinition` records (one per API endpoint: URL, method, auth method, schemas, JS transform functions). A generic executor dispatches requests. OAuth definitions embed JavaScript compute functions executed by a TypeScript service. Adding a new platform = inserting documents, no code changes.
+
+**Analysis of IronClaw v1 tools**: Audited all 37 built-in tools. Only 3 (image_gen, image_analyze, image_edit) are HTTP API wrappers. The other 34 are local computation, filesystem, orchestration, or system management — none convertible to data-driven definitions. The value isn't converting existing tools; it's enabling hundreds of new integrations.
+
+**Key finding — deterministic executors don't solve the LLM problem**: Even with a Pica-style executor, each integration action must be registered as a tool in the LLM's context. At 200+ tools:
+- ~20,000 tokens always-on cost (tool definitions sent every request)
+- LLM tool selection accuracy degrades beyond ~20-30 tools
+- The LLM still constructs parameters and can get them wrong
+- Deterministic execution only helps *after* the LLM correctly selects the tool and params
+
+**The realization**: In engine v2, Capabilities already bundle actions + knowledge. For API integrations, a Capability's knowledge text teaches the LLM how to call the platform's API using the generic `http` action. This is superior to dedicated tools because:
+- Tool list stays small (just `http` + core actions) — high selection accuracy
+- Knowledge loaded on-demand per thread context — zero cost for unused integrations
+- ~350 tokens of knowledge covers 4+ API endpoints (the LLM generalizes)
+- Adding a new platform = writing markdown knowledge, no Rust code
+
+**Remaining gap**: OAuth token acquisition requires a dedicated `oauth_init` action (LLM can't do redirect flows). Capability knowledge instructs the LLM to call it before using the API.
+
+**Decision**: Use Capabilities as knowledge-bearing integration definitions. Write knowledge text for top 20 platforms. Build one `oauth_init` action. Skip the Pica-style deterministic executor — it solves the wrong problem for LLM agents.
+
 ## Architecture Evolution
 
 ```
@@ -105,6 +129,8 @@ Session 4:    + Self-improvement Mission (fires on issues, fixes prompts)
 Session 5:    + Autoresearch-style goal prompt (concrete, not vague)
 Session 6:    Rust loop → Python orchestrator (self-modifiable)
               900 lines Rust → 80 lines Rust bootstrap + 230 lines Python
+Session 7:    Integration scaling: Capabilities as knowledge → http action
+              (not Pica-style per-action tools — tool list bloat kills LLM accuracy)
 ```
 
 ## Key Commits

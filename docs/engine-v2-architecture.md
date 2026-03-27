@@ -215,6 +215,117 @@ ReadLocal, ReadExternal, WriteLocal, WriteExternal,
 CredentialedNetwork, Compute, Financial
 ```
 
+## Integration Scaling Strategy
+
+### The Problem: Tool List Bloat
+
+A naive approach to adding third-party integrations (Slack, GitHub, Stripe, etc.) is to register each API action as a separate tool — `slack_post_message`, `slack_list_channels`, `github_create_issue`, etc. This fails for LLM-based agents:
+
+- Each tool definition costs ~80-120 tokens in the tool list, sent on **every request**
+- 200 actions = ~20,000 tokens always-on context cost
+- LLM tool selection accuracy **degrades significantly** beyond ~20-30 tools
+- The LLM still has to construct correct parameters — deterministic execution doesn't help if the LLM picks the wrong tool or hallucinates params
+
+This was confirmed by studying [Pica](https://github.com/withoneai/pica) (formerly IntegrationOS), which supports 200+ platforms via data-driven definitions in MongoDB. Pica's approach works for programmatic API access, but registering all those actions as LLM tools would degrade agent performance.
+
+### The Solution: Capabilities as Knowledge-Bearing Definitions
+
+In engine v2, Capabilities replace both Tools and Skills. A Capability bundles **actions** (what it can do) with **knowledge** (how to do it). For API integrations, this means:
+
+1. The `http` action is always available (one tool in the LLM's action list)
+2. Each integration is a Capability with knowledge text that teaches the LLM how to call that platform's API
+3. Capabilities are loaded on-demand based on thread context, not registered globally
+4. The LLM reads the knowledge, constructs the correct `http` call
+
+```
+User: "post hello to #general on slack"
+       ↓
+Capability activation: "slack-api" loaded into thread context
+       ↓
+LLM reads knowledge: learns endpoints, auth pattern, body format
+       ↓
+LLM calls `http` action:
+  POST https://slack.com/api/chat.postMessage
+  headers: {"Authorization": "Bearer {SLACK_BOT_TOKEN}"}
+  body: {"channel": "C01234", "text": "hello"}
+       ↓
+EffectExecutor: policy check → credential injection → SSRF protection → leak detection → response
+```
+
+### Token Cost Comparison
+
+| Scenario | Dedicated Tools (200 actions) | Capability + http |
+|---|---|---|
+| User asks about Slack | ~20,000 (all tools in list) | ~700 (http action + slack knowledge) |
+| User asks about nothing | ~20,000 (still there) | ~200 (just http action) |
+| Tool selection accuracy | Degrades with count | Always picks `http` — no confusion |
+| Adding a new platform | Define N tool schemas + executor | Write knowledge text (markdown) |
+
+### What a Capability Definition Looks Like
+
+```yaml
+name: slack-api
+description: Slack Web API — post messages, manage channels, search, react
+knowledge: |
+  Base: `https://slack.com/api`
+  Auth header: `Authorization: Bearer {SLACK_BOT_TOKEN}`
+  All POST bodies are JSON with `Content-Type: application/json`.
+
+  **Post message**: POST `/chat.postMessage` body `{"channel":"<id>","text":"<msg>"}`
+  **List channels**: GET `/conversations.list?types=public_channel&limit=100`
+  **Search**: GET `/search.messages?query=<text>`
+  **Add reaction**: POST `/reactions.add` body `{"channel":"<id>","timestamp":"<ts>","name":"<emoji>"}`
+
+  All responses: `{"ok": true, ...}` or `{"ok": false, "error": "<code>"}`.
+  Paginate with `cursor` param when `response_metadata.next_cursor` is non-empty.
+actions: [http]
+effects: [CredentialedNetwork, ReadExternal, WriteExternal]
+policies:
+  requires_secret: SLACK_BOT_TOKEN
+```
+
+~350 tokens of knowledge covers 4+ actions. The LLM generalizes the pattern to other Slack endpoints from training data.
+
+### Classification of v1 Built-in Tools
+
+Studied all 37 v1 built-in tools to determine which fit the knowledge-driven pattern:
+
+**Can be knowledge-driven (HTTP API wrappers):**
+- `image_gen`, `image_analyze`, `image_edit` — pure HTTP calls to external APIs with auth
+
+**Already a generic action (the execution engine):**
+- `http` — the action that knowledge-driven Capabilities delegate to
+
+**Must remain dedicated actions (complex local logic):**
+- `shell` — 4-layer command validation, Docker sandbox, environment scrubbing
+- `file` (read/write/list/patch) — local filesystem with path traversal prevention
+- `memory_*` — hybrid FTS + vector search, prompt injection detection
+- `job_*` — Docker container lifecycle, context isolation
+- `routine_*` — database-backed CRON scheduling
+- `extension_tools`, `skill_tools` — registry and system management
+- `secrets_tools` — encrypted store management
+- `json`, `time`, `echo` — pure local computation
+- `message`, `restart`, `tool_info` — internal agent control
+
+**Takeaway**: Only 3 of 37 existing tools are HTTP wrappers. The value is not converting existing tools — it's enabling hundreds of **new** integrations (Slack, GitHub, Jira, Stripe, Salesforce, etc.) without writing Rust.
+
+### Where Dedicated Actions Still Win
+
+1. **Autonomous/headless threads** — Missions and background threads with no human oversight benefit from deterministic execution for their 1-2 critical integrations. Register those specific actions via leases.
+2. **OAuth token acquisition** — The LLM cannot perform redirect-based OAuth flows. A dedicated `oauth_init` action handles the redirect dance and stores tokens in the secrets system. The Capability knowledge then instructs the LLM to call `oauth_init` before using the API.
+3. **High-frequency reliability-critical paths** — If a specific integration is called thousands of times and must never fail, a dedicated action avoids LLM reasoning variance.
+
+### Comparison with Pica's Approach
+
+[Pica](https://github.com/withoneai/pica) uses a data-driven model where each API action is a MongoDB document (`ConnectionModelDefinition`) with base URL, path, method, auth method, schemas, and JavaScript transform functions. A generic executor dispatches requests. Key patterns:
+
+- **Handlebars secret injection** — entire definition rendered as template with user's secrets as context
+- **Passthrough + Unified dual mode** — raw HTTP proxy or normalized CRUD via CommonModels
+- **JS sandbox transforms** — `fromCommonModel`/`toCommonModel` functions for data mapping
+- **`knowledge` field** — free-text documentation per action for AI tool discovery
+
+Pica's model is optimized for programmatic API access (SDK calls from code). For LLM agents, the Capability-as-knowledge approach is superior because it avoids tool list bloat while leveraging the LLM's ability to construct HTTP calls from documentation. The two approaches share the insight that **integrations should be data, not code**.
+
 ## Key Files
 
 | File | Purpose |
@@ -248,5 +359,6 @@ cargo test                                                        # full suite
 - **karpathy/autoresearch** — the self-improvement loop as a program.md, fixed-budget evaluation, git as state machine
 - **Official RLM impl** (alexzhang13/rlm) — 30 max iterations, compaction at 85%, budget inheritance
 - **fast-rlm** (avbiswas/fast-rlm) — Step 0 orientation, parallel sub-calls, dual model routing
+- **Pica/IntegrationOS** (withoneai/pica) — data-driven integration definitions, Handlebars secret injection, knowledge fields for AI tool discovery. Validated the "integrations as data" principle; diverged on execution model (knowledge-driven Capabilities instead of per-action tool registration)
 
 See also: `docs/plans/2026-03-20-engine-v2-architecture.md` for the full 8-phase roadmap.
