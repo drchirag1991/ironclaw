@@ -870,10 +870,10 @@ async fn await_thread_outcome(
                 match event {
                     Ok(ref evt) if evt.thread_id == thread_id => {
                         forward_event_to_channel(evt, channels, channel_name, metadata).await;
-                        if let Some(sse) = sse
-                            && let Some(app_event) = thread_event_to_app_event(evt, &tid_str)
-                        {
-                            sse.broadcast_for_user(&message.user_id, app_event);
+                        if let Some(sse) = sse {
+                            for app_event in thread_event_to_app_events(evt, &tid_str) {
+                                sse.broadcast_for_user(&message.user_id, app_event);
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1008,12 +1008,26 @@ async fn forward_event_to_channel(
             let _ = channels
                 .send_status(
                     channel_name,
-                    StatusUpdate::Thinking("Thinking...".into()),
+                    StatusUpdate::Thinking("Calling LLM...".into()),
                     metadata,
                 )
                 .await;
         }
-        EventKind::ActionExecuted { action_name, .. } => {
+        EventKind::ActionExecuted {
+            action_name,
+            duration_ms,
+            ..
+        } => {
+            // Emit ToolStarted then ToolCompleted so the frontend shows the card
+            let _ = channels
+                .send_status(
+                    channel_name,
+                    StatusUpdate::ToolStarted {
+                        name: action_name.clone(),
+                    },
+                    metadata,
+                )
+                .await;
             let _ = channels
                 .send_status(
                     channel_name,
@@ -1021,7 +1035,7 @@ async fn forward_event_to_channel(
                         name: action_name.clone(),
                         success: true,
                         error: None,
-                        parameters: None,
+                        parameters: Some(format!("{duration_ms}ms")),
                     },
                     metadata,
                 )
@@ -1030,6 +1044,15 @@ async fn forward_event_to_channel(
         EventKind::ActionFailed {
             action_name, error, ..
         } => {
+            let _ = channels
+                .send_status(
+                    channel_name,
+                    StatusUpdate::ToolStarted {
+                        name: action_name.clone(),
+                    },
+                    metadata,
+                )
+                .await;
             let _ = channels
                 .send_status(
                     channel_name,
@@ -1043,11 +1066,64 @@ async fn forward_event_to_channel(
                 )
                 .await;
         }
-        EventKind::StepCompleted { .. } => {
+        EventKind::StepCompleted { tokens, .. } => {
+            let tok_msg = format!(
+                "Step complete — {} in / {} out tokens",
+                tokens.input_tokens, tokens.output_tokens
+            );
             let _ = channels
                 .send_status(
                     channel_name,
-                    StatusUpdate::Thinking("Processing results...".into()),
+                    StatusUpdate::Thinking(tok_msg),
+                    metadata,
+                )
+                .await;
+        }
+        EventKind::MessageAdded {
+            role,
+            content_preview,
+        } => {
+            // Surface code execution and tool results as thinking status
+            let msg = if role == "User" && content_preview.starts_with("[stdout]") {
+                Some("Code executed".to_string())
+            } else if role == "User" && content_preview.starts_with("[code ") {
+                Some("Code executed (no output)".to_string())
+            } else if role == "User"
+                && (content_preview.contains("Error")
+                    || content_preview.starts_with("Traceback"))
+            {
+                Some("Code error — retrying...".to_string())
+            } else if role == "Assistant" {
+                Some("Executing code...".to_string())
+            } else {
+                None
+            };
+            if let Some(text) = msg {
+                let _ = channels
+                    .send_status(
+                        channel_name,
+                        StatusUpdate::Thinking(text),
+                        metadata,
+                    )
+                    .await;
+            }
+        }
+        EventKind::ReflectionStarted => {
+            let _ = channels
+                .send_status(
+                    channel_name,
+                    StatusUpdate::Thinking("Reflecting on execution...".into()),
+                    metadata,
+                )
+                .await;
+        }
+        EventKind::ReflectionComplete { docs_produced, .. } => {
+            let _ = channels
+                .send_status(
+                    channel_name,
+                    StatusUpdate::Thinking(format!(
+                        "Reflection complete — {docs_produced} insight(s) saved"
+                    )),
                     metadata,
                 )
                 .await;
@@ -1056,50 +1132,107 @@ async fn forward_event_to_channel(
     }
 }
 
-/// Convert a ThreadEvent to an AppEvent for the web gateway SSE stream.
-fn thread_event_to_app_event(
+/// Convert a ThreadEvent to AppEvents for the web gateway SSE stream.
+///
+/// Returns multiple events when needed (e.g., ToolStarted + ToolCompleted
+/// so the frontend creates the card then resolves it).
+fn thread_event_to_app_events(
     event: &ironclaw_engine::ThreadEvent,
     thread_id: &str,
-) -> Option<AppEvent> {
+) -> Vec<AppEvent> {
     use ironclaw_engine::EventKind;
 
     match &event.kind {
-        EventKind::StepStarted { .. } => Some(AppEvent::Thinking {
-            message: "Thinking...".into(),
+        EventKind::StepStarted { .. } => vec![AppEvent::Thinking {
+            message: "Calling LLM...".into(),
             thread_id: Some(thread_id.into()),
-        }),
-        EventKind::ActionExecuted { action_name, .. } => Some(AppEvent::ToolCompleted {
-            name: action_name.clone(),
-            success: true,
-            error: None,
-            parameters: None,
-            thread_id: Some(thread_id.into()),
-        }),
+        }],
+        EventKind::ActionExecuted {
+            action_name,
+            duration_ms,
+            ..
+        } => vec![
+            AppEvent::ToolStarted {
+                name: action_name.clone(),
+                thread_id: Some(thread_id.into()),
+            },
+            AppEvent::ToolCompleted {
+                name: action_name.clone(),
+                success: true,
+                error: None,
+                parameters: Some(format!("{duration_ms}ms")),
+                thread_id: Some(thread_id.into()),
+            },
+        ],
         EventKind::ActionFailed {
             action_name, error, ..
-        } => Some(AppEvent::ToolCompleted {
-            name: action_name.clone(),
-            success: false,
-            error: Some(error.clone()),
-            parameters: None,
+        } => vec![
+            AppEvent::ToolStarted {
+                name: action_name.clone(),
+                thread_id: Some(thread_id.into()),
+            },
+            AppEvent::ToolCompleted {
+                name: action_name.clone(),
+                success: false,
+                error: Some(error.clone()),
+                parameters: None,
+                thread_id: Some(thread_id.into()),
+            },
+        ],
+        EventKind::StepCompleted { tokens, .. } => vec![AppEvent::Status {
+            message: format!(
+                "Step complete — {} in / {} out tokens",
+                tokens.input_tokens, tokens.output_tokens
+            ),
             thread_id: Some(thread_id.into()),
-        }),
-        EventKind::StepCompleted { .. } => Some(AppEvent::Status {
-            message: "Processing results...".into(),
+        }],
+        EventKind::MessageAdded {
+            role,
+            content_preview,
+        } => {
+            let msg = if role == "User" && content_preview.starts_with("[stdout]") {
+                Some("Code executed")
+            } else if role == "User" && content_preview.starts_with("[code ") {
+                Some("Code executed (no output)")
+            } else if role == "User"
+                && (content_preview.contains("Error")
+                    || content_preview.starts_with("Traceback"))
+            {
+                Some("Code error — retrying...")
+            } else if role == "Assistant" {
+                Some("Executing code...")
+            } else {
+                None
+            };
+            msg.map(|text| AppEvent::Thinking {
+                message: text.into(),
+                thread_id: Some(thread_id.into()),
+            })
+            .into_iter()
+            .collect()
+        }
+        EventKind::ReflectionStarted => vec![AppEvent::Thinking {
+            message: "Reflecting on execution...".into(),
             thread_id: Some(thread_id.into()),
-        }),
-        EventKind::StateChanged { from, to, reason } => Some(AppEvent::ThreadStateChanged {
+        }],
+        EventKind::ReflectionComplete { docs_produced, .. } => vec![AppEvent::Status {
+            message: format!("Reflection complete — {docs_produced} insight(s) saved"),
+            thread_id: Some(thread_id.into()),
+        }],
+        EventKind::StateChanged { from, to, reason } => {
+            vec![AppEvent::ThreadStateChanged {
             thread_id: thread_id.into(),
             from_state: format!("{from:?}"),
             to_state: format!("{to:?}"),
-            reason: reason.clone(),
-        }),
-        EventKind::ChildSpawned { child_id, goal } => Some(AppEvent::ChildThreadSpawned {
+                reason: reason.clone(),
+            }]
+        }
+        EventKind::ChildSpawned { child_id, goal } => vec![AppEvent::ChildThreadSpawned {
             parent_thread_id: thread_id.into(),
             child_thread_id: child_id.to_string(),
             goal: goal.clone(),
-        }),
-        _ => None,
+        }],
+        _ => vec![],
     }
 }
 
