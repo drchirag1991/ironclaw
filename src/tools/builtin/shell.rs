@@ -88,14 +88,7 @@ static BLOCKED_COMMANDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 /// file tool protections. This list covers command-level dangers only.
 static DANGEROUS_PATTERNS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     vec![
-        "sudo ",
-        "doas ",
-        " | sh",
-        " | bash",
-        " | zsh",
-        "eval ",
-        "$(curl",
-        "$(wget",
+        "sudo ", "doas ", " | sh", " | bash", " | zsh", "eval ", "$(curl", "$(wget",
     ]
 });
 

@@ -59,15 +59,13 @@ static SENSITIVE_PATH_PATTERNS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
 });
 
 /// File extensions that are always sensitive regardless of location.
-static SENSITIVE_EXTENSIONS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    vec![".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"]
-});
+static SENSITIVE_EXTENSIONS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| vec![".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"]);
 
 /// Suffixes that indicate a file is safe despite matching a sensitive pattern
 /// (e.g., `.env.example`, `.env.sample`).
-static SAFE_SUFFIXES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    vec![".example", ".sample", ".template", ".dist", ".bak.example"]
-});
+static SAFE_SUFFIXES: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| vec![".example", ".sample", ".template", ".dist", ".bak.example"]);
 
 /// Check if a resolved file path points to a sensitive location.
 /// Used by file tools (read, write, list_dir, apply_patch).
@@ -354,7 +352,9 @@ mod tests {
     #[test]
     fn test_is_sensitive_path_blocks_ssh() {
         assert!(is_sensitive_path(Path::new("/home/user/.ssh/id_rsa")));
-        assert!(is_sensitive_path(Path::new("/home/user/.ssh/authorized_keys")));
+        assert!(is_sensitive_path(Path::new(
+            "/home/user/.ssh/authorized_keys"
+        )));
         assert!(is_sensitive_path(Path::new("/root/.ssh/config")));
     }
 
@@ -407,7 +407,10 @@ mod tests {
     #[test]
     fn test_command_references_sensitive_path_catches_cat_ssh() {
         assert!(command_references_sensitive_path("cat ~/.ssh/id_rsa").is_some());
-        assert!(command_references_sensitive_path("head -n 5 /home/user/.ssh/authorized_keys").is_some());
+        assert!(
+            command_references_sensitive_path("head -n 5 /home/user/.ssh/authorized_keys")
+                .is_some()
+        );
     }
 
     #[test]
