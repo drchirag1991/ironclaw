@@ -52,6 +52,14 @@ pub fn get_updates(
     config: &WechatConfig,
     get_updates_buf: &str,
 ) -> Result<GetUpdatesResponse, String> {
+    get_updates_with_timeout(config, get_updates_buf, config.long_poll_timeout_ms)
+}
+
+pub fn get_updates_with_timeout(
+    config: &WechatConfig,
+    get_updates_buf: &str,
+    timeout_ms: u32,
+) -> Result<GetUpdatesResponse, String> {
     let body = serde_json::to_vec(&GetUpdatesRequest {
         get_updates_buf: get_updates_buf.to_string(),
         base_info: base_info(),
@@ -70,14 +78,9 @@ pub fn get_updates(
             config.long_poll_timeout_ms
         ),
     );
-    let response = channel_host::http_request(
-        "POST",
-        &url,
-        &headers,
-        Some(&body),
-        Some(config.long_poll_timeout_ms),
-    )
-    .map_err(|e| format!("getUpdates request failed: {e}"))?;
+    let response =
+        channel_host::http_request("POST", &url, &headers, Some(&body), Some(timeout_ms))
+            .map_err(|e| format!("getUpdates request failed: {e}"))?;
 
     channel_host::log(
         channel_host::LogLevel::Info,

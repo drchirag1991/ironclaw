@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 wit_bindgen::generate!({
     world: "sandboxed-channel",
     path: "../../wit/channel.wit",
@@ -39,17 +37,6 @@ enum WechatStatusAction {
 
 struct WechatChannel;
 
-fn log_channel(level: channel_host::LogLevel, message: &str) {
-    #[cfg(not(test))]
-    channel_host::log(level, message);
-
-    #[cfg(test)]
-    {
-        let _ = level;
-        let _ = message;
-    }
-}
-
 impl Guest for WechatChannel {
     fn on_start(config_json: String) -> Result<ChannelConfig, String> {
         let config = serde_json::from_str::<WechatConfig>(&config_json)
@@ -87,6 +74,7 @@ impl Guest for WechatChannel {
 
         let config = load_config();
         let cursor = load_get_updates_buf();
+        let mut current_cursor = cursor.clone();
         let mut context_tokens = load_context_tokens();
         let mut pending_inbound = match load_pending_inbound_bundles() {
             Ok(bundles) => bundles,
@@ -98,10 +86,14 @@ impl Guest for WechatChannel {
                 return;
             }
         };
-        let carried_pending_keys: HashSet<String> = pending_inbound.keys().cloned().collect();
         let mut pending_inbound_changed = false;
 
-        match api::get_updates(&config, &cursor) {
+        for bundle in take_due_pending_bundles(&mut pending_inbound, channel_host::now_millis()) {
+            pending_inbound_changed = true;
+            emit_buffered_bundle(bundle);
+        }
+
+        match api::get_updates(&config, &current_cursor) {
             Ok(response) => {
                 if response.errcode == Some(-14) {
                     channel_host::log(
@@ -126,7 +118,8 @@ impl Guest for WechatChannel {
                 }
 
                 if let Some(next_cursor) = response.get_updates_buf.as_deref() {
-                    if next_cursor != cursor {
+                    if next_cursor != current_cursor {
+                        current_cursor = next_cursor.to_string();
                         if let Err(error) = persist_get_updates_buf(next_cursor) {
                             channel_host::log(
                                 channel_host::LogLevel::Warn,
@@ -153,6 +146,8 @@ impl Guest for WechatChannel {
                                 &mut pending_inbound,
                                 bundle,
                                 &mut pending_inbound_changed,
+                                channel_host::now_millis(),
+                                u64::from(config.inbound_merge_window_ms),
                             );
                             for emitted_bundle in emitted {
                                 emit_buffered_bundle(emitted_bundle);
@@ -168,11 +163,20 @@ impl Guest for WechatChannel {
                     }
                 }
 
-                for key in carried_pending_keys {
-                    if let Some(bundle) = pending_inbound.remove(&key) {
-                        pending_inbound_changed = true;
-                        emit_buffered_bundle(bundle);
-                    }
+                collect_follow_up_bundles(
+                    &config,
+                    &mut current_cursor,
+                    &mut context_tokens,
+                    &mut context_tokens_changed,
+                    &mut pending_inbound,
+                    &mut pending_inbound_changed,
+                );
+
+                for bundle in
+                    take_due_pending_bundles(&mut pending_inbound, channel_host::now_millis())
+                {
+                    pending_inbound_changed = true;
+                    emit_buffered_bundle(bundle);
                 }
 
                 if context_tokens_changed {
@@ -299,6 +303,7 @@ fn incoming_bundle_from_message(
         session_id: message.session_id,
         context_token: message.context_token,
         message_id: message.message_id,
+        flush_at_ms: 0,
         text,
         attachments,
     }))
@@ -306,8 +311,10 @@ fn incoming_bundle_from_message(
 
 fn process_incoming_bundle(
     pending_inbound: &mut std::collections::HashMap<String, PendingInboundBundle>,
-    bundle: PendingInboundBundle,
+    mut bundle: PendingInboundBundle,
     pending_inbound_changed: &mut bool,
+    now_ms: u64,
+    inbound_merge_window_ms: u64,
 ) -> Vec<PendingInboundBundle> {
     let key = bundle.from_user_id.clone();
     let bundle_has_text = !bundle.text.trim().is_empty();
@@ -321,44 +328,152 @@ fn process_incoming_bundle(
             pending.text = merge_text(&pending.text, &bundle.text);
             pending.attachments.extend(bundle.attachments);
             merge_bundle_metadata(&mut pending, &incoming_metadata);
-            log_channel(
-                channel_host::LogLevel::Info,
-                &format!(
-                    "Merged buffered WeChat attachment message with follow-up text for {}",
-                    pending.from_user_id
-                ),
-            );
             return vec![pending];
         }
 
         let incoming_metadata = bundle.clone();
         pending.attachments.extend(bundle.attachments);
         merge_bundle_metadata(&mut pending, &incoming_metadata);
+        pending.flush_at_ms = next_flush_deadline(now_ms, inbound_merge_window_ms);
         pending_inbound.insert(key, pending);
-        log_channel(
-            channel_host::LogLevel::Info,
-            &format!(
-                "Buffered additional WeChat attachment for {} while waiting for follow-up text",
-                bundle.from_user_id
-            ),
-        );
         return Vec::new();
     }
 
     if bundle_has_attachments && !bundle_has_text {
         *pending_inbound_changed = true;
-        log_channel(
-            channel_host::LogLevel::Info,
-            &format!(
-                "Buffered WeChat attachment-only message for {} and will wait one poll cycle for follow-up text",
-                bundle.from_user_id
-            ),
-        );
+        bundle.flush_at_ms = next_flush_deadline(now_ms, inbound_merge_window_ms);
         pending_inbound.insert(key, bundle);
         Vec::new()
     } else {
         vec![bundle]
     }
+}
+
+fn collect_follow_up_bundles(
+    config: &WechatConfig,
+    current_cursor: &mut String,
+    context_tokens: &mut std::collections::HashMap<String, String>,
+    context_tokens_changed: &mut bool,
+    pending_inbound: &mut std::collections::HashMap<String, PendingInboundBundle>,
+    pending_inbound_changed: &mut bool,
+) {
+    while !pending_inbound.is_empty() {
+        let now_ms = channel_host::now_millis();
+        let Some(timeout_ms) = next_follow_up_timeout_ms(pending_inbound, now_ms) else {
+            break;
+        };
+        if timeout_ms == 0 {
+            break;
+        }
+
+        let timeout_ms_u32 = timeout_ms.min(u64::from(u32::MAX)) as u32;
+        let response = match api::get_updates_with_timeout(config, current_cursor, timeout_ms_u32) {
+            Ok(response) => response,
+            Err(_) => break,
+        };
+
+        if response.errcode == Some(-14) {
+            channel_host::log(
+                channel_host::LogLevel::Error,
+                "WeChat getUpdates returned errcode=-14 during follow-up merge window; reconnect the channel",
+            );
+            break;
+        }
+
+        if response.ret.unwrap_or(0) != 0 {
+            let errmsg = response
+                .errmsg
+                .as_deref()
+                .unwrap_or("unknown WeChat polling error");
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                &format!(
+                    "WeChat getUpdates returned ret={} errmsg={errmsg} during follow-up merge window",
+                    response.ret.unwrap_or(-1)
+                ),
+            );
+        }
+
+        if let Some(next_cursor) = response.get_updates_buf.as_deref() {
+            if next_cursor != current_cursor {
+                *current_cursor = next_cursor.to_string();
+                if let Err(error) = persist_get_updates_buf(next_cursor) {
+                    channel_host::log(
+                        channel_host::LogLevel::Warn,
+                        &format!("Failed to persist WeChat polling cursor: {error}"),
+                    );
+                }
+            }
+        }
+
+        let mut saw_relevant_message = false;
+        for message in response.msgs {
+            if let Some(from_user_id) = message.from_user_id.as_deref() {
+                if let Some(context_token) = message.context_token.as_deref() {
+                    let changed = context_tokens
+                        .insert(from_user_id.to_string(), context_token.to_string())
+                        .as_deref()
+                        != Some(context_token);
+                    *context_tokens_changed |= changed;
+                }
+            }
+            match incoming_bundle_from_message(config, message) {
+                Ok(Some(bundle)) => {
+                    let emitted = process_incoming_bundle(
+                        pending_inbound,
+                        bundle,
+                        pending_inbound_changed,
+                        channel_host::now_millis(),
+                        u64::from(config.inbound_merge_window_ms),
+                    );
+                    for emitted_bundle in emitted {
+                        saw_relevant_message = true;
+                        emit_buffered_bundle(emitted_bundle);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    channel_host::log(
+                        channel_host::LogLevel::Error,
+                        &format!("Failed to map WeChat inbound message: {error}"),
+                    );
+                }
+            }
+        }
+
+        if !saw_relevant_message && pending_inbound.is_empty() {
+            break;
+        }
+    }
+}
+
+fn next_flush_deadline(now_ms: u64, inbound_merge_window_ms: u64) -> u64 {
+    now_ms.saturating_add(inbound_merge_window_ms)
+}
+
+fn next_follow_up_timeout_ms(
+    pending_inbound: &std::collections::HashMap<String, PendingInboundBundle>,
+    now_ms: u64,
+) -> Option<u64> {
+    pending_inbound
+        .values()
+        .map(|bundle| bundle.flush_at_ms.saturating_sub(now_ms))
+        .min()
+}
+
+fn take_due_pending_bundles(
+    pending_inbound: &mut std::collections::HashMap<String, PendingInboundBundle>,
+    now_ms: u64,
+) -> Vec<PendingInboundBundle> {
+    let due_keys = pending_inbound
+        .iter()
+        .filter_map(|(key, bundle)| (bundle.flush_at_ms <= now_ms).then_some(key.clone()))
+        .collect::<Vec<_>>();
+
+    due_keys
+        .into_iter()
+        .filter_map(|key| pending_inbound.remove(&key))
+        .collect()
 }
 
 fn emit_buffered_bundle(bundle: PendingInboundBundle) {
@@ -402,7 +517,7 @@ fn merge_text(existing: &str, incoming: &str) -> String {
         (true, true) => String::new(),
         (true, false) => incoming.to_string(),
         (false, true) => existing.to_string(),
-        (false, false) => format!("{existing}\n{incoming}"),
+        (false, false) => format!("{existing}\n\n{incoming}"),
     }
 }
 
@@ -616,7 +731,8 @@ mod tests {
 
     use super::{
         classify_status_update, extract_text, merge_text, process_incoming_bundle,
-        PendingInboundBundle, StoredInboundAttachment, WechatStatusAction,
+        take_due_pending_bundles, PendingInboundBundle, StoredInboundAttachment,
+        WechatStatusAction,
     };
     use crate::exports::near::agent::channel::{StatusType, StatusUpdate};
     use crate::types::{MessageItem, VoiceItem, WechatMessage, MESSAGE_ITEM_VOICE};
@@ -628,6 +744,7 @@ mod tests {
             session_id: Some("session-1".to_string()),
             context_token: Some("ctx-1".to_string()),
             message_id: Some(1),
+            flush_at_ms: 0,
             text: text.to_string(),
             attachments: (0..image_count)
                 .map(|index| StoredInboundAttachment {
@@ -725,7 +842,7 @@ mod tests {
     #[test]
     fn test_merge_text_joins_non_empty_segments() {
         assert_eq!(merge_text("", "hello"), "hello");
-        assert_eq!(merge_text("look", "what is this"), "look\nwhat is this");
+        assert_eq!(merge_text("look", "what is this"), "look\n\nwhat is this");
         assert_eq!(merge_text("look", ""), "look");
     }
 
@@ -760,16 +877,25 @@ mod tests {
         let mut pending = HashMap::new();
         let mut changed = false;
 
-        let emitted = process_incoming_bundle(&mut pending, make_bundle("u1", "", 1), &mut changed);
+        let emitted = process_incoming_bundle(
+            &mut pending,
+            make_bundle("u1", "", 1),
+            &mut changed,
+            100,
+            5_000,
+        );
         assert!(emitted.is_empty());
         assert!(changed);
         assert_eq!(pending.len(), 1);
+        assert_eq!(pending["u1"].flush_at_ms, 5100);
 
         changed = false;
         let emitted = process_incoming_bundle(
             &mut pending,
             make_bundle("u1", "What is in this image?", 0),
             &mut changed,
+            200,
+            5_000,
         );
         assert!(changed);
         assert!(pending.is_empty());
@@ -787,11 +913,30 @@ mod tests {
             &mut pending,
             make_bundle("u1", "Look at this image", 1),
             &mut changed,
+            100,
+            5_000,
         );
         assert!(!changed);
         assert!(pending.is_empty());
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].text, "Look at this image");
         assert_eq!(emitted[0].attachments.len(), 1);
+    }
+
+    #[test]
+    fn test_take_due_pending_bundles_emits_only_expired_entries() {
+        let mut pending = HashMap::new();
+        let mut expired = make_bundle("u1", "", 1);
+        expired.flush_at_ms = 100;
+        let mut fresh = make_bundle("u2", "", 1);
+        fresh.flush_at_ms = 300;
+        pending.insert(expired.from_user_id.clone(), expired);
+        pending.insert(fresh.from_user_id.clone(), fresh);
+
+        let due = take_due_pending_bundles(&mut pending, 200);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].from_user_id, "u1");
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key("u2"));
     }
 }

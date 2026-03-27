@@ -64,6 +64,7 @@ pub struct PendingInboundBundle {
     pub session_id: Option<String>,
     pub context_token: Option<String>,
     pub message_id: Option<i64>,
+    pub flush_at_ms: u64,
     pub text: String,
     pub attachments: Vec<StoredInboundAttachment>,
 }

@@ -12,6 +12,8 @@ pub struct WechatConfig {
     pub poll_interval_ms: u32,
     #[serde(default = "default_long_poll_timeout_ms")]
     pub long_poll_timeout_ms: u32,
+    #[serde(default = "default_inbound_merge_window_ms")]
+    pub inbound_merge_window_ms: u32,
 }
 
 fn default_base_url() -> String {
@@ -31,7 +33,11 @@ fn default_poll_interval_ms() -> u32 {
 }
 
 fn default_long_poll_timeout_ms() -> u32 {
-    15_000
+    35_000
+}
+
+fn default_inbound_merge_window_ms() -> u32 {
+    5_000
 }
 
 impl Default for WechatConfig {
@@ -42,6 +48,7 @@ impl Default for WechatConfig {
             bot_type: default_bot_type(),
             poll_interval_ms: default_poll_interval_ms(),
             long_poll_timeout_ms: default_long_poll_timeout_ms(),
+            inbound_merge_window_ms: default_inbound_merge_window_ms(),
         }
     }
 }
