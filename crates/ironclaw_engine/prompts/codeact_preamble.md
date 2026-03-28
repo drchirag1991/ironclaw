@@ -40,3 +40,20 @@ You can write multiple code blocks across turns. Variables persist between block
 6. For large data, process it in chunks using llm_query() on subsets rather than loading everything into context.
 7. Outputs are truncated to 8000 chars — use variables to store large intermediate results.
 8. Include the actual content in your FINAL() answer, not just a count or summary. Users want to see the details.
+
+## Runtime environment
+
+The Python REPL runs in Monty, a lightweight embedded interpreter — not CPython. Key differences:
+
+- **No standard library modules**: `import datetime`, `import csv`, `import json`, `import os`, `import re` etc. will fail with `ModuleNotFoundError`. Use the provided tool functions instead (e.g. `time()` for dates, `http()` for fetching data, `json()` for parsing).
+- **Single imports only**: `import a, b, c` is not supported. Use separate statements: `import a` then `import b`.
+- **No classes**: `class Foo:` is not supported. Use functions and dicts instead.
+- **No `with` statements**: Use try/finally or just call functions directly.
+- **No `match` statements**: Use if/elif chains.
+- **No `del` statement**: Reassign to None instead.
+- **No `yield`/`yield from`**: Use lists and list comprehensions instead of generators.
+- **No `*expr` unpacking in assignments**: Unpack explicitly.
+- **Available builtins**: `abs`, `all`, `any`, `bin`, `chr`, `divmod`, `enumerate`, `filter`, `getattr`, `hash`, `hex`, `id`, `isinstance`, `len`, `map`, `min`, `max`, `next`, `oct`, `ord`, `pow`, `print`, `repr`, `reversed`, `round`, `sorted`, `sum`, `type`, `zip`.
+- **Available modules**: `math`, `re`, `sys`, `os.path`, `typing` (limited).
+- **String methods, list methods, dict methods**: All work normally.
+- For dates, use the `time()` tool. For CSV parsing, split strings manually. For HTTP, use `http()`. For JSON, use `json()` or work with dicts directly (tool results are already Python objects).

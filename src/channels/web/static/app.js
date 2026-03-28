@@ -2092,8 +2092,10 @@ function switchThread(threadId) {
 function createNewThread() {
   apiFetch('/api/chat/thread/new', { method: 'POST' }).then((data) => {
     currentThreadId = data.id || null;
+    currentThreadIsReadOnly = false;
     document.getElementById('chat-messages').innerHTML = '';
     showWelcomeCard();
+    enableChatInput();
     loadThreads();
   }).catch((err) => {
     showToast('Failed to create thread: ' + err.message, 'error');
