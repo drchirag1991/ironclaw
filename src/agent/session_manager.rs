@@ -966,7 +966,7 @@ mod tests {
         let adopted_id = Uuid::new_v4();
         {
             let mut sess = session1.lock().await;
-            let thread = Thread::with_id(adopted_id, sess.id);
+            let thread = Thread::with_id(adopted_id, sess.id, None);
             sess.threads.insert(adopted_id, thread);
         }
         // Resolve with the UUID as external_thread_id -- should adopt it
@@ -1020,7 +1020,6 @@ mod tests {
     }
 
     #[tokio::test]
-<<<<<<< HEAD
     async fn test_resolve_thread_with_pre_parsed_uuid_adopts_thread() {
         use crate::agent::session::Thread;
 
@@ -1031,7 +1030,7 @@ mod tests {
         let known_id = Uuid::new_v4();
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(known_id, sess.id);
+            let thread = Thread::with_id(known_id, sess.id, None);
             sess.threads.insert(known_id, thread);
         }
 
@@ -1058,7 +1057,7 @@ mod tests {
         let known_id = Uuid::new_v4();
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(known_id, sess.id);
+            let thread = Thread::with_id(known_id, sess.id, None);
             sess.threads.insert(known_id, thread);
         }
 
@@ -1082,7 +1081,7 @@ mod tests {
         let known_id = Uuid::new_v4();
         {
             let mut sess = session.lock().await;
-            let thread = Thread::with_id(known_id, sess.id);
+            let thread = Thread::with_id(known_id, sess.id, None);
             sess.threads.insert(known_id, thread);
         }
 

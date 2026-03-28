@@ -1744,7 +1744,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn test_record_tool_result_for_by_id() {
         let mut turn = Turn::new(0, "test");
         turn.record_tool_call_with_reasoning(
