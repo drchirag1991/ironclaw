@@ -339,6 +339,7 @@ def run_loop(context, goal, actions, state, config):
                     "nudge_count": nudge_count,
                     "consecutive_errors": consecutive_errors,
                 })
+                __transition_to__("waiting", "approval needed")
                 return {
                     "outcome": "need_approval",
                     "action_name": approval.get("action_name", ""),
@@ -382,6 +383,7 @@ def run_loop(context, goal, actions, state, config):
                         "nudge_count": nudge_count,
                         "consecutive_errors": consecutive_errors,
                     })
+                    __transition_to__("waiting", "approval needed")
                     return {
                         "outcome": "need_approval",
                         "action_name": name,

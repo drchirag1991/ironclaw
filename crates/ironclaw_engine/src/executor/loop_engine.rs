@@ -305,6 +305,22 @@ impl ExecutionLoop {
                     .await;
                 }
                 let _ = &orch_result.tokens_used;
+
+                // Safety net: if the orchestrator returned NeedApproval but
+                // didn't transition to Waiting, do it now so resume_thread works.
+                if matches!(orch_result.outcome, ThreadOutcome::NeedApproval { .. })
+                    && self.thread.state != ThreadState::Waiting
+                {
+                    debug!(
+                        thread_id = %self.thread.id,
+                        state = ?self.thread.state,
+                        "orchestrator returned NeedApproval without transitioning to Waiting"
+                    );
+                    let _ = self
+                        .thread
+                        .transition_to(ThreadState::Waiting, Some("approval needed".into()));
+                }
+
                 self.clear_runtime_checkpoint();
                 self.persist_runtime_state(None, &mut persisted_event_count)
                     .await?;
