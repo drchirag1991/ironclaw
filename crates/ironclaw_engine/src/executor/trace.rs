@@ -481,6 +481,7 @@ mod tests {
                 action_name: "web_search".into(),
                 call_id: "call_123".into(),
                 error: "No lease for action 'web_search'".into(),
+                params_summary: None,
             },
         ));
 
@@ -546,13 +547,19 @@ mod tests {
         thread.add_message(ThreadMessage::assistant("parallel calls"));
         thread.add_message(ThreadMessage::action_result("", "tool_a", "result_a"));
         thread.add_message(ThreadMessage::action_result("", "tool_b", "result_b"));
-        thread.add_message(ThreadMessage::action_result("call_ok", "tool_c", "result_c"));
+        thread.add_message(ThreadMessage::action_result(
+            "call_ok", "tool_c", "result_c",
+        ));
 
         let issues = analyze_trace(&thread);
         let empty_issues: Vec<_> = issues
             .iter()
             .filter(|i| i.category == "empty_call_id")
             .collect();
-        assert_eq!(empty_issues.len(), 2, "should flag exactly the 2 empty call_ids");
+        assert_eq!(
+            empty_issues.len(),
+            2,
+            "should flag exactly the 2 empty call_ids"
+        );
     }
 }

@@ -443,10 +443,7 @@ pub async fn execute_code_with_skills(
                         let entries: Vec<(MontyObject, MontyObject)> = known_actions
                             .iter()
                             .map(|name| {
-                                (
-                                    MontyObject::String(name.clone()),
-                                    MontyObject::Bool(true),
-                                )
+                                (MontyObject::String(name.clone()), MontyObject::Bool(true))
                             })
                             .collect();
                         ExtFunctionResult::Return(MontyObject::Dict(entries.into()))
@@ -993,6 +990,7 @@ async fn dispatch_action(
                 action_name: action_name.into(),
                 call_id: call_id.into(),
                 error: format!("no lease for action '{action_name}'"),
+                params_summary: None,
             });
             return DispatchResult::Ok(ExtFunctionResult::NotFound(action_name.into()));
         }
@@ -1012,6 +1010,7 @@ async fn dispatch_action(
                     action_name: action_name.into(),
                     call_id: call_id.into(),
                     error: reason.clone(),
+                    params_summary: None,
                 });
                 return DispatchResult::Ok(ExtFunctionResult::Error(MontyException::new(
                     ExcType::RuntimeError,
@@ -1046,6 +1045,7 @@ async fn dispatch_action(
                 action_name: action_name.into(),
                 call_id: call_id.into(),
                 duration_ms: result.duration.as_millis() as u64,
+                params_summary: None,
             });
             let monty_obj = json_to_monty(&result.output);
             action_results.push(result);
@@ -1064,6 +1064,7 @@ async fn dispatch_action(
                 action_name: action_name.into(),
                 call_id: call_id.into(),
                 error: e.to_string(),
+                params_summary: None,
             });
             DispatchResult::Ok(ExtFunctionResult::Error(MontyException::new(
                 ExcType::RuntimeError,

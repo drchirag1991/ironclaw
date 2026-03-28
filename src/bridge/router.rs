@@ -1174,14 +1174,20 @@ async fn forward_event_to_channel(
         EventKind::ActionExecuted {
             action_name,
             duration_ms,
+            params_summary,
             ..
         } => {
-            // Emit ToolStarted then ToolCompleted so the frontend shows the card
+            // Format tool name with params summary: "http(https://api.github.com/...)"
+            let display_name = match params_summary {
+                Some(summary) => format!("{}({})", action_name, summary),
+                None => action_name.clone(),
+            };
+
             let _ = channels
                 .send_status(
                     channel_name,
                     StatusUpdate::ToolStarted {
-                        name: action_name.clone(),
+                        name: display_name.clone(),
                     },
                     metadata,
                 )
@@ -1190,7 +1196,7 @@ async fn forward_event_to_channel(
                 .send_status(
                     channel_name,
                     StatusUpdate::ToolCompleted {
-                        name: action_name.clone(),
+                        name: display_name,
                         success: true,
                         error: None,
                         parameters: Some(format!("{duration_ms}ms")),
@@ -1200,13 +1206,21 @@ async fn forward_event_to_channel(
                 .await;
         }
         EventKind::ActionFailed {
-            action_name, error, ..
+            action_name,
+            error,
+            params_summary,
+            ..
         } => {
+            let display_name = match params_summary {
+                Some(summary) => format!("{}({})", action_name, summary),
+                None => action_name.clone(),
+            };
+
             let _ = channels
                 .send_status(
                     channel_name,
                     StatusUpdate::ToolStarted {
-                        name: action_name.clone(),
+                        name: display_name.clone(),
                     },
                     metadata,
                 )
@@ -1215,7 +1229,7 @@ async fn forward_event_to_channel(
                 .send_status(
                     channel_name,
                     StatusUpdate::ToolCompleted {
-                        name: action_name.clone(),
+                        name: display_name,
                         success: false,
                         error: Some(error.clone()),
                         parameters: None,
@@ -1316,35 +1330,51 @@ fn thread_event_to_app_events(
         EventKind::ActionExecuted {
             action_name,
             duration_ms,
+            params_summary,
             ..
-        } => vec![
-            AppEvent::ToolStarted {
-                name: action_name.clone(),
-                thread_id: Some(thread_id.into()),
-            },
-            AppEvent::ToolCompleted {
-                name: action_name.clone(),
-                success: true,
-                error: None,
-                parameters: Some(format!("{duration_ms}ms")),
-                thread_id: Some(thread_id.into()),
-            },
-        ],
+        } => {
+            let display_name = match params_summary {
+                Some(s) => format!("{}({})", action_name, s),
+                None => action_name.clone(),
+            };
+            vec![
+                AppEvent::ToolStarted {
+                    name: display_name.clone(),
+                    thread_id: Some(thread_id.into()),
+                },
+                AppEvent::ToolCompleted {
+                    name: display_name,
+                    success: true,
+                    error: None,
+                    parameters: Some(format!("{duration_ms}ms")),
+                    thread_id: Some(thread_id.into()),
+                },
+            ]
+        }
         EventKind::ActionFailed {
-            action_name, error, ..
-        } => vec![
-            AppEvent::ToolStarted {
-                name: action_name.clone(),
-                thread_id: Some(thread_id.into()),
-            },
-            AppEvent::ToolCompleted {
-                name: action_name.clone(),
-                success: false,
-                error: Some(error.clone()),
-                parameters: None,
-                thread_id: Some(thread_id.into()),
-            },
-        ],
+            action_name,
+            error,
+            params_summary,
+            ..
+        } => {
+            let display_name = match params_summary {
+                Some(s) => format!("{}({})", action_name, s),
+                None => action_name.clone(),
+            };
+            vec![
+                AppEvent::ToolStarted {
+                    name: display_name.clone(),
+                    thread_id: Some(thread_id.into()),
+                },
+                AppEvent::ToolCompleted {
+                    name: display_name,
+                    success: false,
+                    error: Some(error.clone()),
+                    parameters: None,
+                    thread_id: Some(thread_id.into()),
+                },
+            ]
+        }
         EventKind::StepCompleted { tokens, .. } => vec![AppEvent::Status {
             message: format!(
                 "Step complete — {} in / {} out tokens",

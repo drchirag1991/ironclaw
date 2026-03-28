@@ -1211,7 +1211,10 @@ mod tests {
 
         assert!(!exec_events.is_empty(), "should have ActionExecuted events");
         for call_id in &exec_events {
-            assert!(!call_id.is_empty(), "ActionExecuted event must have non-empty call_id");
+            assert!(
+                !call_id.is_empty(),
+                "ActionExecuted event must have non-empty call_id"
+            );
         }
     }
 
@@ -1257,20 +1260,11 @@ mod tests {
         let policy = Arc::new(PolicyEngine::new());
 
         // Grant a lease that does NOT cover "restricted_tool"
-        leases
-            .grant(tid, "basic_cap", vec![], None, None)
-            .await;
+        leases.grant(tid, "basic_cap", vec![], None, None).await;
 
         let (_tx, rx) = crate::runtime::messaging::signal_channel(16);
-        let mut exec = ExecutionLoop::new(
-            thread,
-            llm,
-            effects,
-            leases,
-            policy,
-            rx,
-            "test-user".into(),
-        );
+        let mut exec =
+            ExecutionLoop::new(thread, llm, effects, leases, policy, rx, "test-user".into());
 
         exec.run().await.unwrap();
 
@@ -1306,10 +1300,7 @@ mod tests {
             .collect();
 
         for (call_id, _name) in &fail_events {
-            assert!(
-                !call_id.is_empty(),
-                "ActionFailed event must have call_id"
-            );
+            assert!(!call_id.is_empty(), "ActionFailed event must have call_id");
         }
     }
 

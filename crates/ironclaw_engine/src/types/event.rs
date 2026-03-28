@@ -8,6 +8,71 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::capability::LeaseId;
+
+/// Generate a short human-readable summary of tool parameters for display.
+///
+/// For `http`: shows the URL. For `web_search`: shows the query.
+/// For other tools: shows the first string argument, truncated.
+/// Returns `None` for empty or unrecognizable params.
+pub fn summarize_params(action_name: &str, params: &serde_json::Value) -> Option<String> {
+    let summary = match action_name {
+        "http" | "web_fetch" => params.get("url").and_then(|v| v.as_str()).map(|u| {
+            if u.len() > 80 {
+                format!("{}...", &u[..77])
+            } else {
+                u.to_string()
+            }
+        }),
+        "web_search" | "llm_context" => params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|q| truncate(q, 60)),
+        "memory_search" => params
+            .get("query")
+            .and_then(|v| v.as_str())
+            .map(|q| truncate(q, 60)),
+        "memory_write" => params
+            .get("target")
+            .and_then(|v| v.as_str())
+            .map(|t| t.to_string()),
+        "memory_read" => params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| p.to_string()),
+        "shell" => params
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|c| truncate(c, 60)),
+        "message" => params
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|c| truncate(c, 40)),
+        _ => {
+            // Generic: show first string value
+            if let Some(obj) = params.as_object() {
+                obj.values()
+                    .find_map(|v| v.as_str())
+                    .map(|s| truncate(s, 50))
+            } else {
+                None
+            }
+        }
+    };
+    summary.filter(|s| !s.is_empty())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        // Find a safe UTF-8 boundary
+        let mut end = max.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
+    }
+}
 use crate::types::step::{StepId, TokenUsage};
 use crate::types::thread::{ThreadId, ThreadState};
 
@@ -76,12 +141,18 @@ pub enum EventKind {
         action_name: String,
         call_id: String,
         duration_ms: u64,
+        /// Short human-readable summary of parameters (e.g., URL for http tool).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params_summary: Option<String>,
     },
     ActionFailed {
         step_id: StepId,
         action_name: String,
         call_id: String,
         error: String,
+        /// Short human-readable summary of parameters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params_summary: Option<String>,
     },
 
     // ── Capability leases ───────────────────────────────────

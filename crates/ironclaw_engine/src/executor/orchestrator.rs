@@ -36,7 +36,7 @@ use crate::traits::effect::{EffectExecutor, ThreadExecutionContext};
 use crate::traits::llm::{LlmBackend, LlmCallConfig};
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
-use crate::types::event::{EventKind, ThreadEvent};
+use crate::types::event::{EventKind, ThreadEvent, summarize_params};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
 use crate::types::step::{StepId, TokenUsage};
@@ -719,6 +719,7 @@ async fn handle_execute_action(
                     action_name: name.clone(),
                     call_id: call_id.clone(),
                     error,
+                    params_summary: None,
                 },
                 &call_id,
                 &name,
@@ -751,6 +752,7 @@ async fn handle_execute_action(
                         action_name: name.clone(),
                         call_id: call_id.clone(),
                         error: reason,
+                        params_summary: None,
                     },
                     &call_id,
                     &name,
@@ -779,6 +781,7 @@ async fn handle_execute_action(
     }
 
     // 4. Execute
+    let ps = summarize_params(&name, &params);
     match effects
         .execute_action(&name, params, &lease, &exec_ctx)
         .await
@@ -792,6 +795,7 @@ async fn handle_execute_action(
                     action_name: name.clone(),
                     call_id: call_id.clone(),
                     duration_ms: r.duration.as_millis() as u64,
+                    params_summary: ps.clone(),
                 },
                 &call_id,
                 &name,
@@ -815,6 +819,7 @@ async fn handle_execute_action(
                     action_name: name.clone(),
                     call_id: call_id.clone(),
                     error: e.to_string(),
+                    params_summary: ps,
                 },
                 &call_id,
                 &name,
@@ -886,6 +891,7 @@ fn handle_emit_event(
                 action_name,
                 call_id,
                 duration_ms: 0,
+                params_summary: None,
             }
         }
         "action_failed" => {
@@ -897,6 +903,7 @@ fn handle_emit_event(
                 action_name,
                 call_id,
                 error,
+                params_summary: None,
             }
         }
         "skill_activated" => {

@@ -68,6 +68,7 @@ pub async fn execute_action_calls(
                     action_name: call.action_name.clone(),
                     call_id: call.id.clone(),
                     error: format!("no lease for action '{}'", call.action_name),
+                    params_summary: None,
                 });
                 results.push(error_result);
                 continue;
@@ -97,6 +98,7 @@ pub async fn execute_action_calls(
                         action_name: call.action_name.clone(),
                         call_id: call.id.clone(),
                         error: reason,
+                        params_summary: None,
                     });
                     results.push(error_result);
                     continue;
@@ -138,6 +140,7 @@ pub async fn execute_action_calls(
                     action_name: call.action_name.clone(),
                     call_id: call.id.clone(),
                     duration_ms: action_result.duration.as_millis() as u64,
+                    params_summary: None,
                 });
                 results.push(action_result);
             }
@@ -153,6 +156,7 @@ pub async fn execute_action_calls(
                     action_name: action_name.clone(),
                     call_id: call_id.clone(),
                     error: format!("authentication required for credential '{credential_name}'"),
+                    params_summary: None,
                 });
                 return Ok(ActionBatchResult {
                     results,
@@ -178,6 +182,7 @@ pub async fn execute_action_calls(
                     action_name: call.action_name.clone(),
                     call_id: call.id.clone(),
                     error: e.to_string(),
+                    params_summary: None,
                 });
                 results.push(error_result);
             }
@@ -272,7 +277,12 @@ mod tests {
 
     #[tokio::test]
     async fn call_id_preserved_on_successful_execution() {
-        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
             vec![test_action("web_search")],
             vec![Ok(ActionResult {
@@ -306,9 +316,17 @@ mod tests {
         assert!(!result.results[0].is_error);
 
         // Event should carry the same call_id
-        let exec_event = result.events.iter().find(|e| matches!(e, EventKind::ActionExecuted { .. }));
+        let exec_event = result
+            .events
+            .iter()
+            .find(|e| matches!(e, EventKind::ActionExecuted { .. }));
         assert!(exec_event.is_some());
-        if let Some(EventKind::ActionExecuted { call_id, action_name, .. }) = exec_event {
+        if let Some(EventKind::ActionExecuted {
+            call_id,
+            action_name,
+            ..
+        }) = exec_event
+        {
             assert_eq!(call_id, "call_r2o5mqBgdNUlH8KzskncUGaX");
             assert_eq!(action_name, "web_search");
         }
@@ -316,7 +334,12 @@ mod tests {
 
     #[tokio::test]
     async fn call_id_preserved_on_execution_error() {
-        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
             vec![test_action("shell")],
             vec![Err(EngineError::Effect {
@@ -343,7 +366,10 @@ mod tests {
         assert_eq!(result.results[0].call_id, "call_abc123def");
         assert!(result.results[0].is_error);
 
-        let fail_event = result.events.iter().find(|e| matches!(e, EventKind::ActionFailed { .. }));
+        let fail_event = result
+            .events
+            .iter()
+            .find(|e| matches!(e, EventKind::ActionFailed { .. }));
         assert!(fail_event.is_some());
         if let Some(EventKind::ActionFailed { call_id, .. }) = fail_event {
             assert_eq!(call_id, "call_abc123def");
@@ -352,7 +378,12 @@ mod tests {
 
     #[tokio::test]
     async fn call_id_preserved_when_no_lease() {
-        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
         let leases = Arc::new(LeaseManager::new());
         let policy = Arc::new(PolicyEngine::new());
@@ -383,7 +414,12 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_calls_each_get_correct_call_id() {
-        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
             vec![test_action("tool_a"), test_action("tool_b")],
             vec![
@@ -616,7 +652,12 @@ mod tests {
     /// ever has an empty call_id when the ActionCall provided one.
     #[tokio::test]
     async fn openai_empty_call_id_never_produced() {
-        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
             vec![test_action("echo")],
             vec![Ok(ActionResult {
@@ -653,7 +694,12 @@ mod tests {
     /// but engine must never lose it).
     #[tokio::test]
     async fn mistral_format_call_id_preserved() {
-        let thread = Thread::new("test", ThreadType::Foreground, ProjectId::new(), ThreadConfig::default());
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        );
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
             vec![test_action("web_search")],
             vec![Ok(ActionResult {
