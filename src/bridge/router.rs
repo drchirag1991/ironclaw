@@ -114,6 +114,26 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         agent.hooks().clone(),
     ));
 
+    // Wire auth_required callback: emits SSE event when a credential is missing.
+    // Best-effort — if no frontend is connected, the event is silently dropped.
+    if let Some(sse) = agent.deps.sse_tx.clone() {
+        let sse_for_auth = sse;
+        effect_adapter
+            .set_auth_required_callback(Arc::new(Box::new(move |credential_name, action_name| {
+                let event = ironclaw_common::AppEvent::AuthRequired {
+                    extension_name: credential_name.to_string(),
+                    instructions: Some(format!(
+                        "Tool '{}' needs the '{}' credential. Please authenticate to continue.",
+                        action_name, credential_name
+                    )),
+                    auth_url: None,
+                    setup_url: None,
+                };
+                sse_for_auth.broadcast(event);
+            })))
+            .await;
+    }
+
     let store = Arc::new(HybridStore::new(agent.workspace().cloned()));
     store.load_state_from_workspace().await;
 
@@ -328,6 +348,9 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     effect_adapter
         .set_mission_manager(Arc::clone(&mission_manager))
         .await;
+
+    // Wire mission manager into agent for /expected command
+    agent.set_mission_manager(Arc::clone(&mission_manager)).await;
 
     *guard = Some(EngineState {
         thread_manager,
@@ -976,6 +999,11 @@ async fn await_thread_outcome(
     let sse = state.sse.as_ref();
     let tid_str = thread_id.to_string();
 
+    // Safety timeout: if the thread doesn't finish within 5 minutes,
+    // break out to avoid hanging the user session forever (e.g. after
+    // a denied approval where the thread fails to resume).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+
     loop {
         tokio::select! {
             event = event_rx.recv() => {
@@ -994,6 +1022,13 @@ async fn await_thread_outcome(
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if !state.thread_manager.is_running(thread_id).await {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        "await_thread_outcome timed out after 5 minutes — breaking to avoid hang"
+                    );
                     break;
                 }
             }
@@ -1101,6 +1136,15 @@ async fn await_thread_outcome(
             Ok(Some(format!(
                 "Tool '{}' requires approval. Reply 'yes' to approve, 'always' to auto-approve future uses of this tool, or 'no' to deny.",
                 action_name
+            )))
+        }
+        ThreadOutcome::NeedAuthentication { credential_name, .. } => {
+            // This shouldn't reach here in the non-blocking design (the error
+            // flows through the LLM as a normal action result), but handle
+            // gracefully in case it does.
+            Ok(Some(format!(
+                "Authentication required for '{}'. Please set up the credential and try again.",
+                credential_name
             )))
         }
     }

@@ -58,6 +58,14 @@ pub enum EngineError {
 
     #[error("skill error: {reason}")]
     Skill { reason: String },
+
+    #[error("authentication required for credential '{credential_name}'")]
+    NeedAuthentication {
+        credential_name: String,
+        action_name: String,
+        call_id: String,
+        parameters: serde_json::Value,
+    },
 }
 
 use crate::types::project::ProjectId;

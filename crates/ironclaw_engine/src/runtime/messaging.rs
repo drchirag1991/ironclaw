@@ -38,6 +38,14 @@ pub enum ThreadOutcome {
         call_id: String,
         parameters: serde_json::Value,
     },
+    /// An action needs a credential that requires user authentication (e.g. OAuth).
+    /// The thread pauses until the credential is available, then resumes.
+    NeedAuthentication {
+        credential_name: String,
+        action_name: String,
+        call_id: String,
+        parameters: serde_json::Value,
+    },
 }
 
 /// A mailbox for sending signals to a running thread.

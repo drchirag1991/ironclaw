@@ -249,6 +249,18 @@ impl ConversationManager {
                     ));
                     // Thread stays active — waiting for approval
                 }
+                ThreadOutcome::NeedAuthentication {
+                    credential_name,
+                    action_name: _,
+                    call_id: _,
+                    parameters: _,
+                } => {
+                    conv.add_entry(ConversationEntry::system_for_thread(
+                        thread_id,
+                        format!("Authentication required for credential: {credential_name}"),
+                    ));
+                    // Thread stays active — waiting for OAuth completion
+                }
             }
             self.store.save_conversation(conv).await?;
         }

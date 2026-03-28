@@ -141,6 +141,30 @@ pub async fn execute_action_calls(
                 });
                 results.push(action_result);
             }
+            Err(crate::types::error::EngineError::NeedAuthentication {
+                credential_name,
+                action_name,
+                call_id,
+                parameters,
+            }) => {
+                // Interrupt the batch — thread should pause for authentication.
+                events.push(EventKind::ActionFailed {
+                    step_id: context.step_id,
+                    action_name: action_name.clone(),
+                    call_id: call_id.clone(),
+                    error: format!("authentication required for credential '{credential_name}'"),
+                });
+                return Ok(ActionBatchResult {
+                    results,
+                    events,
+                    need_approval: Some(ThreadOutcome::NeedAuthentication {
+                        credential_name,
+                        action_name,
+                        call_id,
+                        parameters,
+                    }),
+                });
+            }
             Err(e) => {
                 let error_result = ActionResult {
                     call_id: call.id.clone(),
@@ -406,6 +430,187 @@ mod tests {
         assert_eq!(result.results[0].call_id, "id_aaaa");
         assert_eq!(result.results[1].call_id, "id_bbbb");
     }
+
+    // ── NeedAuthentication tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn need_authentication_interrupts_batch() {
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("http")],
+            vec![Err(EngineError::NeedAuthentication {
+                credential_name: "github_token".into(),
+                action_name: "http".into(),
+                call_id: "call_auth_1".into(),
+                parameters: serde_json::json!({"url": "https://api.github.com/repos"}),
+            })],
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+
+        leases.grant(thread.id, "tools", vec![], None, None).await;
+
+        let calls = vec![ActionCall {
+            id: "call_auth_1".into(),
+            action_name: "http".into(),
+            parameters: serde_json::json!({"url": "https://api.github.com/repos"}),
+        }];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        // Batch should be interrupted with NeedAuthentication outcome
+        assert!(
+            result.need_approval.is_some(),
+            "NeedAuthentication should interrupt the batch"
+        );
+        match result.need_approval.unwrap() {
+            ThreadOutcome::NeedAuthentication {
+                credential_name,
+                action_name,
+                ..
+            } => {
+                assert_eq!(credential_name, "github_token");
+                assert_eq!(action_name, "http");
+            }
+            other => panic!("expected NeedAuthentication, got {:?}", other),
+        }
+
+        // ActionFailed event should be emitted
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| matches!(e, EventKind::ActionFailed { .. })),
+            "should emit ActionFailed event"
+        );
+    }
+
+    #[tokio::test]
+    async fn need_authentication_stops_before_subsequent_calls() {
+        // Two calls: first needs auth, second should never execute
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("http"), test_action("echo")],
+            vec![
+                Err(EngineError::NeedAuthentication {
+                    credential_name: "api_key".into(),
+                    action_name: "http".into(),
+                    call_id: "call_1".into(),
+                    parameters: serde_json::json!({}),
+                }),
+                // This should never be called
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "echo".into(),
+                    output: serde_json::json!("should not appear"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+            ],
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+
+        leases.grant(thread.id, "tools", vec![], None, None).await;
+
+        let calls = vec![
+            ActionCall {
+                id: "call_1".into(),
+                action_name: "http".into(),
+                parameters: serde_json::json!({}),
+            },
+            ActionCall {
+                id: "call_2".into(),
+                action_name: "echo".into(),
+                parameters: serde_json::json!({}),
+            },
+        ];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        // Second call should NOT have executed
+        assert!(
+            result.results.is_empty(),
+            "no results should be returned before the interrupted call"
+        );
+        assert!(result.need_approval.is_some());
+    }
+
+    /// Regular EngineError::Effect (not NeedAuthentication) should NOT interrupt —
+    /// it becomes a normal error result and execution continues.
+    #[tokio::test]
+    async fn regular_effect_error_does_not_interrupt() {
+        let thread = Thread::new(
+            "test",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            ThreadConfig::default(),
+        );
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("http"), test_action("echo")],
+            vec![
+                Err(EngineError::Effect {
+                    reason: "connection timeout".into(),
+                }),
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "echo".into(),
+                    output: serde_json::json!("second call ran"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+            ],
+        ));
+        let leases = Arc::new(LeaseManager::new());
+        let policy = Arc::new(PolicyEngine::new());
+        let ctx = make_exec_context(&thread);
+
+        leases.grant(thread.id, "tools", vec![], None, None).await;
+
+        let calls = vec![
+            ActionCall {
+                id: "call_1".into(),
+                action_name: "http".into(),
+                parameters: serde_json::json!({}),
+            },
+            ActionCall {
+                id: "call_2".into(),
+                action_name: "echo".into(),
+                parameters: serde_json::json!({}),
+            },
+        ];
+
+        let result = execute_action_calls(&calls, &thread, &effects, &leases, &policy, &ctx, &[])
+            .await
+            .unwrap();
+
+        // Both calls should have results (error does not interrupt)
+        assert_eq!(result.results.len(), 2);
+        assert!(result.results[0].is_error);
+        assert!(!result.results[1].is_error);
+        assert!(
+            result.need_approval.is_none(),
+            "no interruption for regular errors"
+        );
+    }
+
+    // ── call_id preservation (OpenAI/Mistral) ─────────────────
 
     /// Provider-specific: OpenAI rejects empty string call_id. Verify no result
     /// ever has an empty call_id when the ActionCall provided one.

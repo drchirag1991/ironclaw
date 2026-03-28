@@ -25,6 +25,12 @@ use crate::safety::SafetyLayer;
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::{ApprovalRequirement, ToolRegistry};
 
+/// Callback invoked when a credential is missing and the user needs to authenticate.
+/// Parameters: (credential_name, action_name).
+/// The router sets this to emit SSE events; mission threads may have a no-op.
+pub type AuthRequiredCallback =
+    Box<dyn Fn(&str, &str) + Send + Sync>;
+
 /// Wraps the existing tool pipeline to implement the engine's `EffectExecutor`.
 ///
 /// Enforces all v1 security controls at the adapter boundary:
@@ -41,6 +47,8 @@ pub struct EffectBridgeAdapter {
     rate_limiter: RateLimiter,
     /// Mission manager for handling mission_* function calls.
     mission_manager: RwLock<Option<Arc<ironclaw_engine::MissionManager>>>,
+    /// Optional callback for when a credential is missing (emits AuthRequired SSE).
+    auth_required_callback: RwLock<Option<Arc<AuthRequiredCallback>>>,
 }
 
 impl EffectBridgeAdapter {
@@ -57,6 +65,19 @@ impl EffectBridgeAdapter {
             call_count: std::sync::atomic::AtomicU32::new(0),
             rate_limiter: RateLimiter::new(),
             mission_manager: RwLock::new(None),
+            auth_required_callback: RwLock::new(None),
+        }
+    }
+
+    /// Set the callback invoked when a credential is missing.
+    pub async fn set_auth_required_callback(&self, cb: Arc<AuthRequiredCallback>) {
+        *self.auth_required_callback.write().await = Some(cb);
+    }
+
+    /// Emit an auth_required signal (best-effort, non-blocking).
+    async fn emit_auth_required(&self, credential_name: &str, action_name: &str) {
+        if let Some(cb) = self.auth_required_callback.read().await.as_ref() {
+            cb(credential_name, action_name);
         }
     }
 
@@ -415,6 +436,24 @@ impl EffectExecutor for EffectBridgeAdapter {
             }
             Err(e) => {
                 let error_msg = format!("Tool '{}' failed: {}", lookup_name, e);
+
+                // Detect authentication_required errors from the HTTP tool.
+                // Emit an AuthRequired SSE event as a side effect (for connected
+                // frontends) but return the error normally — the LLM sees it and
+                // tells the user. This avoids blocking mission/sub-threads that
+                // have no channel context.
+                if error_msg.contains("authentication_required") {
+                    if let Some(cred_name) = extract_credential_name(&error_msg) {
+                        tracing::warn!(
+                            credential = %cred_name,
+                            tool = %lookup_name,
+                            user = %context.user_id,
+                            "Credential missing — emitting auth_required event"
+                        );
+                        self.emit_auth_required(&cred_name, action_name).await;
+                    }
+                }
+
                 let sanitized = self.safety.sanitize_tool_output(lookup_name, &error_msg);
 
                 Ok(ActionResult {
@@ -502,9 +541,24 @@ fn parse_cadence(s: &str) -> ironclaw_engine::types::mission::MissionCadence {
     }
 }
 
-/// Tools that depend on v1 runtime components (RoutineEngine, Scheduler,
-/// ContainerJobManager) and cannot work in engine v2's minimal JobContext.
-/// Note: routine_* tools are NOT blocked — they map to mission operations.
+/// Extract credential name from an authentication_required error message.
+///
+/// The HTTP tool returns errors like:
+/// `{"error":"authentication_required","credential_name":"github_token",...}`
+fn extract_credential_name(error_msg: &str) -> Option<String> {
+    // The error is JSON-encoded inside the tool error string.
+    // Find the JSON portion and parse credential_name from it.
+    if let Some(json_start) = error_msg.find('{') {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&error_msg[json_start..]) {
+            return parsed
+                .get("credential_name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+        }
+    }
+    None
+}
+
 fn is_v1_only_tool(name: &str) -> bool {
     matches!(
         name,
@@ -578,5 +632,92 @@ mod tests {
         assert!(!adapter.auto_approved.read().await.contains("shell"));
         adapter.auto_approve_tool("shell").await;
         assert!(adapter.auto_approved.read().await.contains("shell"));
+    }
+
+    // ── extract_credential_name tests ──────────────────────────
+
+    #[test]
+    fn extract_credential_from_auth_required_error() {
+        let msg = r#"Tool 'http' failed: execution failed: {"error":"authentication_required","credential_name":"github_token","message":"Credential 'github_token' is not configured."}"#;
+        assert_eq!(
+            extract_credential_name(msg),
+            Some("github_token".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_credential_from_nested_json() {
+        let msg = r#"Tool 'http' failed: {"error":"authentication_required","credential_name":"linear_api_key","message":"Use auth_setup"}"#;
+        assert_eq!(
+            extract_credential_name(msg),
+            Some("linear_api_key".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_credential_returns_none_for_non_auth_error() {
+        let msg = "Tool 'http' failed: connection timeout";
+        assert_eq!(extract_credential_name(msg), None);
+    }
+
+    #[test]
+    fn extract_credential_returns_none_for_json_without_credential() {
+        let msg = r#"Tool 'http' failed: {"error":"not_found","message":"404"}"#;
+        assert_eq!(extract_credential_name(msg), None);
+    }
+
+    // ── auth_required_callback tests ───────────────────────────
+
+    #[tokio::test]
+    async fn auth_callback_fires_on_missing_credential() {
+        let adapter = make_adapter();
+
+        let fired = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let fired_clone = Arc::clone(&fired);
+
+        adapter
+            .set_auth_required_callback(Arc::new(Box::new(move |cred, action| {
+                fired_clone
+                    .lock()
+                    .unwrap()
+                    .push((cred.to_string(), action.to_string()));
+            })))
+            .await;
+
+        adapter.emit_auth_required("github_token", "http").await;
+
+        let calls = fired.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "github_token");
+        assert_eq!(calls[0].1, "http");
+    }
+
+    #[tokio::test]
+    async fn auth_callback_not_set_is_noop() {
+        let adapter = make_adapter();
+        // No callback set — should not panic
+        adapter.emit_auth_required("some_token", "http").await;
+    }
+
+    // ── is_v1_only_tool tests ──────────────────────────────────
+
+    #[test]
+    fn routine_tools_are_v1_only() {
+        assert!(is_v1_only_tool("routine_create"));
+        assert!(is_v1_only_tool("routine_list"));
+        assert!(is_v1_only_tool("routine_fire"));
+        assert!(is_v1_only_tool("routine_delete"));
+        assert!(is_v1_only_tool("routine_pause"));
+        assert!(is_v1_only_tool("routine_resume"));
+        assert!(is_v1_only_tool("routine_update"));
+    }
+
+    #[test]
+    fn mission_tools_are_not_v1_only() {
+        assert!(!is_v1_only_tool("mission_create"));
+        assert!(!is_v1_only_tool("mission_list"));
+        assert!(!is_v1_only_tool("mission_fire"));
+        assert!(!is_v1_only_tool("http"));
+        assert!(!is_v1_only_tool("web_search"));
     }
 }
