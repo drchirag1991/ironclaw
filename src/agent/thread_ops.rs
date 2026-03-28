@@ -146,7 +146,7 @@ impl Agent {
         } else {
             None
         };
-        let effective_source_channel = db_source_channel.as_deref().or(Some(&*message.channel));
+        let effective_source_channel = db_source_channel.as_deref();
 
         let session_id = {
             let sess = session.lock().await;

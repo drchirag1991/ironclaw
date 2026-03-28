@@ -34,6 +34,7 @@ pub async fn setup_wasm_channels(
     secrets_store: &Option<Arc<dyn SecretsStore + Send + Sync>>,
     extension_manager: Option<&Arc<ExtensionManager>>,
     database: Option<&Arc<dyn Database>>,
+    registered_channel_names: &[String],
 ) -> Option<WasmChannelSetup> {
     let runtime = match WasmChannelRuntime::new(WasmChannelRuntimeConfig::default()) {
         Ok(r) => Arc::new(r),
@@ -74,7 +75,19 @@ pub async fn setup_wasm_channels(
     // Reserved channel names that WASM modules must not claim.
     // A malicious module could otherwise register as a trusted built-in
     // channel and bypass cross-channel authorization checks.
-    const RESERVED_CHANNEL_NAMES: &[&str] = &["web", "gateway", "cli", "repl"];
+    // This list must cover every built-in channel name to prevent a WASM
+    // module from impersonating a built-in and satisfying same-channel
+    // approval checks.
+    const RESERVED_CHANNEL_NAMES: &[&str] = &[
+        "web",
+        "gateway",
+        "cli",
+        "repl",
+        "http",
+        "signal",
+        "slack-relay",
+        "secret_save",
+    ];
 
     for loaded in results.loaded {
         let name_lower = loaded.name().to_ascii_lowercase();
@@ -82,6 +95,19 @@ pub async fn setup_wasm_channels(
             tracing::warn!(
                 channel = %loaded.name(),
                 "Rejected WASM channel with reserved name"
+            );
+            continue;
+        }
+        // Also reject any name that collides with an already-registered
+        // channel to prevent a WASM module from shadowing a channel that
+        // was registered earlier in the startup sequence.
+        if registered_channel_names
+            .iter()
+            .any(|n| n.to_ascii_lowercase() == name_lower)
+        {
+            tracing::warn!(
+                channel = %loaded.name(),
+                "Rejected WASM channel that collides with already-registered channel"
             );
             continue;
         }

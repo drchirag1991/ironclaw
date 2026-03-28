@@ -38,8 +38,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     thread_id TEXT,
     started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     last_activity TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    metadata TEXT NOT NULL DEFAULT '{}',
-    source_channel TEXT
+    metadata TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversations_channel ON conversations(channel);
