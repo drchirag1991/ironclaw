@@ -57,6 +57,17 @@ pub struct PendingApprovalView {
     pub parameters: String,
 }
 
+/// Pending credential auth: the next user message is treated as a token value.
+#[derive(Clone)]
+struct PendingAuth {
+    credential_name: String,
+    /// The original user message to retry after token is stored.
+    original_message: String,
+    user_id: String,
+    channel: String,
+    metadata: serde_json::Value,
+}
+
 /// Persistent engine state that lives across messages.
 struct EngineState {
     thread_manager: Arc<ThreadManager>,
@@ -66,10 +77,14 @@ struct EngineState {
     default_project_id: ironclaw_engine::ProjectId,
     /// Per-user pending approvals (keyed by user_id).
     pending_approvals: RwLock<HashMap<String, PendingApproval>>,
+    /// Per-user pending credential auth (keyed by user_id).
+    pending_auth: RwLock<HashMap<String, PendingAuth>>,
     /// SSE manager for broadcasting AppEvents to the web gateway.
     sse: Option<Arc<SseManager>>,
     /// V1 database for writing conversation messages (gateway reads from here).
     db: Option<Arc<dyn Database>>,
+    /// Secrets store for storing credentials after auth flow.
+    secrets_store: Option<Arc<dyn crate::secrets::SecretsStore + Send + Sync>>,
 }
 
 /// Global engine state, initialized on first use.
@@ -361,8 +376,10 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         store: store.clone(),
         default_project_id: project_id,
         pending_approvals: RwLock::new(HashMap::new()),
+        pending_auth: RwLock::new(HashMap::new()),
         sse: agent.deps.sse_tx.clone(),
         db: agent.deps.store.clone(),
+        secrets_store: agent.tools().secrets_store().cloned(),
     });
 
     Ok(())
@@ -917,6 +934,76 @@ pub async fn handle_with_engine(
         "engine v2: handling message"
     );
 
+    // Check for pending auth — if the user is responding to an auth prompt,
+    // treat the message as a token value and store it as a secret.
+    {
+        let pending = state
+            .pending_auth
+            .write()
+            .await
+            .remove(&message.user_id);
+        if let Some(pending) = pending {
+            let token = content.trim().to_string();
+            if token.is_empty() || token.eq_ignore_ascii_case("cancel") {
+                return Ok(Some("Authentication cancelled.".into()));
+            }
+
+            if let Some(ref ss) = state.secrets_store {
+                let params = crate::secrets::CreateSecretParams::new(
+                    &pending.credential_name,
+                    &token,
+                );
+                match ss.create(&message.user_id, params).await {
+                    Ok(_) => {
+                        let _ = agent
+                            .channels
+                            .send_status(
+                                &message.channel,
+                                StatusUpdate::AuthCompleted {
+                                    extension_name: pending.credential_name.clone(),
+                                    success: true,
+                                    message: format!(
+                                        "Credential '{}' stored. Retrying your request...",
+                                        pending.credential_name
+                                    ),
+                                },
+                                &message.metadata,
+                            )
+                            .await;
+
+                        // Retry the original request — drop the read guard first,
+                        // then re-enter handle_with_engine with the original message.
+                        let retry_msg = IncomingMessage {
+                            content: pending.original_message.clone(),
+                            channel: pending.channel,
+                            user_id: pending.user_id,
+                            metadata: pending.metadata,
+                            ..message.clone()
+                        };
+                        let retry_content = pending.original_message;
+                        drop(guard);
+                        return Box::pin(handle_with_engine(
+                            agent,
+                            &retry_msg,
+                            &retry_content,
+                        ))
+                        .await;
+                    }
+                    Err(e) => {
+                        return Ok(Some(format!(
+                            "Failed to store credential '{}': {}",
+                            pending.credential_name, e
+                        )));
+                    }
+                }
+            } else {
+                return Ok(Some(
+                    "No secrets store available. Cannot store credentials.".into(),
+                ));
+            }
+        }
+    }
+
     // Send "Thinking..." status to the channel
     let _ = agent
         .channels
@@ -1087,6 +1174,79 @@ async fn await_thread_outcome(
     match outcome {
         ThreadOutcome::Completed { response } => {
             debug!(thread_id = %thread_id, "engine v2: completed");
+
+            // Detect authentication_required in the response and enter auth mode.
+            // The user sees a prompt to paste their token; the next message stores
+            // it and retries the original request.
+            if let Some(ref text) = response
+                && text.contains("authentication_required")
+            {
+                // Extract credential name from the response text
+                let cred_name = text
+                    .split("credential_name")
+                    .nth(1)
+                    .and_then(|s| {
+                        // Handle both JSON ("credential_name":"foo") and prose
+                        s.split(&['"', '\'', '`'][..])
+                            .find(|seg| !seg.is_empty() && !seg.contains(':') && !seg.contains(' '))
+                    })
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                // Find setup instructions from skill credential spec
+                let setup_hint = agent
+                    .deps
+                    .skill_registry
+                    .as_ref()
+                    .and_then(|sr| {
+                        let reg = sr.read().ok()?;
+                        reg.skills().iter().find_map(|s| {
+                            s.manifest.credentials.iter().find_map(|c| {
+                                if c.name == cred_name {
+                                    c.setup_instructions.clone()
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        format!("Provide your {} token", cred_name)
+                    });
+
+                // Store pending auth for this user
+                state.pending_auth.write().await.insert(
+                    message.user_id.clone(),
+                    PendingAuth {
+                        credential_name: cred_name.clone(),
+                        original_message: message.content.clone(),
+                        user_id: message.user_id.clone(),
+                        channel: message.channel.clone(),
+                        metadata: message.metadata.clone(),
+                    },
+                );
+
+                // Show auth prompt via channel
+                let _ = agent
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::AuthRequired {
+                            extension_name: cred_name.clone(),
+                            instructions: Some(setup_hint),
+                            auth_url: None,
+                            setup_url: None,
+                        },
+                        &message.metadata,
+                    )
+                    .await;
+
+                return Ok(Some(format!(
+                    "Authentication required for '{}'. Paste your token below (or type 'cancel'):",
+                    cred_name
+                )));
+            }
+
             Ok(response)
         }
         ThreadOutcome::Stopped => Ok(Some("Thread was stopped.".into())),
