@@ -342,13 +342,22 @@ def run_loop(context, goal, actions, state, config):
                 __transition_to__("completed", "FINAL() in code")
                 return {"outcome": "completed", "response": result["final_answer"]}
 
-            # Check for approval needed
+            # Check for approval or authentication needed
             if result.get("need_approval") is not None:
                 approval = result["need_approval"]
                 __save_checkpoint__(state, {
                     "nudge_count": nudge_count,
                     "consecutive_errors": consecutive_errors,
                 })
+                if approval.get("need_authentication"):
+                    __transition_to__("waiting", "authentication needed")
+                    return {
+                        "outcome": "need_authentication",
+                        "credential_name": approval.get("credential_name", ""),
+                        "action_name": approval.get("action_name", ""),
+                        "call_id": approval.get("call_id", ""),
+                        "parameters": approval.get("parameters", {}),
+                    }
                 __transition_to__("waiting", "approval needed")
                 return {
                     "outcome": "need_approval",
@@ -387,6 +396,20 @@ def run_loop(context, goal, actions, state, config):
                 # __execute_action__ handles event emission, message addition,
                 # and lease consumption in Rust — no duplicate logic needed here.
                 r = __execute_action__(name, params, call_id=call_id)
+
+                if r.get("need_authentication"):
+                    __save_checkpoint__(state, {
+                        "nudge_count": nudge_count,
+                        "consecutive_errors": consecutive_errors,
+                    })
+                    __transition_to__("waiting", "authentication needed")
+                    return {
+                        "outcome": "need_authentication",
+                        "credential_name": r.get("credential_name", ""),
+                        "action_name": name,
+                        "call_id": call_id,
+                        "parameters": params,
+                    }
 
                 if r.get("need_approval"):
                     __save_checkpoint__(state, {

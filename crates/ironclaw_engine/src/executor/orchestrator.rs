@@ -567,7 +567,12 @@ async fn handle_execute_code_step(
         thread_id: thread.id,
         thread_type: thread.thread_type,
         project_id: thread.project_id,
-        user_id: "orchestrator".into(),
+        user_id: thread
+            .metadata
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("orchestrator")
+            .to_string(),
         step_id: StepId::new(),
     };
 
@@ -690,7 +695,12 @@ async fn handle_execute_action(
         thread_id: thread.id,
         thread_type: thread.thread_type,
         project_id: thread.project_id,
-        user_id: "orchestrator".into(),
+        user_id: thread
+            .metadata
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("orchestrator")
+            .to_string(),
         step_id: StepId::new(),
     };
 

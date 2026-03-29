@@ -334,12 +334,10 @@ impl EffectExecutor for EffectBridgeAdapter {
                             });
 
                         if !has_credential_backing {
-                            return Err(EngineError::LeaseDenied {
-                                reason: format!(
-                                    "Tool '{}' requires approval. \
-                                     Use a read-only tool instead, or ask the user to approve this action.",
-                                    action_name
-                                ),
+                            return Err(EngineError::NeedApproval {
+                                action_name: action_name.to_string(),
+                                call_id: String::new(),
+                                parameters,
                             });
                         }
                     }
@@ -447,10 +445,8 @@ impl EffectExecutor for EffectBridgeAdapter {
                 let error_msg = format!("Tool '{}' failed: {}", lookup_name, e);
 
                 // Detect authentication_required errors from the HTTP tool.
-                // Emit an AuthRequired SSE event as a side effect (for connected
-                // frontends) but return the error normally — the LLM sees it and
-                // tells the user. This avoids blocking mission/sub-threads that
-                // have no channel context.
+                // Return NeedAuthentication so the engine pauses the thread
+                // and the router can prompt the user for credentials.
                 if error_msg.contains("authentication_required")
                     && let Some(cred_name) = extract_credential_name(&error_msg)
                 {
@@ -458,9 +454,15 @@ impl EffectExecutor for EffectBridgeAdapter {
                         credential = %cred_name,
                         tool = %lookup_name,
                         user = %context.user_id,
-                        "Credential missing — emitting auth_required event"
+                        "Credential missing — returning NeedAuthentication"
                     );
                     self.emit_auth_required(&cred_name, action_name).await;
+                    return Err(EngineError::NeedAuthentication {
+                        credential_name: cred_name,
+                        action_name: action_name.to_string(),
+                        call_id: String::new(),
+                        parameters,
+                    });
                 }
 
                 let sanitized = self.safety.sanitize_tool_output(lookup_name, &error_msg);
