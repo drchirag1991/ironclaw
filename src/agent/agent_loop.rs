@@ -1174,6 +1174,13 @@ impl Agent {
                     return crate::bridge::handle_with_engine(self, message, content).await;
                 }
                 Submission::ApprovalResponse { approved, always } => {
+                    // If there's a pending auth, "cancel"/"no" should clear the
+                    // auth flow, not be treated as an approval response.
+                    // Route through handle_with_engine so PendingAuth is checked.
+                    if crate::bridge::has_pending_auth(&message.user_id).await {
+                        let content = &message.content;
+                        return crate::bridge::handle_with_engine(self, message, content).await;
+                    }
                     return crate::bridge::handle_approval(self, message, *approved, *always).await;
                 }
                 Submission::ExecApproval {

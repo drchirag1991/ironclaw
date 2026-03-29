@@ -25,6 +25,7 @@ pub use router::{
     get_engine_thread,
     // Action handlers
     handle_approval,
+    has_pending_auth,
     handle_clear,
     handle_exec_approval,
     handle_interrupt,

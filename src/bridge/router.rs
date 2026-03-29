@@ -66,6 +66,9 @@ struct PendingAuth {
     user_id: String,
     channel: String,
     metadata: serde_json::Value,
+    /// Engine thread that is waiting for the credential.
+    /// Used to stop the thread on cancel.
+    engine_thread_id: Option<ironclaw_engine::ThreadId>,
 }
 
 /// Persistent engine state that lives across messages.
@@ -926,6 +929,27 @@ async fn clear_engine_conversation(agent: &Agent, message: &IncomingMessage) -> 
     Ok(())
 }
 
+/// Check if a user has a pending auth flow (PendingAuth in the engine state).
+///
+/// Used by the agent loop to route "cancel"/"no" through `handle_with_engine`
+/// instead of `handle_approval` when the user is in auth mode.
+pub async fn has_pending_auth(user_id: &str) -> bool {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return false;
+    };
+    let Ok(guard) = lock.try_read() else {
+        return false;
+    };
+    let Some(state) = guard.as_ref() else {
+        return false;
+    };
+    state
+        .pending_auth
+        .read()
+        .await
+        .contains_key(user_id)
+}
+
 /// Handle a user message through the engine v2 pipeline.
 pub async fn handle_with_engine(
     agent: &Agent,
@@ -956,6 +980,10 @@ pub async fn handle_with_engine(
         if let Some(pending) = pending {
             let token = content.trim().to_string();
             if token.is_empty() || token.eq_ignore_ascii_case("cancel") {
+                // Stop the waiting engine thread so it doesn't leak.
+                if let Some(engine_tid) = pending.engine_thread_id {
+                    let _ = state.thread_manager.stop_thread(engine_tid).await;
+                }
                 let response = "Authentication cancelled.".to_string();
                 // Write to v1 DB so the history API shows the response.
                 if let Some(ref db) = state.db {
@@ -1249,6 +1277,7 @@ async fn await_thread_outcome(
                         user_id: message.user_id.clone(),
                         channel: message.channel.clone(),
                         metadata: message.metadata.clone(),
+                        engine_thread_id: None, // Completed path — thread already finished
                     },
                 );
 
@@ -1355,6 +1384,7 @@ async fn await_thread_outcome(
                     user_id: message.user_id.clone(),
                     channel: message.channel.clone(),
                     metadata: message.metadata.clone(),
+                    engine_thread_id: Some(thread_id),
                 },
             );
 
