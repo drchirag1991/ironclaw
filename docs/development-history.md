@@ -251,6 +251,59 @@ Files: `src/agent/submission.rs` (parser), `src/agent/commands.rs` (handler), `s
 - **Clippy cleanup** — collapsible ifs, shadow imports, missing SkillActivated match arm, duplicate repl.rs arms. Zero warnings across all crates.
 - **Mission prompt templates extracted** to `crates/ironclaw_engine/prompts/mission_*.md` from inline Rust strings.
 
+## Session 11: E2E Test Suite + Engine Hardening (2026-03-28 to 2026-03-29)
+
+Analyzed two production traces (`engine_trace_20260329T011339.json`, `engine_trace_20260329T052431.json`) that revealed 5 silent failures in the v2 engine. Built comprehensive E2E tests that exposed 9 additional engine bugs, all fixed in this session.
+
+### Trace-Driven Fixes (before E2E tests)
+
+1. **Tool result desync on RequireApproval** — `handle_execute_action()` returned without calling `emit_and_record()` for RequireApproval, leaving orphaned `tool_calls` in the OpenAI message history. On thread resume → 400 "No tool output found for function call" → 3 retries → thread failure.
+
+2. **LLM installs WASM tool instead of using skill** — `## Extensions` section told LLM to `tool_search`, competing with `## Active Skills`. Added skill-aware guidance to both v1 `Reasoning` and v2 `default.py` `format_skills()`.
+
+3. **HTTP tool blocks unauthenticated requests** — Credential lookup returned `authentication_required` immediately when secret was missing. Changed to inject-if-available: proceed without auth, only error on 401/403.
+
+4. **NeedAuthentication not wired in CodeAct** — `EffectBridgeAdapter` returned `Ok(ActionResult { is_error: true })` instead of `Err(NeedAuthentication)`. Wired `NeedAuthentication` through scripting.rs `DispatchResult`, orchestrator.rs `handle_execute_action`, default.py, loop_engine.rs safety net, and router.rs NeedAuthentication handler.
+
+5. **CodeAct gives up after one tool error** — Added error recovery section to `codeact_postamble.md`.
+
+### E2E Test Suite (5 files, 12 tests)
+
+Built a v2-engine-specific E2E test framework: mock API servers (aiohttp), mock LLM tool call patterns, dedicated ironclaw server fixtures with `ENGINE_V2=true`, `HTTP_ALLOW_LOCALHOST=true`, `SECRETS_MASTER_KEY`.
+
+| File | Tests | Coverage |
+|------|-------|---------|
+| `test_v2_engine_auth_flow.py` | 4 | Skill activation, NeedAuthentication → auth prompt → token → retry → mock API receives token, credential persistence |
+| `test_v2_engine_auth_cancel.py` | 2 | Cancel during auth prompt, server responsive after cancel |
+| `test_v2_engine_approval_flow.py` | 4 | Approve yes/no/always (text-based), approval prompt mentions tool name |
+| `test_v2_engine_error_handling.py` | 2 | Max iterations (30 step limit), tool intent nudge recovery |
+
+### Bugs Found and Fixed by Running E2E Tests
+
+6. **`HTTP_ALLOW_LOCALHOST` flag** — HTTP tool's SSRF protection blocked `http://127.0.0.1`, making mock-server-based testing impossible. Added `OnceLock`-backed env var check.
+
+7. **`EngineError::NeedApproval`** — Effect adapter returned `LeaseDenied` for tools needing approval (not auto-approved, no credential backing). Engine treated it as generic error → thread failed. Added `NeedApproval` variant and wired through orchestrator and scripting dispatch.
+
+8. **v1 DB write for non-Completed outcomes** — `await_thread_outcome` only wrote to v1 DB for `Completed { response }`. NeedApproval/NeedAuthentication responses were invisible in history API → `state=Failed`. Moved write to cover all outcomes.
+
+9. **`pending_approval` thread ID mismatch** — History endpoint passed v1 session UUID as hint to engine pending approval lookup (different UUID space). Cache miss every time. Removed hint.
+
+10. **`SECRETS_MASTER_KEY` required** — Without it, `init_secrets()` returns early → no SecretsStore → HttpTool has no credential injection → NeedAuthentication never triggers. Test fixtures now set the key.
+
+11. **`user_id: "orchestrator"` hardcoded** — `ThreadExecutionContext` used `"orchestrator"` for secrets lookup, but credentials stored under real user_id. Changed to read from `thread.metadata["user_id"]`.
+
+12. **`host_matches_pattern` port matching** — Skill hosts like `"127.0.0.1:8080"` didn't match `host_str()` output `"127.0.0.1"`. Added port-stripping logic.
+
+13. **Cancel during auth stored message as credential** — `SubmissionParser` parsed `"cancel"` as `ApprovalResponse { approved: false }`, bypassing `handle_with_engine`'s PendingAuth check. Next `UserInput` message was treated as token and stored. Added `has_pending_auth()` check to route approval-like submissions through `handle_with_engine` when auth is pending.
+
+14. **Cancel doesn't stop engine thread** — Added `engine_thread_id` to `PendingAuth`, call `stop_thread` on cancel. Also added v1 DB write for cancel response.
+
+### Infrastructure
+
+- **`mock_llm.py`** — Added runtime-configurable `_github_api_url` via `POST /__mock/set_github_api_url`, tool call patterns for `list.*issues`, `loop forever`, `list.*drive.*files`, canned responses for tool intent nudge.
+- **Mock API servers** — Per-test aiohttp servers with strict Bearer token validation (`ghp_*` prefix), token tracking, reset endpoints.
+- **`HTTP_ALLOW_LOCALHOST`** — New env var flag that relaxes HTTPS-only and SSRF checks for `http://` and `127.0.0.1` targets. For E2E testing only.
+
 ## Architecture Evolution
 
 ```
@@ -268,6 +321,9 @@ Session 9:    CodeAct event pipeline fix (ActionExecuted events were lost)
               + Monty globals() builtin + platform self-awareness injection
 Session 10:   Workspace restructure (human-readable paths, frontmatter,
               cleanup, README) + /expected feedback loop + approval fix
+Session 11:   E2E test suite (12 tests across 5 files) → found 9 engine bugs
+              + HTTP_ALLOW_LOCALHOST + NeedApproval/NeedAuthentication wiring
+              + user_id fix + cancel routing fix + host_matches_pattern fix
 ```
 
 ## Key Commits
