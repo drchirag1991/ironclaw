@@ -611,11 +611,11 @@ async fn load_and_validate_skill(
     let manifest = parsed.manifest;
     let prompt_content = parsed.prompt_content;
 
-    // Check gating requirements
-    if let Some(ref meta) = manifest.metadata
-        && let Some(ref openclaw) = meta.openclaw
+    // Check gating requirements (merged from top-level `requires` and legacy
+    // `metadata.openclaw.requires`)
     {
-        let result = gating::check_requirements(&openclaw.requires).await;
+        let effective = manifest.effective_requires();
+        let result = gating::check_requirements(&effective).await;
         if !result.passed {
             return Err(SkillRegistryError::GatingFailed {
                 name: manifest.name.clone(),
@@ -698,11 +698,10 @@ async fn load_from_content(
     let manifest = parsed.manifest;
     let prompt_content = parsed.prompt_content;
 
-    // Check gating requirements
-    if let Some(ref meta) = manifest.metadata
-        && let Some(ref openclaw) = meta.openclaw
+    // Check gating requirements (merged from top-level and legacy path)
     {
-        let result = gating::check_requirements(&openclaw.requires).await;
+        let effective = manifest.effective_requires();
+        let result = gating::check_requirements(&effective).await;
         if !result.passed {
             return Err(SkillRegistryError::GatingFailed {
                 name: manifest.name.clone(),

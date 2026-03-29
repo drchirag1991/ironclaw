@@ -21,14 +21,12 @@ activation:
     - publishing
     - setup
   max_context_tokens: 2500
-metadata:
-  openclaw:
-    requires:
-      skills:
-        - commitment-triage
-        - commitment-digest
-        - decision-capture
-        - idea-parking
+requires:
+  skills:
+    - commitment-triage
+    - commitment-digest
+    - decision-capture
+    - idea-parking
 ---
 
 # Content Creator — Commitment System Setup

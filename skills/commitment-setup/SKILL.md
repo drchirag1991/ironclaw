@@ -19,12 +19,10 @@ activation:
     - setup
     - personal-assistant
   max_context_tokens: 2000
-metadata:
-  openclaw:
-    requires:
-      skills:
-        - commitment-triage
-        - commitment-digest
+requires:
+  skills:
+    - commitment-triage
+    - commitment-digest
 ---
 
 # Commitment System Setup

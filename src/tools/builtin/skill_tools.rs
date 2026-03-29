@@ -349,18 +349,84 @@ impl Tool for SkillInstallTool {
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         // Commit the in-memory addition under a brief write lock.
-        let installed_name = {
+        let (installed_name, required_skills) = {
             let mut guard = self
                 .registry
                 .write()
                 .map_err(|e| ToolError::ExecutionFailed(format!("Lock poisoned: {}", e)))?;
+            let reqs = loaded_skill.manifest.effective_requires();
             guard
                 .commit_install(&skill_name, loaded_skill)
                 .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-            skill_name
+            (skill_name, reqs.skills)
         };
 
-        let output = serde_json::json!({
+        // Chain-install missing skill dependencies.
+        let mut chain_installed: Vec<String> = Vec::new();
+        let mut chain_failed: Vec<String> = Vec::new();
+        let mut chain_need_approval: Vec<String> = Vec::new();
+
+        if !required_skills.is_empty() {
+            for dep_name in &required_skills {
+                // Check if already present (read lock)
+                let already_present = {
+                    let guard = self
+                        .registry
+                        .read()
+                        .map_err(|e| ToolError::ExecutionFailed(format!("Lock poisoned: {}", e)))?;
+                    guard.has(dep_name)
+                };
+                if already_present {
+                    continue;
+                }
+
+                // Check if the dependency exists as a local workspace/user skill
+                // that just hasn't been loaded yet — not applicable since discover_all
+                // already loaded everything. So we fetch from catalog.
+                let download_url = ironclaw_skills::catalog::skill_download_url(
+                    self.catalog.registry_url(),
+                    dep_name,
+                );
+                match fetch_skill_content(&download_url).await {
+                    Ok(dep_content) => {
+                        // Hub skills are installed as "Installed" trust (read-only
+                        // tools). We auto-install without approval since the parent
+                        // skill was already approved by the user.
+                        let normalized = ironclaw_skills::normalize_line_endings(&dep_content);
+                        let user_dir = {
+                            let guard = self.registry.read().map_err(|e| {
+                                ToolError::ExecutionFailed(format!("Lock poisoned: {}", e))
+                            })?;
+                            guard.install_target_dir().to_path_buf()
+                        };
+                        match ironclaw_skills::registry::SkillRegistry::prepare_install_to_disk(
+                            &user_dir,
+                            dep_name,
+                            &normalized,
+                        )
+                        .await
+                        {
+                            Ok((name, skill)) => {
+                                let mut guard = self.registry.write().map_err(|e| {
+                                    ToolError::ExecutionFailed(format!("Lock poisoned: {}", e))
+                                })?;
+                                match guard.commit_install(&name, skill) {
+                                    Ok(()) => chain_installed.push(name),
+                                    Err(e) => chain_failed.push(format!("{}: {}", dep_name, e)),
+                                }
+                            }
+                            Err(e) => chain_failed.push(format!("{}: {}", dep_name, e)),
+                        }
+                    }
+                    Err(_) => {
+                        // Could not fetch from catalog — report as needing manual install
+                        chain_need_approval.push(dep_name.clone());
+                    }
+                }
+            }
+        }
+
+        let mut output = serde_json::json!({
             "name": installed_name,
             "status": "installed",
             "trust": "installed",
@@ -369,6 +435,20 @@ impl Tool for SkillInstallTool {
                 installed_name
             ),
         });
+
+        if !chain_installed.is_empty() {
+            output["chain_installed"] = serde_json::json!(chain_installed);
+        }
+        if !chain_failed.is_empty() {
+            output["chain_install_failed"] = serde_json::json!(chain_failed);
+        }
+        if !chain_need_approval.is_empty() {
+            output["missing_dependencies"] = serde_json::json!(chain_need_approval);
+            output["missing_dependencies_message"] = serde_json::json!(format!(
+                "These required skills could not be found in the catalog and need manual installation: {}",
+                chain_need_approval.join(", ")
+            ));
+        }
 
         Ok(ToolOutput::success(output, start.elapsed()))
     }

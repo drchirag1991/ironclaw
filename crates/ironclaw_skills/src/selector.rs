@@ -164,7 +164,9 @@ pub fn apply_confidence_factor(base_score: u32, confidence: f64, is_authored: bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ActivationCriteria, LoadedSkill, SkillManifest, SkillSource, SkillTrust};
+    use crate::types::{
+        ActivationCriteria, GatingRequirements, LoadedSkill, SkillManifest, SkillSource, SkillTrust,
+    };
     use std::path::PathBuf;
 
     fn make_skill(name: &str, keywords: &[&str], tags: &[&str], patterns: &[&str]) -> LoadedSkill {
@@ -187,6 +189,7 @@ mod tests {
                     max_context_tokens: 1000,
                 },
                 credentials: vec![],
+                requires: GatingRequirements::default(),
                 metadata: None,
             },
             prompt_content: "Test prompt".to_string(),

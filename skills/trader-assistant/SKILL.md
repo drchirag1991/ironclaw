@@ -21,14 +21,12 @@ activation:
     - finance
     - setup
   max_context_tokens: 2500
-metadata:
-  openclaw:
-    requires:
-      skills:
-        - commitment-triage
-        - commitment-digest
-        - decision-capture
-        - delegation-tracker
+requires:
+  skills:
+    - commitment-triage
+    - commitment-digest
+    - decision-capture
+    - delegation-tracker
 ---
 
 # Financial Trader — Commitment System Setup

@@ -123,13 +123,60 @@ pub struct SkillManifest {
     /// Parsed at load time; values are never in the LLM context.
     #[serde(default)]
     pub credentials: Vec<SkillCredentialSpec>,
-    /// Optional OpenClaw metadata.
+    /// Gating requirements (binaries, env vars, config files, companion skills).
+    /// Top-level field — preferred over the legacy `metadata.openclaw.requires` path.
+    #[serde(default)]
+    pub requires: GatingRequirements,
+    /// Optional metadata (legacy; new skills should use top-level `requires` instead).
     #[serde(default)]
     pub metadata: Option<SkillMetadata>,
 }
 
 fn default_version() -> String {
     "0.0.0".to_string()
+}
+
+impl SkillManifest {
+    /// Return the effective gating requirements, merging the top-level `requires`
+    /// field with the legacy `metadata.openclaw.requires` path.
+    ///
+    /// Top-level fields take precedence when both are populated; legacy fields
+    /// are appended for any category that is empty at the top level.
+    pub fn effective_requires(&self) -> GatingRequirements {
+        let legacy = self
+            .metadata
+            .as_ref()
+            .and_then(|m| m.openclaw.as_ref())
+            .map(|oc| &oc.requires);
+
+        let Some(legacy) = legacy else {
+            return self.requires.clone();
+        };
+
+        // Merge: use top-level if non-empty, otherwise fall back to legacy.
+        GatingRequirements {
+            bins: if self.requires.bins.is_empty() {
+                legacy.bins.clone()
+            } else {
+                self.requires.bins.clone()
+            },
+            env: if self.requires.env.is_empty() {
+                legacy.env.clone()
+            } else {
+                self.requires.env.clone()
+            },
+            config: if self.requires.config.is_empty() {
+                legacy.config.clone()
+            } else {
+                self.requires.config.clone()
+            },
+            skills: if self.requires.skills.is_empty() {
+                legacy.skills.clone()
+            } else {
+                self.requires.skills.clone()
+            },
+        }
+    }
 }
 
 /// Optional metadata section in SKILL.md frontmatter.
@@ -471,6 +518,7 @@ metadata:
                 description: String::new(),
                 activation: ActivationCriteria::default(),
                 credentials: vec![],
+                requires: GatingRequirements::default(),
                 metadata: None,
             },
             prompt_content: "test prompt".to_string(),

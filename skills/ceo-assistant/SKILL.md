@@ -21,15 +21,13 @@ activation:
     - delegation
     - setup
   max_context_tokens: 2000
-metadata:
-  openclaw:
-    requires:
-      skills:
-        - commitment-triage
-        - commitment-digest
-        - decision-capture
-        - delegation-tracker
-        - idea-parking
+requires:
+  skills:
+    - commitment-triage
+    - commitment-digest
+    - decision-capture
+    - delegation-tracker
+    - idea-parking
 ---
 
 # CEO / Manager — Commitment System Setup

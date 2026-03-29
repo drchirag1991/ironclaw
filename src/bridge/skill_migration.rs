@@ -138,6 +138,7 @@ mod tests {
                     ..Default::default()
                 },
                 credentials: vec![],
+                requires: ironclaw_skills::GatingRequirements::default(),
                 metadata: None,
             },
             prompt_content: content.to_string(),
