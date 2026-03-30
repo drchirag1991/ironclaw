@@ -117,7 +117,7 @@ impl Guest for WechatChannel {
                     return;
                 }
 
-                if response.ret.unwrap_or(0) != 0 {
+                if !matches!(response.ret, Some(0)) {
                     let errmsg = response
                         .errmsg
                         .as_deref()
@@ -429,7 +429,7 @@ fn collect_follow_up_bundles(
             break;
         }
 
-        if response.ret.unwrap_or(0) != 0 {
+        if !matches!(response.ret, Some(0)) {
             let errmsg = response
                 .errmsg
                 .as_deref()
@@ -748,7 +748,7 @@ fn resolve_typing_ticket(
     }
 
     let response = api::get_config(config, user_id, context_token)?;
-    if response.ret.unwrap_or(0) != 0 {
+    if !matches!(response.ret, Some(0)) {
         let errmsg = response
             .errmsg
             .as_deref()

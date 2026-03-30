@@ -265,7 +265,7 @@ pub fn send_typing(
     let parsed: SendTypingResponse = serde_json::from_slice(&response.body)
         .map_err(|e| format!("Failed to parse sendTyping response: {e}"))?;
 
-    if parsed.ret.unwrap_or(0) != 0 {
+    if !matches!(parsed.ret, Some(0)) {
         let errmsg = parsed
             .errmsg
             .as_deref()
