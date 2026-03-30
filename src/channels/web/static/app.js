@@ -300,6 +300,43 @@ function apiFetch(path, options) {
 let isRestarting = false; // Track if we're currently restarting
 let restartEnabled = false; // Track if restart is available in this deployment
 
+const TELEGRAM_BOT_TOKEN_RE = /^\d{6,}:[A-Za-z0-9_-]{20,}$/;
+
+function detectSensitiveChatCredential(value) {
+  const trimmed = (value || '').trim();
+  if (TELEGRAM_BOT_TOKEN_RE.test(trimmed)) {
+    return { kind: 'telegram_bot_token', extensionName: 'telegram' };
+  }
+  return null;
+}
+
+function getOptimisticUserMessageContent(content) {
+  const credential = detectSensitiveChatCredential(content);
+  if (credential && credential.kind === 'telegram_bot_token') {
+    return '[Telegram bot token redacted]';
+  }
+  return content;
+}
+
+function redactLastSensitiveUserMessage(credential) {
+  if (!credential) return;
+  const messages = document.querySelectorAll('#chat-messages .message.user');
+  if (messages.length === 0) return;
+  const last = messages[messages.length - 1];
+  const currentCopyText = last.getAttribute('data-copy-text') || '';
+  const currentText = (last.innerText || '').trim();
+  const looksSensitive =
+    currentCopyText === '[Telegram bot token redacted]'
+    || TELEGRAM_BOT_TOKEN_RE.test(currentCopyText)
+    || TELEGRAM_BOT_TOKEN_RE.test(currentText);
+  if (!looksSensitive) return;
+
+  const replacement = '[Telegram bot token redacted]';
+  const content = last.querySelector('.message-content');
+  if (content) content.textContent = replacement;
+  last.setAttribute('data-copy-text', replacement);
+}
+
 function triggerRestart() {
   if (!currentThreadId) {
     alert(I18n.t('error.startConversation'));
@@ -756,7 +793,8 @@ function sendMessage() {
   const content = input.value.trim();
   if (!content && stagedImages.length === 0) return;
 
-  const userMsg = addMessage('user', content || '(images attached)');
+  const optimisticUserContent = content ? getOptimisticUserMessageContent(content) : content;
+  const userMsg = addMessage('user', optimisticUserContent || '(images attached)');
   input.value = '';
   autoResizeTextarea(input);
   input.focus();
@@ -1517,6 +1555,9 @@ function showJobCard(data) {
 // --- Auth card ---
 
 function handleAuthRequired(data) {
+  if (!data.auth_url && data.extension_name === 'telegram') {
+    redactLastSensitiveUserMessage({ kind: 'telegram_bot_token', extensionName: 'telegram' });
+  }
   if (data.auth_url) {
     setAuthFlowPending(true, data.instructions);
     // OAuth flow: show the global auth prompt with an OAuth button + optional token paste field.

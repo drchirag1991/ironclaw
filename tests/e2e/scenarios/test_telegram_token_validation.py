@@ -9,7 +9,7 @@ UI can accept Telegram tokens with colons and renders correctly.
 
 import json
 
-from helpers import SEL
+from helpers import SEL, api_get
 
 
 # ─── Fixture data ─────────────────────────────────────────────────────────────
@@ -170,3 +170,61 @@ async def test_telegram_token_with_underscores_and_hyphens(page):
     assert entered_value == token_value
     assert "-" in entered_value
     assert "_" in entered_value
+
+
+async def test_pasted_telegram_token_redirects_to_secure_setup_without_history_leak(
+    page, ironclaw_server
+):
+    """Pasting a Telegram bot token into chat opens secure setup and avoids history leaks."""
+    setup_requests = []
+
+    async def handle_setup(route):
+        setup_requests.append(route.request.method)
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"secrets": _TELEGRAM_SECRETS}),
+        )
+
+    await page.route("**/api/extensions/telegram/setup", handle_setup)
+
+    token_value = "123456789:AABBccDDeeFFgg_Test-Token"
+    chat_input = page.locator(SEL["chat_input"])
+    await chat_input.wait_for(state="visible", timeout=5000)
+    await chat_input.fill(token_value)
+    await chat_input.press("Enter")
+
+    modal = page.locator(SEL["configure_modal"])
+    await modal.wait_for(state="visible", timeout=8000)
+    assert setup_requests, "Telegram secure setup modal was not requested"
+
+    user_msg = page.locator(SEL["message_user"]).last
+    await user_msg.wait_for(state="visible", timeout=5000)
+    user_text = await user_msg.text_content()
+    assert "redacted" in user_text.lower()
+    assert token_value not in user_text
+
+    assistant_msg = page.locator(SEL["message_assistant"]).last
+    await assistant_msg.wait_for(state="visible", timeout=8000)
+    assistant_text = await assistant_msg.text_content()
+    assert "secure telegram setup flow" in assistant_text.lower()
+
+    thread_id = await page.evaluate("currentThreadId")
+    history = await api_get(
+        ironclaw_server,
+        f"/api/chat/history?limit=50&thread_id={thread_id}",
+    )
+    assert history.status_code == 200
+    history_data = history.json()
+    assert token_value not in json.dumps(history_data)
+    assert history_data["turns"] == [], history_data
+
+    await page.evaluate("loadHistory()")
+    await page.wait_for_function(
+        """token => {
+            const chat = document.querySelector('#chat-messages');
+            return !!chat && !(chat.innerText || '').includes(token);
+        }""",
+        token_value,
+        timeout=8000,
+    )
