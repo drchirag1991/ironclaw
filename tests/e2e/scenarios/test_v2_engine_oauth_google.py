@@ -561,17 +561,12 @@ async def test_api_key_then_api_call(v2_google_server, mock_google_api):
         t.get("response", "") for t in history.get("turns", [])
     ).lower()
 
-    token_success = (
-        test_token in tokens_data.get("tokens", [])
-        or "stored" in all_responses
-        or "retrying" in all_responses
-        or "budget" in all_responses  # file name from mock
-        or "meeting" in all_responses  # file name from mock
-    )
-    assert token_success, (
-        f"Token should be stored and retry should succeed.\n"
-        f"Mock API received tokens: {tokens_data.get('tokens', [])}\n"
-        f"Responses: {all_responses[:800]}"
+    # The token MUST be received by the mock API
+    assert test_token in tokens_data.get("tokens", []), (
+        f"Token MUST be received by mock API after auth flow.\n"
+        f"Expected: {test_token}\n"
+        f"Mock API tokens: {tokens_data.get('tokens', [])}\n"
+        f"Responses: {all_responses[:500]}"
     )
 
 

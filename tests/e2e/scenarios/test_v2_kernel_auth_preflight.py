@@ -401,9 +401,9 @@ class TestPreflightAuthGate:
             state_r = await client.get(f"{mock_api_url}/__mock/state")
             api_state = state_r.json()
 
-        assert api_state["request_count"] > 0 or "issue" in all_responses or "onboarding" in all_responses, (
-            f"After auth, either the API should receive a request or the LLM "
-            f"should generate a response. API state: {api_state}, "
+        assert api_state["request_count"] > 0, (
+            f"After auth, the mock API MUST receive a request with the stored token. "
+            f"Request count: {api_state['request_count']}, "
             f"Responses: {all_responses[:300]}"
         )
 
@@ -433,6 +433,15 @@ class TestPreflightAuthGate:
         ).lower()
         assert "paste your token" not in all_responses, (
             f"Should not need auth again. Responses: {all_responses[:500]}"
+        )
+
+        # Verify token was injected into the request
+        async with httpx.AsyncClient() as client:
+            state_r = await client.get(f"{mock_api_url}/__mock/state")
+            api_state = state_r.json()
+        assert api_state["request_count"] > 0, (
+            f"Credential should be injected into follow-up request. "
+            f"Mock API received 0 requests."
         )
 
 

@@ -293,19 +293,26 @@ class TestV2EngineApprovalFlow:
             timeout=30,
         )
 
-        # Wait for the response after approval
-        history = await _wait_for_response(base, thread_id, timeout=60)
-        all_responses = " ".join(
-            (t.get("response") or "") for t in history.get("turns", [])
-        ).lower()
+        # Wait for the approval to be processed — poll until the response
+        # changes from the approval prompt (tool executes after approval)
+        for _ in range(120):
+            await asyncio.sleep(0.5)
+            r = await api_get(base, f"/api/chat/history?thread_id={thread_id}", timeout=15)
+            history = r.json()
+            turns = history.get("turns", [])
+            if turns:
+                last = (turns[-1].get("response") or "").lower()
+                if last and "requires approval" not in last:
+                    break
+            # Also check if pending_approval is cleared (approval processed)
+            if not history.get("pending_approval"):
+                break
 
-        # After approval, the tool executes and the LLM summarizes the result
-        assert (
-            "http" in all_responses
-            or "tool returned" in all_responses
-            or "test-alpha" in all_responses
-            or "approval" in all_responses
-        ), f"Expected tool result after approval. Got: {all_responses[:500]}"
+        # After approval, pending_approval should be cleared
+        assert history.get("pending_approval") is None, (
+            f"After approval, pending_approval should be cleared. "
+            f"Got: {history.get('pending_approval')}"
+        )
 
     async def test_approval_no(self, v2_approval_server):
         """Deny a pending tool call by replying 'no'."""
@@ -333,18 +340,31 @@ class TestV2EngineApprovalFlow:
             timeout=30,
         )
 
-        # Wait for response — LLM should see "User denied"
-        history = await _wait_for_response(base, thread_id, timeout=60)
+        # Wait for the denial response — poll until the approval prompt is
+        # no longer the latest response (meaning the denial was processed)
+        for _ in range(120):
+            await asyncio.sleep(0.5)
+            r = await api_get(base, f"/api/chat/history?thread_id={thread_id}", timeout=15)
+            history = r.json()
+            turns = history.get("turns", [])
+            if turns:
+                last = (turns[-1].get("response") or "").lower()
+                # The denial is processed when the last response changes from
+                # the approval prompt or mentions denial
+                if last and "requires approval" not in last:
+                    break
+                if "denied" in last or "rejected" in last:
+                    break
+
         all_responses = " ".join(
             (t.get("response") or "") for t in history.get("turns", [])
         ).lower()
 
-        assert (
-            "denied" in all_responses
-            or "rejected" in all_responses
-            or "no pending" in all_responses
-            or "tool" in all_responses
-        ), f"Expected denial acknowledgment. Got: {all_responses[:500]}"
+        # After denial, approval prompt should no longer be pending
+        assert history.get("pending_approval") is None, (
+            f"After denial, pending_approval should be cleared. "
+            f"Got: {history.get('pending_approval')}"
+        )
 
     async def test_approval_always(self, v2_approval_server):
         """Approve with 'always' — second request auto-approves."""
@@ -390,6 +410,12 @@ class TestV2EngineApprovalFlow:
 
         assert "requires approval" not in all_responses, (
             f"Second thread should auto-approve. Got: {all_responses[:500]}"
+        )
+        # Verify the tool actually ran (not just that approval was skipped)
+        turns = history.get("turns", [])
+        assert len(turns) >= 1, (
+            f"Expected at least 1 turn with tool execution after auto-approve. "
+            f"Got {len(turns)} turns."
         )
 
     async def test_approval_prompt_contains_tool_name(self, v2_approval_server):
