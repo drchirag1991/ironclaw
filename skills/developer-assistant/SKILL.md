@@ -39,11 +39,15 @@ requires:
     - project-setup
     - github
     - github-workflow
+    - security-review
+    - qa-review
+    - review-readiness
+    - product-prioritization
 ---
 
 # Developer Workflow Setup
 
-You are configuring the full developer workflow — commitment tracking, GitHub automation, tech debt tracking, and proactive briefings across multiple repositories.
+You are configuring the full developer workflow — commitment tracking, GitHub automation, tech debt tracking, security/QA reviews, product prioritization, and proactive briefings across multiple repositories.
 
 ## Companion skills
 
@@ -58,6 +62,10 @@ These activate during conversation via keyword matching:
 | `idea-parking` | "park this idea" | Saves for later |
 | `tech-debt-tracker` | "this is a hack", "refactor later" | Tracks tech debt, resurfaces weekly |
 | `project-setup` | "add repo owner/repo" | Adds a new project with workflow |
+| `security-review` | "security review", "check for vulnerabilities" | OWASP audit, auto-fix obvious issues |
+| `qa-review` | "QA review", "test coverage", "edge cases" | Test plans, coverage gaps, regression risks |
+| `review-readiness` | "ready to merge?", "PR readiness" | Tracks which reviews are complete per branch |
+| `product-prioritization` | "what to build next", "prioritize" | Evidence-based feature scoring, demand analysis |
 | `github` | GitHub API operations | REST API with credential injection |
 | `github-workflow` | Workflow automation reference | Issue-to-merge pipeline templates |
 | `review-checklist` | Pre-merge review | 55+ verification items |
@@ -155,7 +163,7 @@ mission_create(
 ```
 memory_write(
   target: "commitments/calibration.md",
-  content: "# Developer Calibration\n\n- Group digest by repo for CI/PR status, by action type for commitments\n- CI failures on user's own PRs = prompt urgency — surface within the hour\n- Production/hotfix/critical labels = realtime — broadcast immediately\n- PR review requests = batch urgency unless from team lead or marked urgent\n- AI agent PRs grouped separately in digest with shorter stale threshold (1 day vs 3)\n- Tech debt captured passively from conversation AND from merged PR review comments\n- PR review comments matching 'address in follow-up', 'not blocking but fix', 'TODO later', 'leaving for now' → auto-create tech-debt items\n- Architecture/API design decisions = high-confidence capture; debugging 'let's try X' = not a decision\n- Most developer commitments are personal tasks, not delegations — default owner=user\n- Projects tracked in projects/<slug>/project.md — triage and digest read all tracked projects\n- For complex tasks or large tech debt items, suggest plan mode for structured execution\n- Weekly retro writes to context/intel/ as durable intelligence for pattern recognition\n- Start conservative: surface everything, don't auto-promote signals or auto-dispatch without approval",
+  content: "# Developer Calibration\n\n## Decision classification\n- mechanical (auto-act silently): expire stale signals, update CI status, dismiss noise, mark passing checks\n- taste (auto-act, surface in digest): auto-dismiss FYI signals, auto-resolve completed items, update readiness dashboard\n- challenge (always ask): architecture decisions, sending messages to people, merging PRs, deleting branches, any irreversible action\n\n## Effort principle\n- AI makes completeness cheap — when the thorough implementation costs minutes more than the shortcut, always do the thorough thing\n- Always show dual effort estimates when known: human time vs AI-assisted time\n- This reframes prioritization: features that seem expensive may be cheap with AI\n\n## Signal urgency\n- CI failures on user's own PRs = prompt urgency — surface within the hour\n- Production/hotfix/critical labels = realtime — broadcast immediately\n- PR review requests = batch urgency unless from team lead or marked urgent\n- Security P1 findings = realtime\n- AI agent PRs grouped separately in digest with shorter stale threshold (1 day vs 3)\n\n## Tech debt\n- Captured passively from conversation AND from merged PR review comments\n- PR review comments matching 'address in follow-up', 'not blocking but fix', 'TODO later', 'leaving for now' → auto-create tech-debt items\n\n## Reviews\n- Track review readiness per branch in projects/<slug>/readiness/\n- Before merge, check: code review + tests + security + QA. Surface gaps in digest.\n- Security and QA reviews can be run with /security-review and /qa-review\n- Obvious security/QA fixes are auto-applied; ambiguous ones always ask\n\n## Product\n- Feature prioritization uses evidence-based scoring: demand × 3 + impact × 2 + alignment / effort\n- Challenge assumptions — 'I think users want X' requires evidence\n- Use /product-prioritization for structured analysis\n\n## General\n- Architecture/API design decisions = high-confidence capture; debugging 'let's try X' = not a decision\n- Most developer commitments are personal tasks, not delegations — default owner=user\n- Projects tracked in projects/<slug>/project.md\n- For complex tasks, suggest /plan for structured execution\n- Weekly retro writes to context/intel/ as durable intelligence\n- Start conservative: surface everything, earn trust through feedback",
   append: false
 )
 ```
@@ -182,6 +190,9 @@ Tell the user:
 > - **"show commitments"** — current status
 > - **"show tech debt"** — debt backlog
 > - **"add repo owner/repo"** — add another project
-> - **`/plan <description>`** — create a structured execution plan for complex tasks
-> - **`/commitment-digest`** — force a digest now
-> - **`/tech-debt-tracker`** — force tech debt review
+> - **"is this PR ready?"** — review readiness dashboard
+> - **"what should we build next?"** — evidence-based prioritization
+> - **`/security-review`** — run security audit on current changes
+> - **`/qa-review`** — generate test plan and coverage analysis
+> - **`/plan <description>`** — structured execution plan for complex tasks
+> - **`/product-prioritization`** — score and rank features by demand

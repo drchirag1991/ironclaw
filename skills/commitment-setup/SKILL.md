@@ -96,6 +96,9 @@ Tracks obligations, decisions, and ideas via structured markdown files.
     owner: user | agent
     delegated_to: null | <person or team>
     resolution_path: agent_can_handle | needs_reply | needs_decision | note_only
+    decision_type: mechanical | taste | challenge
+    effort_human: <estimate> | null
+    effort_assisted: <estimate> | null
     source_signal: <relative path> | null
     resolved_by: null | agent | user | delegate | expired
     tags: [<freeform>]
@@ -116,11 +119,24 @@ Tracks obligations, decisions, and ideas via structured markdown files.
 - needs_decision: user must choose between options
 - note_only: informational, no action needed but tracked
 
+### Decision types (when to ask the user)
+- mechanical: auto-act silently (expire stale signal, update status, dismiss noise). Report in digest as "auto-handled."
+- taste: auto-act but surface for awareness ("I auto-dismissed 3 FYI signals, auto-resolved 2 completed items"). User can override.
+- challenge: always ask the user before acting (architecture decisions, sending messages, spending money, irreversible actions).
+
+### Effort estimates
+When known, include dual estimates:
+- effort_human: time without AI assistance (e.g. "2h", "3d")
+- effort_assisted: time with AI assistance (e.g. "15min", "2h")
+This reframes decisions — when AI makes completeness cheap, there is no excuse for shortcuts.
+
 ### Autonomous resolution
-When a commitment has resolution_path=agent_can_handle and the user approves:
-1. Agent spawns a mission for complex work, or handles inline for simple tasks
-2. Status transitions to in_progress
-3. On completion, status transitions to resolved with resolved_by=agent
+When a commitment has resolution_path=agent_can_handle and decision_type=mechanical or taste:
+1. Agent handles it and reports in the next digest
+When decision_type=challenge:
+1. Agent asks for explicit approval before acting
+2. On approval, spawns a mission for complex work or handles inline
+3. Status transitions to in_progress, then resolved with resolved_by=agent
 
 ## Decision Schema (decisions/<date>-<slug>.md)
 
