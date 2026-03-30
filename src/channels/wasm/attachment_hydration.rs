@@ -3,6 +3,7 @@ use std::time::Duration;
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
 use base64::Engine as _;
+use futures::StreamExt;
 use serde::Deserialize;
 use silk_rs::decode_silk;
 
@@ -131,12 +132,26 @@ async fn download_wechat_attachment_bytes(
             response.status()
         ));
     }
+    if let Some(content_length) = response.content_length()
+        && content_length > MAX_ATTACHMENT_BYTES as u64
+    {
+        return Err(format!(
+            "WeChat attachment exceeds {MAX_ATTACHMENT_BYTES} bytes"
+        ));
+    }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read WeChat CDN response body: {e}"))?
-        .to_vec();
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Failed to read WeChat CDN response body: {e}"))?;
+        let next_len = bytes.len().saturating_add(chunk.len());
+        if next_len > MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "WeChat attachment exceeds {MAX_ATTACHMENT_BYTES} bytes"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
 
     if bytes.is_empty() {
         return Err("WeChat CDN download returned an empty body".to_string());

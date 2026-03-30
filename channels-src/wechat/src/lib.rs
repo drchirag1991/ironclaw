@@ -40,6 +40,16 @@ enum WechatStatusAction {
 
 struct WechatChannel;
 
+struct FollowUpState<'a> {
+    current_cursor: &'a mut String,
+    context_tokens: &'a mut std::collections::HashMap<String, String>,
+    context_tokens_changed: &'a mut bool,
+    pending_inbound: &'a mut std::collections::HashMap<String, PendingInboundBundle>,
+    pending_inbound_changed: &'a mut bool,
+    processed_message_ids: &'a mut Vec<i64>,
+    processed_message_ids_changed: &'a mut bool,
+}
+
 impl Guest for WechatChannel {
     fn on_start(config_json: String) -> Result<ChannelConfig, String> {
         let config = serde_json::from_str::<WechatConfig>(&config_json)
@@ -199,16 +209,15 @@ impl Guest for WechatChannel {
                     }
                 }
 
-                collect_follow_up_bundles(
-                    &config,
-                    &mut current_cursor,
-                    &mut context_tokens,
-                    &mut context_tokens_changed,
-                    &mut pending_inbound,
-                    &mut pending_inbound_changed,
-                    &mut processed_message_ids,
-                    &mut processed_message_ids_changed,
-                );
+                collect_follow_up_bundles(&config, FollowUpState {
+                    current_cursor: &mut current_cursor,
+                    context_tokens: &mut context_tokens,
+                    context_tokens_changed: &mut context_tokens_changed,
+                    pending_inbound: &mut pending_inbound,
+                    pending_inbound_changed: &mut pending_inbound_changed,
+                    processed_message_ids: &mut processed_message_ids,
+                    processed_message_ids_changed: &mut processed_message_ids_changed,
+                });
 
                 for bundle in
                     take_due_pending_bundles(&mut pending_inbound, channel_host::now_millis())
@@ -396,19 +405,10 @@ fn process_incoming_bundle(
     }
 }
 
-fn collect_follow_up_bundles(
-    config: &WechatConfig,
-    current_cursor: &mut String,
-    context_tokens: &mut std::collections::HashMap<String, String>,
-    context_tokens_changed: &mut bool,
-    pending_inbound: &mut std::collections::HashMap<String, PendingInboundBundle>,
-    pending_inbound_changed: &mut bool,
-    processed_message_ids: &mut Vec<i64>,
-    processed_message_ids_changed: &mut bool,
-) {
-    while !pending_inbound.is_empty() {
+fn collect_follow_up_bundles(config: &WechatConfig, state: FollowUpState<'_>) {
+    while !state.pending_inbound.is_empty() {
         let now_ms = channel_host::now_millis();
-        let Some(timeout_ms) = next_follow_up_timeout_ms(pending_inbound, now_ms) else {
+        let Some(timeout_ms) = next_follow_up_timeout_ms(state.pending_inbound, now_ms) else {
             break;
         };
         if timeout_ms == 0 {
@@ -416,7 +416,8 @@ fn collect_follow_up_bundles(
         }
 
         let timeout_ms_u32 = timeout_ms.min(u64::from(u32::MAX)) as u32;
-        let response = match api::get_updates_with_timeout(config, current_cursor, timeout_ms_u32) {
+        let response =
+            match api::get_updates_with_timeout(config, state.current_cursor, timeout_ms_u32) {
             Ok(response) => response,
             Err(_) => break,
         };
@@ -444,8 +445,8 @@ fn collect_follow_up_bundles(
         }
 
         if let Some(next_cursor) = response.get_updates_buf.as_deref() {
-            if next_cursor != current_cursor {
-                *current_cursor = next_cursor.to_string();
+            if next_cursor != state.current_cursor {
+                *state.current_cursor = next_cursor.to_string();
                 if let Err(error) = persist_get_updates_buf(next_cursor) {
                     channel_host::log(
                         channel_host::LogLevel::Warn,
@@ -459,32 +460,33 @@ fn collect_follow_up_bundles(
         for message in response.msgs {
             let message_id = message.message_id;
             if let Some(message_id) = message_id {
-                if has_processed_message_id(processed_message_ids, message_id) {
+                if has_processed_message_id(state.processed_message_ids, message_id) {
                     continue;
                 }
             }
             if let Some(from_user_id) = message.from_user_id.as_deref() {
                 if let Some(context_token) = message.context_token.as_deref() {
-                    let changed = context_tokens
+                    let changed = state
+                        .context_tokens
                         .insert(from_user_id.to_string(), context_token.to_string())
                         .as_deref()
                         != Some(context_token);
-                    *context_tokens_changed |= changed;
+                    *state.context_tokens_changed |= changed;
                 }
             }
             match incoming_bundle_from_message(config, message) {
                 Ok(Some(bundle)) => {
                     let bundle_message_id = bundle.message_id;
                     let emitted = process_incoming_bundle(
-                        pending_inbound,
+                        state.pending_inbound,
                         bundle,
-                        pending_inbound_changed,
+                        state.pending_inbound_changed,
                         channel_host::now_millis(),
                         u64::from(config.inbound_merge_window_ms),
                     );
                     if let Some(message_id) = bundle_message_id {
-                        *processed_message_ids_changed |= remember_processed_message_id(
-                            processed_message_ids,
+                        *state.processed_message_ids_changed |= remember_processed_message_id(
+                            state.processed_message_ids,
                             message_id,
                             MAX_PROCESSED_MESSAGE_IDS,
                         );
@@ -496,8 +498,8 @@ fn collect_follow_up_bundles(
                 }
                 Ok(None) => {
                     if let Some(message_id) = message_id {
-                        *processed_message_ids_changed |= remember_processed_message_id(
-                            processed_message_ids,
+                        *state.processed_message_ids_changed |= remember_processed_message_id(
+                            state.processed_message_ids,
                             message_id,
                             MAX_PROCESSED_MESSAGE_IDS,
                         );
@@ -512,7 +514,7 @@ fn collect_follow_up_bundles(
             }
         }
 
-        if !saw_relevant_message && pending_inbound.is_empty() {
+        if !saw_relevant_message && state.pending_inbound.is_empty() {
             break;
         }
     }

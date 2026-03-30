@@ -34,23 +34,17 @@ fn requires_preexisting_uuid_thread(channel: &str) -> bool {
 fn validate_inbound_text_for_message(
     safety: &crate::safety::SafetyLayer,
     content: &str,
-    attachments: &[crate::channels::IncomingAttachment],
 ) -> crate::safety::ValidationResult {
-    if content.trim().is_empty() && !attachments.is_empty() {
-        crate::safety::ValidationResult::ok()
-    } else {
-        safety.validate_input(content)
-    }
+    safety.validate_input(content)
 }
 
 impl Agent {
     fn reject_unsafe_inbound_user_message(
         &self,
         message: &IncomingMessage,
-        content: &str,
+        effective_content: &str,
     ) -> Option<SubmissionResult> {
-        let validation =
-            validate_inbound_text_for_message(self.safety(), content, &message.attachments);
+        let validation = validate_inbound_text_for_message(self.safety(), effective_content);
         if !validation.is_valid {
             let details = validation
                 .errors
@@ -63,7 +57,7 @@ impl Agent {
             )));
         }
 
-        let violations = self.safety().check_policy(content);
+        let violations = self.safety().check_policy(effective_content);
         if violations
             .iter()
             .any(|rule| rule.action == crate::safety::PolicyAction::Block)
@@ -71,7 +65,7 @@ impl Agent {
             return Some(SubmissionResult::error("Input rejected by safety policy."));
         }
 
-        if let Some(warning) = self.safety().scan_inbound_for_secrets(content) {
+        if let Some(warning) = self.safety().scan_inbound_for_secrets(effective_content) {
             tracing::warn!(
                 user = %message.user_id,
                 channel = %message.channel,
@@ -238,6 +232,13 @@ impl Agent {
             "Processing user input"
         );
 
+        let augmented =
+            crate::agent::attachments::augment_with_attachments(content, &message.attachments);
+        let (effective_content, image_parts) = match &augmented {
+            Some(result) => (result.text.as_str(), result.image_parts.clone()),
+            None => (content, Vec::new()),
+        };
+
         // First check thread state without holding lock during I/O
         let (thread_state, approval_context) = {
             let sess = session.lock().await;
@@ -280,7 +281,7 @@ impl Agent {
                         // Run the same safety checks that the normal path applies
                         // so blocked content is never stored in pending_messages.
                         if let Some(rejection) =
-                            self.reject_unsafe_inbound_user_message(message, content)
+                            self.reject_unsafe_inbound_user_message(message, effective_content)
                         {
                             return Ok(rejection);
                         }
@@ -337,9 +338,10 @@ impl Agent {
         }
 
         // Validate inbound content before the turn is created. Attachment-only
-        // messages are allowed to pass through so multimodal channels can send
-        // an empty text body alongside real image/document payloads.
-        if let Some(rejection) = self.reject_unsafe_inbound_user_message(message, content) {
+        // messages are checked after attachment augmentation so extracted text
+        // and multimodal metadata go through the same safety pipeline.
+        if let Some(rejection) = self.reject_unsafe_inbound_user_message(message, effective_content)
+        {
             return Ok(rejection);
         }
 
@@ -410,14 +412,6 @@ impl Agent {
                 format!("Before turn {}", thread.turn_number()),
             );
         }
-
-        // Augment content with attachment context (transcripts, metadata, images)
-        let augmented =
-            crate::agent::attachments::augment_with_attachments(content, &message.attachments);
-        let (effective_content, image_parts) = match &augmented {
-            Some(result) => (result.text.as_str(), result.image_parts.clone()),
-            None => (content, Vec::new()),
-        };
 
         // Start the turn and get messages
         let turn_messages = {
@@ -2109,7 +2103,7 @@ mod tests {
             injection_check_enabled: true,
         });
 
-        let result = validate_inbound_text_for_message(&safety, "", &[]);
+        let result = validate_inbound_text_for_message(&safety, "");
         assert!(!result.is_valid);
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].field, "input");
@@ -2117,7 +2111,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_inbound_text_allows_empty_text_when_attachments_exist() {
+    fn test_validate_inbound_text_accepts_augmented_attachment_content() {
         let safety = SafetyLayer::new(&SafetyConfig {
             max_output_length: 10_000,
             injection_check_enabled: true,
@@ -2136,7 +2130,9 @@ mod tests {
             duration_secs: None,
         }];
 
-        let result = validate_inbound_text_for_message(&safety, "", &attachments);
+        let augmented = crate::agent::attachments::augment_with_attachments("", &attachments)
+            .expect("attachments should augment content");
+        let result = validate_inbound_text_for_message(&safety, &augmented.text);
         assert!(result.is_valid);
         assert!(result.errors.is_empty());
     }

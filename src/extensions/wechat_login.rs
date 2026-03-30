@@ -17,7 +17,7 @@ const LOGIN_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const QR_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(35);
 const QR_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_QR_REFRESH_COUNT: u8 = 3;
-const WECHAT_ALLOWED_LOGIN_BASE_DOMAINS: &[&str] = &["weixin.qq.com", "wechat.com"];
+const WECHAT_ALLOWED_LOGIN_HOST: &str = "ilinkai.weixin.qq.com";
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingWechatLogin {
@@ -63,12 +63,6 @@ struct QrStatusResponse {
     baseurl: Option<String>,
 }
 
-fn is_allowed_wechat_login_host(host: &str) -> bool {
-    WECHAT_ALLOWED_LOGIN_BASE_DOMAINS
-        .iter()
-        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
-}
-
 fn validate_wechat_login_base_url(raw: &str) -> Result<String, ExtensionError> {
     // Trust model: WeChat QR login trusts the system CA store for HTTPS validation
     // to allowed WeChat domains. We do not certificate-pin iLink endpoints.
@@ -102,13 +96,13 @@ fn validate_wechat_login_base_url(raw: &str) -> Result<String, ExtensionError> {
             "WeChat login returned a base URL without a host".to_string(),
         ));
     };
-    if !is_allowed_wechat_login_host(host) {
+    if host != WECHAT_ALLOWED_LOGIN_HOST {
         return Err(ExtensionError::AuthFailed(format!(
             "WeChat login returned an untrusted base URL host: {host}"
         )));
     }
 
-    Ok(format!("https://{host}"))
+    Ok(format!("https://{WECHAT_ALLOWED_LOGIN_HOST}"))
 }
 
 pub(crate) fn interactive_login_info() -> InteractiveLoginInfo {

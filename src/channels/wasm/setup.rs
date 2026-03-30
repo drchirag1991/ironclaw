@@ -434,32 +434,41 @@ async fn inject_channel_secrets_into_config(
     };
 
     for &(config_key, secret_name) in secret_config_mappings {
-        match secrets.get_decrypted(owner_id, secret_name).await {
-            Ok(decrypted) => {
-                config_updates.insert(
-                    config_key.to_string(),
-                    serde_json::Value::String(decrypted.expose().to_string()),
-                );
-                tracing::debug!(
-                    channel = %channel_name,
-                    config_key = %config_key,
-                    "Injected secret into channel config"
-                );
-            }
-            Err(_) => {
-                // Also try environment variable fallback.
-                let env_name = secret_name.to_uppercase();
-                if let Ok(val) = std::env::var(&env_name)
-                    && !val.is_empty()
-                {
-                    config_updates.insert(config_key.to_string(), serde_json::Value::String(val));
-                    tracing::debug!(
-                        channel = %channel_name,
-                        config_key = %config_key,
-                        "Injected secret from env into channel config"
-                    );
-                }
-            }
+        let decrypted = match secrets.get_decrypted(owner_id, secret_name).await {
+            Ok(decrypted) => Some((decrypted, false)),
+            Err(_) if owner_id != "default" => secrets
+                .get_decrypted("default", secret_name)
+                .await
+                .ok()
+                .map(|decrypted| (decrypted, true)),
+            Err(_) => None,
+        };
+
+        if let Some((decrypted, used_default_fallback)) = decrypted {
+            config_updates.insert(
+                config_key.to_string(),
+                serde_json::Value::String(decrypted.expose().to_string()),
+            );
+            tracing::debug!(
+                channel = %channel_name,
+                config_key = %config_key,
+                used_default_fallback,
+                "Injected secret into channel config"
+            );
+            continue;
+        }
+
+        // Also try environment variable fallback.
+        let env_name = secret_name.to_uppercase();
+        if let Ok(val) = std::env::var(&env_name)
+            && !val.is_empty()
+        {
+            config_updates.insert(config_key.to_string(), serde_json::Value::String(val));
+            tracing::debug!(
+                channel = %channel_name,
+                config_key = %config_key,
+                "Injected secret from env into channel config"
+            );
         }
     }
 }
@@ -508,6 +517,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::db::{Database, SettingsStore};
+    use crate::secrets::{CreateSecretParams, SecretsStore};
+    use crate::testing::credentials::test_secrets_store;
 
     #[tokio::test]
     async fn test_inject_channel_settings_uses_owner_scope() -> Result<(), String> {
@@ -550,6 +561,70 @@ mod tests {
         assert_eq!(
             config_updates.get("base_url"),
             Some(&serde_json::json!("https://owner.example"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_inject_channel_secrets_uses_owner_scope_for_feishu() -> Result<(), String> {
+        let secrets = test_secrets_store();
+        secrets
+            .create(
+                "default",
+                CreateSecretParams::new("feishu_app_id", "default-app-id"),
+            )
+            .await
+            .map_err(|e| format!("persist default feishu_app_id failed: {e}"))?;
+        secrets
+            .create(
+                "owner-123",
+                CreateSecretParams::new("feishu_app_id", "owner-app-id"),
+            )
+            .await
+            .map_err(|e| format!("persist owner feishu_app_id failed: {e}"))?;
+
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> = Arc::new(secrets);
+        let mut config_updates = std::collections::HashMap::new();
+        super::inject_channel_secrets_into_config(
+            "feishu",
+            "owner-123",
+            &Some(secrets_store),
+            &mut config_updates,
+        )
+        .await;
+
+        assert_eq!(
+            config_updates.get("app_id"),
+            Some(&serde_json::json!("owner-app-id"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_inject_channel_secrets_falls_back_to_default_scope() -> Result<(), String> {
+        let secrets = test_secrets_store();
+        secrets
+            .create(
+                "default",
+                CreateSecretParams::new("feishu_app_id", "default-app-id"),
+            )
+            .await
+            .map_err(|e| format!("persist default feishu_app_id failed: {e}"))?;
+
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> = Arc::new(secrets);
+        let mut config_updates = std::collections::HashMap::new();
+        super::inject_channel_secrets_into_config(
+            "feishu",
+            "owner-123",
+            &Some(secrets_store),
+            &mut config_updates,
+        )
+        .await;
+
+        assert_eq!(
+            config_updates.get("app_id"),
+            Some(&serde_json::json!("default-app-id")),
+            "legacy default-scope Feishu secrets should still be injected"
         );
         Ok(())
     }

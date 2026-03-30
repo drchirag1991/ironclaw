@@ -40,16 +40,6 @@ fn request_headers(body: &[u8]) -> String {
     .to_string()
 }
 
-fn summarize_body_preview(bytes: &[u8], limit: usize) -> String {
-    let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(limit)]);
-    let normalized = preview.replace(['\n', '\r'], " ");
-    if bytes.len() > limit {
-        format!("{normalized}...")
-    } else {
-        normalized
-    }
-}
-
 pub fn get_updates(
     config: &WechatConfig,
     get_updates_buf: &str,
@@ -85,20 +75,11 @@ pub fn get_updates_with_timeout(
             .map_err(|e| format!("getUpdates request failed: {e}"))?;
 
     channel_host::log(
-        channel_host::LogLevel::Info,
+        channel_host::LogLevel::Debug,
         &format!(
-            "WeChat getUpdates response: status={} bytes={} has_image_marker={} has_aeskey_marker={} preview={}",
+            "WeChat getUpdates response: status={} bytes={}",
             response.status,
-            response.body.len(),
-            response
-                .body
-                .windows(b"image_item".len())
-                .any(|window| window == b"image_item"),
-            response
-                .body
-                .windows(b"aeskey".len())
-                .any(|window| window == b"aeskey"),
-            summarize_body_preview(&response.body, 160)
+            response.body.len()
         ),
     );
 
@@ -110,7 +91,7 @@ pub fn get_updates_with_timeout(
     let parsed: GetUpdatesResponse = serde_json::from_slice(&response.body)
         .map_err(|e| format!("Failed to parse getUpdates response: {e}"))?;
     channel_host::log(
-        channel_host::LogLevel::Info,
+        channel_host::LogLevel::Debug,
         &format!(
             "WeChat getUpdates parsed: ret={:?} errcode={:?} msg_count={} next_cursor_len={}",
             parsed.ret,
