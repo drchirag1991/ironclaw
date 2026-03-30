@@ -1,0 +1,124 @@
+//! User input area widget using tui-textarea.
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Widget;
+use tui_textarea::TextArea;
+
+use crate::layout::TuiSlot;
+use crate::theme::Theme;
+
+use super::{AppState, TuiWidget};
+
+pub struct InputBoxWidget {
+    theme: Theme,
+    textarea: TextArea<'static>,
+}
+
+impl InputBoxWidget {
+    pub fn new(theme: Theme) -> Self {
+        let mut textarea = TextArea::default();
+        textarea.set_cursor_line_style(ratatui::style::Style::default());
+        textarea.set_block(
+            ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::NONE),
+        );
+        Self { theme, textarea }
+    }
+
+    /// Get the current input text and clear the textarea.
+    pub fn take_input(&mut self) -> String {
+        let lines: Vec<String> = self.textarea.lines().iter().map(|l| l.to_string()).collect();
+        let text = lines.join("\n");
+        // Clear by selecting all and deleting
+        self.textarea.select_all();
+        self.textarea.cut();
+        text
+    }
+
+    /// Returns true if the textarea is empty.
+    pub fn is_empty(&self) -> bool {
+        self.textarea.lines().iter().all(|l| l.is_empty())
+    }
+
+    /// Peek at the current text content without consuming it.
+    pub fn current_text(&self) -> String {
+        self.textarea.lines().join("\n")
+    }
+
+    /// Replace the current text content with `text`.
+    pub fn set_text(&mut self, text: &str) {
+        self.textarea.select_all();
+        self.textarea.cut();
+        self.textarea.insert_str(text);
+    }
+}
+
+impl TuiWidget for InputBoxWidget {
+    fn id(&self) -> &str {
+        "input_box"
+    }
+
+    fn slot(&self) -> TuiSlot {
+        TuiSlot::Tab
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer, state: &AppState) {
+        if area.height == 0 || area.width < 4 {
+            return;
+        }
+
+        // Render prompt character
+        let prompt = if state.pending_approval.is_some() {
+            "\u{25C6}"
+        } else {
+            "\u{203A}"
+        };
+
+        let prompt_span = Span::styled(
+            format!("  {prompt} "),
+            self.theme
+                .accent_style()
+                .add_modifier(Modifier::BOLD),
+        );
+        let prompt_line = Line::from(prompt_span);
+        let prompt_widget = ratatui::widgets::Paragraph::new(prompt_line);
+
+        // Split area: prompt (4 chars) + textarea
+        if area.width > 5 {
+            let prompt_area = Rect {
+                x: area.x,
+                y: area.y,
+                width: 4,
+                height: area.height,
+            };
+            let input_area = Rect {
+                x: area.x + 4,
+                y: area.y,
+                width: area.width - 4,
+                height: area.height,
+            };
+
+            prompt_widget.render(prompt_area, buf);
+            (&self.textarea).render(input_area, buf);
+        } else {
+            prompt_widget.render(area, buf);
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, _state: &mut AppState) -> bool {
+        // Don't handle Enter or Esc here — those are handled by the app
+        if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
+            return false;
+        }
+        if key.code == KeyCode::Esc {
+            return false;
+        }
+        // Let tui-textarea handle everything else
+        self.textarea.input(key);
+        true
+    }
+}

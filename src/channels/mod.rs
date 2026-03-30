@@ -35,8 +35,12 @@ mod repl;
 mod signal;
 pub mod wasm;
 pub mod web;
+#[cfg(feature = "tui")]
+mod tui;
 mod webhook_server;
 
+#[cfg(feature = "tui")]
+pub use self::tui::TuiChannel;
 pub use channel::{
     AttachmentKind, Channel, ChannelSecretUpdater, IncomingAttachment, IncomingMessage,
     MessageStream, OutgoingResponse, StatusUpdate, ToolDecision, routing_target_from_metadata,

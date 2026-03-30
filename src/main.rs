@@ -326,8 +326,13 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Initialize tracing with a reloadable EnvFilter so the gateway can switch
     // log levels at runtime without restarting.
-    let log_level_handle =
-        ironclaw::channels::web::log_layer::init_tracing(Arc::clone(&log_broadcaster));
+    // Suppress stderr fmt layer in TUI mode — logs are shown in a dedicated
+    // Logs tab instead of bleeding into the Ratatui alternate screen.
+    let suppress_stderr = config.channels.tui.is_some() && cfg!(feature = "tui");
+    let log_level_handle = ironclaw::channels::web::log_layer::init_tracing(
+        Arc::clone(&log_broadcaster),
+        suppress_stderr,
+    );
 
     tracing::debug!("Starting IronClaw...");
     tracing::debug!("Loaded configuration for agent: {}", config.agent.name);
@@ -393,13 +398,37 @@ async fn async_main() -> anyhow::Result<()> {
         Arc<WasmChannelRouter>,
     )> = None;
 
-    // Create CLI channel
+    // Create CLI channel (REPL or TUI — mutually exclusive, both claim stdin)
+    let tui_mode = config.channels.tui.is_some();
+
+    #[cfg(feature = "tui")]
+    if tui_mode && cli.message.is_none() {
+        let tui_channel = ironclaw::channels::TuiChannel::new(
+            config.owner_id.clone(),
+            env!("CARGO_PKG_VERSION"),
+            components.llm.model_name(),
+        )
+        .with_log_broadcaster(Arc::clone(&log_broadcaster));
+        channels.add(Box::new(tui_channel)).await;
+        channel_names.push("tui".to_string());
+        tracing::debug!("TUI mode enabled");
+    }
+
+    #[cfg(not(feature = "tui"))]
+    if tui_mode {
+        tracing::warn!(
+            "CLI_MODE=tui requested but the 'tui' feature is not enabled. Falling back to REPL."
+        );
+    }
+
+    // Fall back to REPL when TUI is not active
+    let use_repl = !tui_mode || cfg!(not(feature = "tui"));
     let repl_channel = if let Some(ref msg) = cli.message {
         Some(ReplChannel::with_message_for_user(
             config.owner_id.clone(),
             msg.clone(),
         ))
-    } else if config.channels.cli.enabled {
+    } else if use_repl && config.channels.cli.enabled {
         let repl = ReplChannel::with_user_id(config.owner_id.clone());
         repl.suppress_banner();
         Some(repl)

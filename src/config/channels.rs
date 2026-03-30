@@ -14,6 +14,8 @@ pub struct ChannelsConfig {
     pub http: Option<HttpConfig>,
     pub gateway: Option<GatewayConfig>,
     pub signal: Option<SignalConfig>,
+    /// TUI channel configuration (feature-gated behind `tui`).
+    pub tui: Option<TuiChannelConfig>,
     /// Directory containing WASM channel modules (default: ~/.ironclaw/channels/).
     pub wasm_channels_dir: std::path::PathBuf,
     /// Whether WASM channels are enabled.
@@ -21,6 +23,15 @@ pub struct ChannelsConfig {
     /// Per-channel owner user IDs. When set, the channel only responds to this user.
     /// Key: channel name (e.g., "telegram"), Value: owner user ID.
     pub wasm_channel_owner_ids: HashMap<String, i64>,
+}
+
+/// TUI channel configuration (Ratatui-based terminal UI).
+#[derive(Debug, Clone)]
+pub struct TuiChannelConfig {
+    /// Theme name ("dark" or "light").
+    pub theme: String,
+    /// Whether the sidebar is visible at startup.
+    pub sidebar_visible: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +322,16 @@ impl ChannelsConfig {
 
         let cli_enabled = parse_bool_env("CLI_ENABLED", cs.cli_enabled)?;
 
+        let cli_mode = optional_env("CLI_MODE")?.unwrap_or_default();
+        let tui = if cli_mode.eq_ignore_ascii_case("tui") {
+            Some(TuiChannelConfig {
+                theme: optional_env("TUI_THEME")?.unwrap_or_else(|| "dark".to_string()),
+                sidebar_visible: parse_bool_env("TUI_SIDEBAR", true)?,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             cli: CliConfig {
                 enabled: cli_enabled,
@@ -318,6 +339,7 @@ impl ChannelsConfig {
             http,
             gateway,
             signal,
+            tui,
             wasm_channels_dir: optional_env("WASM_CHANNELS_DIR")?
                 .map(PathBuf::from)
                 .or_else(|| cs.wasm_channels_dir.clone())
@@ -474,6 +496,7 @@ mod tests {
             http: None,
             gateway: None,
             signal: None,
+            tui: None,
             wasm_channels_dir: PathBuf::from("/tmp/channels"),
             wasm_channels_enabled: true,
             wasm_channel_owner_ids: HashMap::new(),
@@ -498,6 +521,7 @@ mod tests {
             http: None,
             gateway: None,
             signal: None,
+            tui: None,
             wasm_channels_dir: PathBuf::from("/opt/channels"),
             wasm_channels_enabled: false,
             wasm_channel_owner_ids: ids,
