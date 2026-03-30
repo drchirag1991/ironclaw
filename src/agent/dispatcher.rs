@@ -137,9 +137,7 @@ impl Agent {
             }
         }
 
-        if !is_group_chat
-            && let Some(extension_manager) = self.deps.extension_manager.as_ref()
-        {
+        if !is_group_chat && let Some(extension_manager) = self.deps.extension_manager.as_ref() {
             match extension_manager
                 .llm_extension_state_summary(&message.user_id)
                 .await
@@ -2442,10 +2440,8 @@ mod tests {
         )
     }
 
-    fn make_test_extension_manager() -> (
-        Arc<crate::extensions::ExtensionManager>,
-        tempfile::TempDir,
-    ) {
+    fn make_test_extension_manager() -> (Arc<crate::extensions::ExtensionManager>, tempfile::TempDir)
+    {
         use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
         use crate::tools::mcp::process::McpProcessManager;
         use crate::tools::mcp::session::McpSessionManager;

@@ -6493,7 +6493,9 @@ fn sanitize_llm_summary_text(value: &str) -> String {
         .chars()
         .filter(|c| !c.is_control())
         .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | ':' | '/' | '@' | '+') {
+            if c.is_ascii_alphanumeric()
+                || matches!(c, ' ' | '-' | '_' | '.' | ':' | '/' | '@' | '+')
+            {
                 c
             } else {
                 '_'
@@ -6524,6 +6526,7 @@ mod tests {
         Channel, ChannelManager, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate,
     };
     use crate::extensions::ExtensionManager;
+    use crate::extensions::InstalledExtension;
     use crate::extensions::manager::{
         ChannelRuntimeState, FallbackDecision, TelegramBindingData, TelegramBindingResult,
         TelegramOwnerBindingState, build_wasm_channel_runtime_config_updates,
@@ -6531,7 +6534,6 @@ mod tests {
         normalize_hosted_callback_url, send_telegram_text_message,
         telegram_message_matches_verification_code,
     };
-    use crate::extensions::InstalledExtension;
     use crate::extensions::{
         ExtensionError, ExtensionKind, ExtensionSource, InstallResult, ToolAuthState,
         VerificationChallenge,
@@ -7659,7 +7661,11 @@ mod tests {
             .ok_or_else(|| format!("missing telegram item: {parsed}"))?;
         require_eq(
             telegram.get("status"),
-            Some(&serde_json::json!(["authenticated", "active", "owner-bound"])),
+            Some(&serde_json::json!([
+                "authenticated",
+                "active",
+                "owner-bound"
+            ])),
             "telegram summary status",
         )
     }
