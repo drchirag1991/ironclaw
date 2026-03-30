@@ -183,6 +183,7 @@ mod tests {
             tools: Vec::new(),
             needs_setup: false,
             has_auth: false,
+            requires_binding: true,
             installed: true,
             activation_error: None,
             version: None,

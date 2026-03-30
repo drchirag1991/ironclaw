@@ -47,15 +47,15 @@ pub(crate) async fn hydrate_attachment_for_channel(
                 attachment.data = plaintext;
                 if attachment.mime_type.starts_with("image/") {
                     attachment.mime_type = detect_image_mime(&attachment.data).to_string();
-                } else if is_wechat_silk_attachment(attachment) {
-                    if let Err(error) = maybe_transcode_wechat_silk_attachment(attachment) {
-                        tracing::warn!(
-                            channel = %channel_name,
-                            attachment_id = %attachment.id,
-                            error = %error,
-                            "Failed to transcode WeChat SILK attachment; preserving raw SILK"
-                        );
-                    }
+                } else if is_wechat_silk_attachment(attachment)
+                    && let Err(error) = maybe_transcode_wechat_silk_attachment(attachment)
+                {
+                    tracing::warn!(
+                        channel = %channel_name,
+                        attachment_id = %attachment.id,
+                        error = %error,
+                        "Failed to transcode WeChat SILK attachment; preserving raw SILK"
+                    );
                 }
             }
             Err(error) => {

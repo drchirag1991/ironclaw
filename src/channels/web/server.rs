@@ -3345,6 +3345,7 @@ mod tests {
             .expect("request");
         req.extensions_mut().insert(UserIdentity {
             user_id: "test".to_string(),
+            role: "admin".to_string(),
             workspace_read_scopes: Vec::new(),
         });
 
@@ -3504,6 +3505,7 @@ mod tests {
             .expect("start request");
         start_req.extensions_mut().insert(UserIdentity {
             user_id: "test".to_string(),
+            role: "admin".to_string(),
             workspace_read_scopes: Vec::new(),
         });
 
@@ -3529,6 +3531,7 @@ mod tests {
             .expect("poll request");
         poll_req.extensions_mut().insert(UserIdentity {
             user_id: "test".to_string(),
+            role: "admin".to_string(),
             workspace_read_scopes: Vec::new(),
         });
 

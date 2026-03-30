@@ -108,22 +108,6 @@ fn format_attachment(index: usize, att: &IncomingAttachment) -> String {
                  </attachment>"
             )
         }
-        AttachmentKind::Video => {
-            let duration_attr = att
-                .duration_secs
-                .map(|d| format!(" duration=\"{d}s\""))
-                .unwrap_or_default();
-            let size_attr = att
-                .size_bytes
-                .map(|s| format!(" size=\"{}\"", format_size(s)))
-                .unwrap_or_default();
-
-            format!(
-                "<attachment index=\"{index}\" type=\"video\" filename=\"{filename}\" mime=\"{mime}\"{duration_attr}{size_attr}>\n\
-                 [Video attached]\n\
-                 </attachment>"
-            )
-        }
         AttachmentKind::Document => {
             let body: String = match &att.extracted_text {
                 Some(text) => escape_xml_text(text),
@@ -256,23 +240,6 @@ mod tests {
             }
             other => panic!("Expected ImageUrl, got: {:?}", other),
         }
-    }
-
-    #[test]
-    fn video_attachment_formats_as_video_not_document() {
-        let mut att = make_attachment(AttachmentKind::Video);
-        att.filename = Some("clip.mp4".to_string());
-        att.mime_type = "video/mp4".to_string();
-        att.size_bytes = Some(1_572_864);
-        att.duration_secs = Some(12);
-
-        let result = augment_with_attachments("watch", &[att]).unwrap();
-        assert!(result.text.contains("type=\"video\""));
-        assert!(result.text.contains("filename=\"clip.mp4\""));
-        assert!(result.text.contains("mime=\"video/mp4\""));
-        assert!(result.text.contains("duration=\"12s\""));
-        assert!(result.text.contains("[Video attached]"));
-        assert!(!result.text.contains("type=\"document\""));
     }
 
     #[test]

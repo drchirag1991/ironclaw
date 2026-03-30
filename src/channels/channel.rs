@@ -17,8 +17,6 @@ pub enum AttachmentKind {
     Audio,
     /// Image content (photos, screenshots).
     Image,
-    /// Video content (clips, recordings).
-    Video,
     /// Document content (PDFs, files).
     Document,
 }
@@ -31,8 +29,6 @@ impl AttachmentKind {
             Self::Audio
         } else if base.starts_with("image/") {
             Self::Image
-        } else if base.starts_with("video/") {
-            Self::Video
         } else {
             Self::Document
         }
