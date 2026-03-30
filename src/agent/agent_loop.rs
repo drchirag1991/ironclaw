@@ -1627,8 +1627,8 @@ mod tests {
     use super::{
         Agent, AgentDeps, SensitiveChatCredential, chat_tool_execution_metadata,
         detect_sensitive_chat_credential, is_single_message_repl,
-        resolve_routine_notification_user,
-        should_fallback_routine_notification, truncate_for_preview,
+        resolve_routine_notification_user, should_fallback_routine_notification,
+        truncate_for_preview,
     };
     use crate::agent::session::Thread;
     use crate::channels::IncomingMessage;
@@ -1864,6 +1864,8 @@ mod tests {
             document_extraction: None,
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
+            llm_backend: "stub".to_string(),
+            tenant_rates: Arc::new(crate::tenant::TenantRateRegistry::new(4, 3)),
         };
 
         let agent = Agent::new(
@@ -1879,10 +1881,15 @@ mod tests {
                 allow_local_tools: false,
                 max_cost_per_day_cents: None,
                 max_actions_per_hour: None,
+                max_cost_per_user_per_day_cents: None,
                 max_tool_iterations: 5,
                 auto_approve_tools: false,
                 default_timezone: "UTC".to_string(),
+                max_jobs_per_user: None,
                 max_tokens_per_job: 0,
+                multi_tenant: false,
+                max_llm_concurrent_per_user: None,
+                max_jobs_concurrent_per_user: None,
             },
             deps,
             Arc::new(channel_manager),
