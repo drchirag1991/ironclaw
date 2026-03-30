@@ -1000,9 +1000,7 @@ pub async fn has_pending_auth(user_id: &str) -> bool {
 /// Used by the history endpoint to include auth state in the response,
 /// so SSE reconnects can re-show the auth card.
 pub async fn get_engine_pending_auth(user_id: &str) -> Option<(String, Option<String>)> {
-    let Some(lock) = ENGINE_STATE.get() else {
-        return None;
-    };
+    let lock = ENGINE_STATE.get()?;
     let guard = lock.read().await;
     let state = guard.as_ref()?;
     let pending = state.pending_auth.read().await;
