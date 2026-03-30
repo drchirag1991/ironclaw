@@ -38,6 +38,14 @@ pub fn hash_token(token: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Return a display prefix containing at most the first 8 Unicode scalar values.
+pub fn token_prefix(token: &str) -> &str {
+    match token.char_indices().nth(8) {
+        Some((idx, _)) => &token[..idx],
+        None => token,
+    }
+}
+
 /// Multi-user auth state: maps token hashes to user identities.
 ///
 /// Tokens are SHA-256 hashed on construction so they are never stored in
