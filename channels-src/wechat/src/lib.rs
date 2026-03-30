@@ -531,25 +531,34 @@ fn send_response(
     let mut sent_attachment = false;
 
     for attachment in &response.attachments {
-        if !attachment.mime_type.starts_with("image/") {
-            return Err(format!(
-                "WeChat currently supports image attachments only, got {} ({})",
-                attachment.filename, attachment.mime_type
-            ));
-        }
-
         let caption = if sent_attachment {
             ""
         } else {
             remaining_text.as_str()
         };
-        media::send_image_attachment(
-            config,
-            &metadata.from_user_id,
-            attachment,
-            context_token,
-            caption,
-        )?;
+        match media::classify_outbound_media_kind(&attachment.mime_type) {
+            media::OutboundMediaKind::Image => media::send_image_attachment(
+                config,
+                &metadata.from_user_id,
+                attachment,
+                context_token,
+                caption,
+            )?,
+            media::OutboundMediaKind::Video => media::send_video_attachment(
+                config,
+                &metadata.from_user_id,
+                attachment,
+                context_token,
+                caption,
+            )?,
+            media::OutboundMediaKind::File => media::send_file_attachment(
+                config,
+                &metadata.from_user_id,
+                attachment,
+                context_token,
+                caption,
+            )?,
+        }
         sent_attachment = true;
         remaining_text.clear();
     }
@@ -866,6 +875,7 @@ mod tests {
                     text: Some("voice transcript".to_string()),
                 }),
                 file_item: None,
+                video_item: None,
             }],
         };
 

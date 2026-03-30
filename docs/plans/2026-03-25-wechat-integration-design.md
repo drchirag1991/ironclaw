@@ -79,6 +79,8 @@ The point of this phase is to keep the channel aligned with upstream behavior wh
 - typing indicators via `getconfig` and `sendtyping`
 - inbound image download/decrypt for vision
 - outbound image upload/send via `getuploadurl`
+- inbound file, voice, and video attachment handling
+- outbound video and generic file attachment sending
 - `context_token` persistence
 - `get_updates_buf` persistence
 - login persistence across restart
@@ -92,7 +94,7 @@ The point of this phase is to keep the channel aligned with upstream behavior wh
 
 These are upstream features, so they belong on the roadmap, but they do not need to block the first implementation cut:
 
-- broader media parity beyond the current image + inbound-file + inbound-voice path (outbound files and video)
+- multi-account lifecycle and account management UX
 
 We should not spend time listing non-goals that come from outside the upstream capability boundary.
 

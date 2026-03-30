@@ -159,6 +159,7 @@ pub struct MessageItem {
     pub image_item: Option<ImageItem>,
     pub voice_item: Option<VoiceItem>,
     pub file_item: Option<FileItem>,
+    pub video_item: Option<VideoItem>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -196,6 +197,13 @@ pub struct FileItem {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VideoItem {
+    pub media: Option<CdnMedia>,
+    pub video_size: Option<u64>,
+    pub play_length: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OutboundMetadata {
     pub from_user_id: String,
     pub to_user_id: Option<String>,
@@ -211,6 +219,9 @@ pub const MESSAGE_ITEM_TEXT: i32 = 1;
 pub const MESSAGE_ITEM_IMAGE: i32 = 2;
 pub const MESSAGE_ITEM_VOICE: i32 = 3;
 pub const MESSAGE_ITEM_FILE: i32 = 4;
+pub const MESSAGE_ITEM_VIDEO: i32 = 5;
 pub const TYPING_STATUS_TYPING: i32 = 1;
 pub const TYPING_STATUS_CANCEL: i32 = 2;
 pub const UPLOAD_MEDIA_TYPE_IMAGE: i32 = 1;
+pub const UPLOAD_MEDIA_TYPE_VIDEO: i32 = 2;
+pub const UPLOAD_MEDIA_TYPE_FILE: i32 = 3;
