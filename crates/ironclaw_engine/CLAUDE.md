@@ -62,7 +62,6 @@ src/
 │   ├── context.rs        # Context builder (messages + actions from leases + memory docs)
 │   ├── compaction.rs     # Context compaction when approaching model context limit
 │   ├── prompt.rs         # System prompt construction (CodeAct preamble/postamble)
-│   ├── intent.rs         # Tool intent nudge detection
 │   └── trace.rs          # Execution trace recording and retrospective analysis
 ├── memory/               # Memory document system
 │   ├── store.rs          # MemoryStore — project-scoped doc CRUD
