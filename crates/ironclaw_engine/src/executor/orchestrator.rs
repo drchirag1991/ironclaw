@@ -363,6 +363,14 @@ pub async fn execute_orchestrator(
                         .await
                     }
 
+                    // __execute_actions_parallel__(calls)
+                    "__execute_actions_parallel__" => {
+                        handle_execute_actions_parallel(
+                            args, thread, effects, leases, policy, event_tx,
+                        )
+                        .await
+                    }
+
                     // __check_signals__()
                     "__check_signals__" => handle_check_signals(signal_rx),
 
@@ -910,6 +918,418 @@ async fn handle_execute_action(
                 "is_error": true,
             });
             ExtFunctionResult::Return(json_to_monty(&result))
+        }
+    }
+}
+
+/// Handle `__execute_actions_parallel__(calls)`.
+///
+/// Batch host function that receives a list of action calls and executes them
+/// concurrently. Each call is a dict with `name`, `params`, and optionally `call_id`.
+///
+/// Returns a list of result dicts (one per call, in order). Each result has the
+/// same shape as `__execute_action__` output, plus an optional `need_approval` or
+/// `need_authentication` flag.
+///
+/// Events are emitted and ActionResult messages are added to the thread in
+/// original call order after all parallel executions complete.
+async fn handle_execute_actions_parallel(
+    args: &[MontyObject],
+    thread: &mut Thread,
+    effects: &Arc<dyn EffectExecutor>,
+    leases: &Arc<LeaseManager>,
+    policy: &Arc<PolicyEngine>,
+    event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
+) -> ExtFunctionResult {
+    // Parse the calls list from the first argument (list of dicts)
+    let calls_json = args
+        .first()
+        .map(monty_to_json)
+        .unwrap_or(serde_json::json!([]));
+    let calls_array = match calls_json.as_array() {
+        Some(arr) => arr.clone(),
+        None => {
+            return ExtFunctionResult::Error(monty::MontyException::new(
+                monty::ExcType::TypeError,
+                Some("__execute_actions_parallel__ requires a list of call dicts".into()),
+            ));
+        }
+    };
+
+    if calls_array.is_empty() {
+        return ExtFunctionResult::Return(json_to_monty(&serde_json::json!([])));
+    }
+
+    // Parse each call dict into (name, params, call_id)
+    struct ParsedCall {
+        name: String,
+        params: serde_json::Value,
+        call_id: String,
+    }
+
+    let mut parsed: Vec<ParsedCall> = Vec::with_capacity(calls_array.len());
+    for c in &calls_array {
+        let name = c
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let params = c.get("params").cloned().unwrap_or(serde_json::json!({}));
+        let call_id = c
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        parsed.push(ParsedCall {
+            name,
+            params,
+            call_id,
+        });
+    }
+
+    let step_id = StepId::new();
+
+    // ── Phase 1: Preflight (sequential) ─────────────────────────
+    // Check leases and policies. Denied → error result. Approval → interrupt.
+
+    enum PfOutcome {
+        Runnable {
+            lease: crate::types::capability::CapabilityLease,
+        },
+        Error {
+            result_json: serde_json::Value,
+            event: EventKind,
+            output: serde_json::Value,
+        },
+    }
+
+    let mut preflight: Vec<Option<PfOutcome>> = Vec::with_capacity(parsed.len());
+
+    for pc in &parsed {
+        // Find lease
+        let lease = match leases.find_lease_for_action(thread.id, &pc.name).await {
+            Some(l) => l,
+            None => {
+                let error = format!("No lease for action '{}'", pc.name);
+                let output = serde_json::json!({"error": &error});
+                let result_json = serde_json::json!({
+                    "output": &output,
+                    "is_error": true,
+                });
+                let event = EventKind::ActionFailed {
+                    step_id,
+                    action_name: pc.name.clone(),
+                    call_id: pc.call_id.clone(),
+                    error,
+                    params_summary: None,
+                };
+                preflight.push(Some(PfOutcome::Error {
+                    result_json,
+                    event,
+                    output,
+                }));
+                continue;
+            }
+        };
+
+        // Check policy
+        let action_def = effects
+            .available_actions(std::slice::from_ref(&lease))
+            .await
+            .ok()
+            .and_then(|actions| actions.into_iter().find(|a| a.name == pc.name));
+
+        if let Some(ref ad) = action_def {
+            match policy.evaluate(ad, &lease, &[]) {
+                crate::capability::policy::PolicyDecision::Deny { reason } => {
+                    let output = serde_json::json!({"error": format!("Denied: {reason}")});
+                    let result_json = serde_json::json!({
+                        "output": &output,
+                        "is_error": true,
+                    });
+                    let event = EventKind::ActionFailed {
+                        step_id,
+                        action_name: pc.name.clone(),
+                        call_id: pc.call_id.clone(),
+                        error: reason,
+                        params_summary: None,
+                    };
+                    preflight.push(Some(PfOutcome::Error {
+                        result_json,
+                        event,
+                        output,
+                    }));
+                    continue;
+                }
+                crate::capability::policy::PolicyDecision::RequireApproval { .. } => {
+                    // Emit events for earlier errors, then interrupt
+                    let mut results_json = Vec::with_capacity(preflight.len() + 1);
+                    for pf in preflight {
+                        match pf {
+                            Some(PfOutcome::Error {
+                                result_json,
+                                event,
+                                output: _,
+                            }) => {
+                                let ev = ThreadEvent::new(thread.id, event);
+                                if let Some(tx) = event_tx {
+                                    let _ = tx.send(ev.clone());
+                                }
+                                thread.events.push(ev);
+                                // Don't add ActionResult message for earlier errors during approval interrupt
+                                results_json.push(result_json);
+                            }
+                            Some(PfOutcome::Runnable { .. }) | None => {
+                                results_json.push(serde_json::json!(null));
+                            }
+                        }
+                    }
+                    // Add the approval entry
+                    let output = serde_json::json!({"status": "awaiting_approval"});
+                    let ev = ThreadEvent::new(
+                        thread.id,
+                        EventKind::ApprovalRequested {
+                            action_name: pc.name.clone(),
+                            call_id: pc.call_id.clone(),
+                        },
+                    );
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(ev.clone());
+                    }
+                    thread.events.push(ev);
+                    thread.updated_at = chrono::Utc::now();
+                    thread.add_message(ThreadMessage::action_result(
+                        &pc.call_id,
+                        &pc.name,
+                        output.to_string(),
+                    ));
+
+                    results_json.push(serde_json::json!({
+                        "need_approval": true,
+                        "action_name": &pc.name,
+                    }));
+                    return ExtFunctionResult::Return(json_to_monty(&serde_json::json!(
+                        results_json
+                    )));
+                }
+                crate::capability::policy::PolicyDecision::Allow => {}
+            }
+        }
+
+        // Consume lease
+        if let Err(e) = leases.consume_use(lease.id).await {
+            debug!(error = %e, "lease consumption failed (non-fatal)");
+        }
+
+        preflight.push(Some(PfOutcome::Runnable { lease }));
+    }
+
+    // ── Phase 2: Execute in parallel ────────────────────────────
+
+    // Slot array: index → execution result
+    let mut slot_results: Vec<Option<serde_json::Value>> = vec![None; parsed.len()];
+    let mut slot_events: Vec<Option<EventKind>> = vec![None; parsed.len()];
+    let mut slot_outputs: Vec<Option<serde_json::Value>> = vec![None; parsed.len()];
+
+    // Separate runnable from errors
+    let mut runnable: Vec<(usize, crate::types::capability::CapabilityLease)> = Vec::new();
+    for (idx, pf) in preflight.into_iter().enumerate() {
+        match pf {
+            Some(PfOutcome::Error {
+                result_json,
+                event,
+                output,
+            }) => {
+                slot_results[idx] = Some(result_json);
+                slot_events[idx] = Some(event);
+                slot_outputs[idx] = Some(output);
+            }
+            Some(PfOutcome::Runnable { lease }) => {
+                runnable.push((idx, lease));
+            }
+            None => {}
+        }
+    }
+
+    if runnable.len() == 1 {
+        // Single call: execute directly
+        let (idx, lease) = runnable.into_iter().next().unwrap(); // safety: len()==1 checked above
+        let pc = &parsed[idx];
+        let exec_ctx = ThreadExecutionContext {
+            thread_id: thread.id,
+            thread_type: thread.thread_type,
+            project_id: thread.project_id,
+            user_id: thread.user_id.clone(),
+            step_id,
+        };
+        let ps = summarize_params(&pc.name, &pc.params);
+        let (result_json, event, output) = execute_single_action(
+            effects,
+            &pc.name,
+            pc.params.clone(),
+            &pc.call_id,
+            &lease,
+            &exec_ctx,
+            ps,
+        )
+        .await;
+        slot_results[idx] = Some(result_json);
+        slot_events[idx] = Some(event);
+        slot_outputs[idx] = Some(output);
+    } else if runnable.len() > 1 {
+        // Multiple calls: execute in parallel via JoinSet
+        let mut join_set = tokio::task::JoinSet::new();
+        let effects = effects.clone();
+
+        for (idx, lease) in runnable {
+            let pc_name = parsed[idx].name.clone();
+            let pc_params = parsed[idx].params.clone();
+            let pc_call_id = parsed[idx].call_id.clone();
+            let effects = effects.clone();
+            let lease = lease.clone();
+            let exec_ctx = ThreadExecutionContext {
+                thread_id: thread.id,
+                thread_type: thread.thread_type,
+                project_id: thread.project_id,
+                user_id: thread.user_id.clone(),
+                step_id,
+            };
+            let ps = summarize_params(&pc_name, &pc_params);
+
+            join_set.spawn(async move {
+                let (result_json, event, output) = execute_single_action(
+                    &effects,
+                    &pc_name,
+                    pc_params,
+                    &pc_call_id,
+                    &lease,
+                    &exec_ctx,
+                    ps,
+                )
+                .await;
+                (idx, result_json, event, output)
+            });
+        }
+
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
+                Ok((idx, result_json, event, output)) => {
+                    slot_results[idx] = Some(result_json);
+                    slot_events[idx] = Some(event);
+                    slot_outputs[idx] = Some(output);
+                }
+                Err(e) => {
+                    warn!("parallel action execution task panicked: {e}");
+                }
+            }
+        }
+    }
+
+    // ── Phase 3: Emit events and add messages in order ──────────
+
+    let mut results_json = Vec::with_capacity(parsed.len());
+    for idx in 0..parsed.len() {
+        let result_json = slot_results[idx].take().unwrap_or(
+            serde_json::json!({"is_error": true, "output": {"error": "execution slot empty"}}),
+        );
+        let output = slot_outputs[idx]
+            .take()
+            .unwrap_or(serde_json::json!({"error": "no output"}));
+
+        if let Some(event) = slot_events[idx].take() {
+            let ev = ThreadEvent::new(thread.id, event);
+            if let Some(tx) = event_tx {
+                let _ = tx.send(ev.clone());
+            }
+            thread.events.push(ev);
+        }
+
+        thread.add_message(ThreadMessage::action_result(
+            &parsed[idx].call_id,
+            &parsed[idx].name,
+            output.to_string(),
+        ));
+
+        results_json.push(result_json.clone());
+    }
+
+    thread.updated_at = chrono::Utc::now();
+    ExtFunctionResult::Return(json_to_monty(&serde_json::json!(results_json)))
+}
+
+/// Execute a single action and return (result_json, event, output) for the
+/// batch handler to record. Shared by both single-call and parallel paths.
+async fn execute_single_action(
+    effects: &Arc<dyn EffectExecutor>,
+    name: &str,
+    params: serde_json::Value,
+    call_id: &str,
+    lease: &crate::types::capability::CapabilityLease,
+    exec_ctx: &ThreadExecutionContext,
+    params_summary: Option<String>,
+) -> (serde_json::Value, EventKind, serde_json::Value) {
+    match effects.execute_action(name, params, lease, exec_ctx).await {
+        Ok(r) => {
+            let event = EventKind::ActionExecuted {
+                step_id: exec_ctx.step_id,
+                action_name: name.to_string(),
+                call_id: call_id.to_string(),
+                duration_ms: r.duration.as_millis() as u64,
+                params_summary: params_summary.clone(),
+            };
+            let result_json = serde_json::json!({
+                "action_name": r.action_name,
+                "output": r.output,
+                "is_error": r.is_error,
+                "duration_ms": r.duration.as_millis(),
+            });
+            (result_json, event, r.output)
+        }
+        Err(EngineError::NeedApproval { .. }) => {
+            let output = serde_json::json!({"status": "awaiting_approval"});
+            let event = EventKind::ApprovalRequested {
+                action_name: name.to_string(),
+                call_id: call_id.to_string(),
+            };
+            let result_json = serde_json::json!({
+                "need_approval": true,
+                "action_name": name,
+            });
+            (result_json, event, output)
+        }
+        Err(EngineError::NeedAuthentication {
+            credential_name, ..
+        }) => {
+            let output = serde_json::json!({"status": "authentication_required", "credential_name": &credential_name});
+            let error_msg = format!("authentication required for credential '{credential_name}'");
+            let event = EventKind::ActionFailed {
+                step_id: exec_ctx.step_id,
+                action_name: name.to_string(),
+                call_id: call_id.to_string(),
+                error: error_msg,
+                params_summary,
+            };
+            let result_json = serde_json::json!({
+                "need_authentication": true,
+                "credential_name": credential_name,
+                "action_name": name,
+            });
+            (result_json, event, output)
+        }
+        Err(e) => {
+            let output = serde_json::json!({"error": e.to_string()});
+            let event = EventKind::ActionFailed {
+                step_id: exec_ctx.step_id,
+                action_name: name.to_string(),
+                call_id: call_id.to_string(),
+                error: e.to_string(),
+                params_summary,
+            };
+            let result_json = serde_json::json!({
+                "output": &output,
+                "is_error": true,
+            });
+            (result_json, event, output)
         }
     }
 }

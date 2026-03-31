@@ -8,6 +8,7 @@
 #   __llm_complete__(messages, actions, config)  -> response dict  (args ignored; Rust builds context from thread)
 #   __execute_code_step__(code, state)           -> result dict
 #   __execute_action__(name, params)             -> result dict
+#   __execute_actions_parallel__(calls)          -> list of result dicts (parallel execution)
 #   __check_signals__()                          -> None | "stop" | {"inject": msg}
 #   __emit_event__(kind, **data)                 -> None
 #   __add_message__(role, content)               -> None
@@ -388,14 +389,15 @@ def run_loop(context, goal, actions, state, config):
             nudge_count = 0
             calls = response.get("calls", [])
 
-            for call in calls:
-                name = call.get("name", "")
-                params = call.get("params", {})
-                call_id = call.get("call_id", "")
+            # Execute all tool calls in parallel via the batch host function.
+            # Rust handles preflight (lease/policy), parallel execution via
+            # JoinSet, event emission, and message addition in call order.
+            results = __execute_actions_parallel__(calls)
 
-                # __execute_action__ handles event emission, message addition,
-                # and lease consumption in Rust — no duplicate logic needed here.
-                r = __execute_action__(name, params, call_id=call_id)
+            # Check results for auth/approval interrupts
+            for r in results:
+                if r is None:
+                    continue
 
                 if r.get("need_authentication"):
                     __save_checkpoint__(state, {
@@ -406,9 +408,9 @@ def run_loop(context, goal, actions, state, config):
                     return {
                         "outcome": "need_authentication",
                         "credential_name": r.get("credential_name", ""),
-                        "action_name": name,
-                        "call_id": call_id,
-                        "parameters": params,
+                        "action_name": r.get("action_name", ""),
+                        "call_id": r.get("call_id", ""),
+                        "parameters": r.get("parameters", {}),
                     }
 
                 if r.get("need_approval"):
@@ -419,9 +421,9 @@ def run_loop(context, goal, actions, state, config):
                     __transition_to__("waiting", "approval needed")
                     return {
                         "outcome": "need_approval",
-                        "action_name": name,
-                        "call_id": call_id,
-                        "parameters": params,
+                        "action_name": r.get("action_name", ""),
+                        "call_id": r.get("call_id", ""),
+                        "parameters": r.get("parameters", {}),
                     }
 
             __save_checkpoint__(state, {
