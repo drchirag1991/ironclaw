@@ -1282,7 +1282,7 @@ async fn handle_record_skill_usage(
         return ExtFunctionResult::Return(MontyObject::None);
     };
 
-    let tracker = crate::capability::skill_tracker::SkillTracker::new(Arc::clone(store));
+    let tracker = crate::memory::SkillTracker::new(Arc::clone(store));
     if let Err(e) = tracker
         .record_usage(crate::types::memory::DocId(uuid), success)
         .await

@@ -48,8 +48,7 @@ src/
 ├── capability/           # Capability management
 │   ├── registry.rs       # CapabilityRegistry — register/get/list capabilities
 │   ├── lease.rs          # LeaseManager — grant/check/consume/revoke/expire leases
-│   ├── policy.rs         # PolicyEngine — deterministic effect-level allow/deny/approve + provenance taint
-│   └── skill_tracker.rs  # SkillTracker — confidence tracking, versioned updates, rollback
+│   └── policy.rs         # PolicyEngine — deterministic effect-level allow/deny/approve + provenance taint
 ├── runtime/              # Thread lifecycle management
 │   ├── manager.rs        # ThreadManager — spawn, stop, inject messages, join threads
 │   ├── conversation.rs   # ConversationManager — routes UI messages to threads
@@ -67,7 +66,8 @@ src/
 │   └── trace.rs          # Execution trace recording and retrospective analysis
 ├── memory/               # Memory document system
 │   ├── store.rs          # MemoryStore — project-scoped doc CRUD
-│   └── retrieval.rs      # RetrievalEngine — keyword-based context retrieval from project docs
+│   ├── retrieval.rs      # RetrievalEngine — keyword-based context retrieval from project docs
+│   └── skill_tracker.rs  # SkillTracker — confidence tracking, versioned updates, rollback
 └── reliability.rs        # ReliabilityTracker — per-action success rate and latency via EMA
 ```
 
