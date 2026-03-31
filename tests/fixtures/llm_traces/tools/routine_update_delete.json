@@ -59,7 +59,7 @@
     {
       "response": {
         "type": "text",
-        "content": "Created, updated, and then deleted the temp-routine successfully. The update would have left it unverified until it was tested again.",
+        "content": "Created, updated, and then deleted the temp-routine successfully.",
         "input_tokens": 400,
         "output_tokens": 20
       }

@@ -246,7 +246,6 @@ I18n.register('en', {
   'routines.summary.total': 'Total',
   'routines.summary.enabled': 'Enabled',
   'routines.summary.disabled': 'Disabled',
-  'routines.summary.unverified': 'Unverified',
   'routines.summary.failing': 'Failing',
   'routines.summary.runsToday': 'Runs Today',
   
