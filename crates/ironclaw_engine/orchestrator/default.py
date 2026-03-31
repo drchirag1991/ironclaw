@@ -277,6 +277,7 @@ def run_loop(context, goal, actions, state, config):
             if active_skills:
                 skill_text = format_skills(active_skills)
                 __add_message__("system_append", skill_text)
+                __set_active_skills__(active_skills)
                 # Emit skill activation event for CLI/gateway display
                 skill_names = ",".join(s.get("metadata", {}).get("name", "?") for s in active_skills)
                 __emit_event__("skill_activated", skill_names=skill_names)

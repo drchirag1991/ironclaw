@@ -6,7 +6,8 @@
 
 use std::sync::Arc;
 
-use ironclaw_skills::v2::V2SkillMetadata;
+use ironclaw_skills::v2::{SkillRevision, V2SkillMetadata};
+use sha2::{Digest, Sha256};
 
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
@@ -15,6 +16,12 @@ use crate::types::memory::{DocId, DocType, MemoryDoc};
 /// Tracks skill usage and updates confidence metrics.
 pub struct SkillTracker {
     store: Arc<dyn Store>,
+}
+
+fn compute_content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 impl SkillTracker {
@@ -70,10 +77,15 @@ impl SkillTracker {
     ///
     /// Sets `parent_version` to the current version before incrementing,
     /// enabling rollback if the update causes issues.
+    ///
+    /// If `expected_version` is `Some(v)`, the update is rejected with an error
+    /// if the skill's current version in the store differs from `v` (optimistic
+    /// concurrency control).
     pub async fn update_skill(
         &self,
         doc_id: DocId,
         new_content: String,
+        expected_version: Option<u32>,
         updater: impl FnOnce(&mut V2SkillMetadata),
     ) -> Result<(), EngineError> {
         let doc = self
@@ -89,9 +101,34 @@ impl SkillTracker {
                 reason: format!("invalid skill metadata: {e}"),
             })?;
 
+        if let Some(expected) = expected_version
+            && meta.version != expected
+        {
+            return Err(EngineError::Skill {
+                reason: format!(
+                    "skill {} version conflict: expected {expected}, found {}",
+                    doc_id.0, meta.version
+                ),
+            });
+        }
+
+        meta.revisions.push(SkillRevision {
+            version: meta.version,
+            content: doc.content.clone(),
+            description: meta.description.clone(),
+            activation: meta.activation.clone(),
+            code_snippets: meta.code_snippets.clone(),
+            content_hash: meta.content_hash.clone(),
+            archived_at: Some(chrono::Utc::now()),
+        });
+        if meta.revisions.len() > 10 {
+            let keep_from = meta.revisions.len() - 10;
+            meta.revisions.drain(0..keep_from);
+        }
         meta.parent_version = Some(meta.version);
         meta.version += 1;
         updater(&mut meta);
+        meta.content_hash = compute_content_hash(&new_content);
 
         let updated_doc = MemoryDoc {
             content: new_content,
@@ -107,9 +144,10 @@ impl SkillTracker {
 
     /// Rollback a skill to its previous version.
     ///
-    /// Decrements the version to `parent_version` if available. This is a
-    /// simple version decrement — the actual content rollback requires the
-    /// caller to also restore the content from a backup.
+    /// If an archived revision exists for `parent_version`, restores the full
+    /// content and metadata snapshot. Otherwise (legacy skills updated before
+    /// revision archiving was added) falls back to a simple version decrement
+    /// without content restoration.
     pub async fn rollback_skill(&self, doc_id: DocId) -> Result<(), EngineError> {
         let doc = self
             .store
@@ -128,10 +166,33 @@ impl SkillTracker {
             reason: format!("skill {} has no parent version to rollback to", doc_id.0),
         })?;
 
-        meta.version = parent;
-        meta.parent_version = None;
+        let revision_opt = meta
+            .revisions
+            .iter()
+            .position(|revision| revision.version == parent);
+
+        let rolled_content = if let Some(revision_index) = revision_opt {
+            // Full content-aware rollback from archived revision
+            let revision = meta.revisions[revision_index].clone();
+            meta.version = revision.version;
+            meta.description = revision.description;
+            meta.activation = revision.activation;
+            meta.code_snippets = revision.code_snippets;
+            meta.content_hash = revision.content_hash;
+            meta.revisions
+                .retain(|archived| archived.version < revision.version);
+            meta.parent_version = meta.revisions.iter().map(|archived| archived.version).max();
+            revision.content
+        } else {
+            // Legacy fallback: no archived revision available, just decrement
+            // the version. Content stays as-is (best effort).
+            meta.version = parent;
+            meta.parent_version = None;
+            doc.content.clone()
+        };
 
         let updated_doc = MemoryDoc {
+            content: rolled_content,
             metadata: serde_json::to_value(&meta).map_err(|e| EngineError::Skill {
                 reason: format!("failed to serialize skill metadata: {e}"),
             })?,
@@ -166,6 +227,8 @@ mod tests {
                 last_used: None,
             },
             parent_version: None,
+            revisions: vec![],
+            repairs: vec![],
             content_hash: String::new(),
         };
 
@@ -227,7 +290,7 @@ mod tests {
         let tracker = SkillTracker::new(store.clone());
 
         tracker
-            .update_skill(doc_id, "Updated content".to_string(), |meta| {
+            .update_skill(doc_id, "Updated content".to_string(), None, |meta| {
                 meta.description = "Updated description".to_string();
             })
             .await
@@ -240,6 +303,8 @@ mod tests {
         assert_eq!(meta.version, 2);
         assert_eq!(meta.parent_version, Some(1));
         assert_eq!(meta.description, "Updated description");
+        assert_eq!(meta.revisions.len(), 1);
+        assert_eq!(meta.revisions[0].version, 1);
     }
 
     #[tokio::test]
@@ -253,7 +318,7 @@ mod tests {
 
         // First update to version 2
         tracker
-            .update_skill(doc_id, "v2 content".to_string(), |_| {})
+            .update_skill(doc_id, "v2 content".to_string(), None, |_| {})
             .await
             .unwrap();
 
@@ -264,6 +329,8 @@ mod tests {
         let meta: V2SkillMetadata = serde_json::from_value(rolled.metadata).unwrap();
         assert_eq!(meta.version, 1);
         assert_eq!(meta.parent_version, None);
+        assert_eq!(rolled.content, "Test skill prompt");
+        assert!(meta.revisions.is_empty());
     }
 
     #[tokio::test]
@@ -286,5 +353,160 @@ mod tests {
 
         let result = tracker.record_usage(DocId::new(), true).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rollback_after_multiple_updates() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        // v1 -> v2
+        tracker
+            .update_skill(doc_id, "v2 content".to_string(), None, |meta| {
+                meta.description = "v2 desc".to_string();
+            })
+            .await
+            .unwrap();
+        // v2 -> v3
+        tracker
+            .update_skill(doc_id, "v3 content".to_string(), None, |meta| {
+                meta.description = "v3 desc".to_string();
+            })
+            .await
+            .unwrap();
+
+        let before_rollback = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta_v3: V2SkillMetadata = serde_json::from_value(before_rollback.metadata).unwrap();
+        assert_eq!(meta_v3.version, 3);
+        assert_eq!(meta_v3.parent_version, Some(2));
+        assert_eq!(meta_v3.revisions.len(), 2);
+
+        // Rollback v3 -> v2
+        tracker.rollback_skill(doc_id).await.unwrap();
+        let rolled = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta_v2: V2SkillMetadata = serde_json::from_value(rolled.metadata).unwrap();
+        assert_eq!(meta_v2.version, 2);
+        assert_eq!(meta_v2.parent_version, Some(1));
+        assert_eq!(rolled.content, "v2 content");
+        assert_eq!(meta_v2.description, "v2 desc");
+        assert_eq!(meta_v2.revisions.len(), 1);
+
+        // Rollback v2 -> v1
+        tracker.rollback_skill(doc_id).await.unwrap();
+        let rolled = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta_v1: V2SkillMetadata = serde_json::from_value(rolled.metadata).unwrap();
+        assert_eq!(meta_v1.version, 1);
+        assert_eq!(meta_v1.parent_version, None);
+        assert_eq!(rolled.content, "Test skill prompt");
+        assert!(meta_v1.revisions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_revision_cap_at_ten() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        // 12 updates: v1 -> v2 -> ... -> v13
+        for i in 2..=13 {
+            tracker
+                .update_skill(doc_id, format!("v{i} content"), None, |_| {})
+                .await
+                .unwrap();
+        }
+
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert_eq!(meta.version, 13);
+        assert_eq!(meta.revisions.len(), 10, "revisions should be capped at 10");
+        // Oldest kept revision should be v3 (v1 and v2 trimmed)
+        assert_eq!(meta.revisions[0].version, 3);
+        assert_eq!(meta.revisions[9].version, 12);
+    }
+
+    #[tokio::test]
+    async fn test_update_skill_version_conflict() {
+        let project_id = ProjectId::new();
+        let doc = make_skill_doc(project_id);
+        let doc_id = doc.id;
+
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        // Bump to v2
+        tracker
+            .update_skill(doc_id, "v2 content".to_string(), None, |_| {})
+            .await
+            .unwrap();
+
+        // Try to update expecting v1 — should fail
+        let result = tracker
+            .update_skill(doc_id, "conflict".to_string(), Some(1), |_| {})
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("version conflict"),
+            "expected version conflict error, got: {err_msg}"
+        );
+
+        // Update expecting v2 — should succeed
+        tracker
+            .update_skill(doc_id, "v3 content".to_string(), Some(2), |_| {})
+            .await
+            .unwrap();
+        let updated = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let meta: V2SkillMetadata = serde_json::from_value(updated.metadata).unwrap();
+        assert_eq!(meta.version, 3);
+    }
+
+    #[tokio::test]
+    async fn test_rollback_legacy_skill_without_revision() {
+        let project_id = ProjectId::new();
+        // Simulate a legacy skill that was updated before revision archiving
+        let meta = V2SkillMetadata {
+            name: "legacy-skill".to_string(),
+            version: 2,
+            description: "updated".to_string(),
+            activation: Default::default(),
+            source: V2SkillSource::Extracted,
+            trust: SkillTrust::Trusted,
+            code_snippets: vec![],
+            metrics: SkillMetrics::default(),
+            parent_version: Some(1),
+            revisions: vec![], // no archived revisions (legacy)
+            repairs: vec![],
+            content_hash: String::new(),
+        };
+
+        let mut doc = MemoryDoc::new(
+            project_id,
+            "test-user",
+            DocType::Skill,
+            "skill:legacy",
+            "v2 content (no v1 backup)",
+        );
+        doc.metadata = serde_json::to_value(&meta).unwrap();
+        let doc_id = doc.id;
+
+        let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![doc]));
+        let tracker = SkillTracker::new(store.clone());
+
+        // Legacy rollback should succeed with version decrement fallback
+        tracker.rollback_skill(doc_id).await.unwrap();
+
+        let rolled = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        let rolled_meta: V2SkillMetadata = serde_json::from_value(rolled.metadata).unwrap();
+        assert_eq!(rolled_meta.version, 1);
+        assert_eq!(rolled_meta.parent_version, None);
+        // Content stays as-is in legacy fallback
+        assert_eq!(rolled.content, "v2 content (no v1 backup)");
     }
 }

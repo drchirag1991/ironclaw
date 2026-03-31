@@ -15,6 +15,7 @@ For each issue in the trigger payload:
    - PROMPT: The LLM made a mistake because the system prompt is missing a rule (wrong tool name, bad API usage, ignoring tool results)
    - CONFIG: A default value is wrong (truncation length, iteration limit, timeout)
    - CODE: There is a bug in the engine or bridge code (crash, type error, missing conversion)
+   - SKILL: An active skill was relevant, but its instructions were stale, incomplete, wrongly ordered, or missing verification/workarounds
 
 2. **Check the fix pattern database** in prior knowledge. Has this pattern been seen before? If yes, apply the known strategy. If no, proceed to step 3.
 
@@ -37,6 +38,10 @@ For each issue in the trigger payload:
    - Read the relevant source files
    - Describe the fix needed but DO NOT apply it directly
    - Log it as a recommendation in your FINAL() response
+
+   SKILL:
+   - Do not patch the engine or prompt overlay for a skill-content problem
+   - Note that the issue belongs in the `skill-repair` mission and summarize why
 
 4. **Record what you did** — include in your FINAL() response:
    - What issue you analyzed

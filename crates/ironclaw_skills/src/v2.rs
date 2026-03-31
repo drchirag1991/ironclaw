@@ -39,17 +39,20 @@ pub struct CodeSnippet {
 
 /// Usage and confidence metrics for auto-extracted skills.
 ///
-/// Tracks how often a skill is used and whether it contributes to successful
-/// thread outcomes. Skills with low confidence get demoted in scoring.
+/// Tracks how often a skill is used and whether it contributes to clean
+/// successful thread outcomes. Skills with low confidence get demoted in
+/// scoring.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillMetrics {
     /// Total number of times this skill was activated in a thread.
     #[serde(default)]
     pub usage_count: u64,
-    /// Number of times the skill was active in a successfully completed thread.
+    /// Number of times the skill was active in a clean successfully completed
+    /// thread.
     #[serde(default)]
     pub success_count: u64,
-    /// Number of times the skill was active in a failed thread.
+    /// Number of times the skill was active in a failed or otherwise unhealthy
+    /// terminal thread.
     #[serde(default)]
     pub failure_count: u64,
     /// When this skill was last activated.
@@ -68,6 +71,64 @@ impl SkillMetrics {
         }
         self.success_count as f64 / total as f64
     }
+}
+
+/// Structured repair categories for versioned skill updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillRepairType {
+    MissingPrerequisite,
+    WrongOrdering,
+    StaleCommandPath,
+    MissingBranch,
+    MissingPitfall,
+    MissingVerification,
+}
+
+/// Archived pre-update skill state used for content-aware rollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRevision {
+    /// Version number represented by this archived snapshot.
+    pub version: u32,
+    /// Prompt content for that version.
+    pub content: String,
+    /// Description at that version.
+    #[serde(default)]
+    pub description: String,
+    /// Activation criteria at that version.
+    #[serde(default)]
+    pub activation: ActivationCriteria,
+    /// Code snippets at that version.
+    #[serde(default)]
+    pub code_snippets: Vec<CodeSnippet>,
+    /// Content hash at that version.
+    #[serde(default)]
+    pub content_hash: String,
+    /// When this snapshot was archived.
+    #[serde(default)]
+    pub archived_at: Option<DateTime<Utc>>,
+}
+
+/// Metadata describing a repair that updated this skill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRepairRecord {
+    /// Source thread that exposed the gap, if known.
+    #[serde(default)]
+    pub source_thread_id: Option<String>,
+    /// Version before the repair.
+    #[serde(default)]
+    pub from_version: u32,
+    /// Version after the repair.
+    #[serde(default)]
+    pub to_version: u32,
+    /// Type of gap that was repaired.
+    pub repair_type: SkillRepairType,
+    /// Short human-readable summary of the fix.
+    #[serde(default)]
+    pub summary: String,
+    /// When the repair was applied.
+    #[serde(default)]
+    pub repaired_at: Option<DateTime<Utc>>,
 }
 
 /// Full metadata for a v2 skill.
@@ -104,6 +165,12 @@ pub struct V2SkillMetadata {
     /// Previous version number (for rollback).
     #[serde(default)]
     pub parent_version: Option<u32>,
+    /// Archived revisions used for content-aware rollback.
+    #[serde(default)]
+    pub revisions: Vec<SkillRevision>,
+    /// Repair history for this skill.
+    #[serde(default)]
+    pub repairs: Vec<SkillRepairRecord>,
     /// SHA-256 hash of the prompt content.
     #[serde(default)]
     pub content_hash: String,
@@ -181,6 +248,23 @@ mod tests {
                 last_used: None,
             },
             parent_version: Some(2),
+            revisions: vec![SkillRevision {
+                version: 2,
+                content: "previous content".to_string(),
+                description: "old".to_string(),
+                activation: ActivationCriteria::default(),
+                code_snippets: vec![],
+                content_hash: "sha256:def".to_string(),
+                archived_at: None,
+            }],
+            repairs: vec![SkillRepairRecord {
+                source_thread_id: Some("thread-123".to_string()),
+                from_version: 2,
+                to_version: 3,
+                repair_type: SkillRepairType::MissingVerification,
+                summary: "added smoke test step".to_string(),
+                repaired_at: None,
+            }],
             content_hash: "sha256:abc".to_string(),
         };
 
@@ -193,6 +277,8 @@ mod tests {
         assert_eq!(parsed.code_snippets.len(), 1);
         assert_eq!(parsed.metrics.success_count, 4);
         assert_eq!(parsed.parent_version, Some(2));
+        assert_eq!(parsed.revisions.len(), 1);
+        assert_eq!(parsed.repairs.len(), 1);
     }
 
     #[test]
@@ -205,5 +291,7 @@ mod tests {
         assert_eq!(parsed.trust, SkillTrust::Trusted);
         assert!(parsed.code_snippets.is_empty());
         assert!((parsed.metrics.confidence() - 1.0).abs() < f64::EPSILON);
+        assert!(parsed.revisions.is_empty());
+        assert!(parsed.repairs.is_empty());
     }
 }

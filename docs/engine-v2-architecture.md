@@ -135,13 +135,15 @@ For trace debugging: `ENGINE_V2_TRACE=1` writes full JSON traces to `engine_trac
 
 ### Learning Missions (replaced Reflection)
 
-Instead of a separate reflection pipeline, knowledge extraction is handled by three event-driven **learning missions** that fire automatically after thread completion:
+Instead of a separate reflection pipeline, knowledge extraction is handled by four event-driven **learning missions** that fire automatically after thread completion:
 
 1. **Self-improvement** (`self-improvement`) — fires when a thread completes with trace issues (errors, tool-not-found, etc.). Diagnoses root cause, applies prompt overlays or orchestrator patches. Graduated risk: Level 1 (prompt) → Level 2 (config) → Level 3 (code, propose only).
 
-2. **Skill extraction** (`skill-extraction`) — fires when a thread succeeds with 5+ steps and 3+ distinct tool actions. Extracts reusable skills with structured metadata: activation keywords/patterns, CodeAct code snippets, domain tags. Output is a `DocType::Skill` MemoryDoc with `V2SkillMetadata` JSON.
+2. **Skill repair** (`skill-repair`) — fires when an active skill was relevant but execution suggests the skill content was incomplete, stale, missing verification, or missing a workaround. Applies a minimal versioned repair and stores repair metadata for rollback/evaluation.
 
-3. **Conversation insights** (`conversation-insights`) — fires every 5 completed threads in a project. Extracts user preferences, domain knowledge, workflow patterns, and corrections.
+3. **Skill extraction** (`skill-extraction`) — fires when a thread succeeds with 5+ steps and 3+ distinct tool actions. Extracts reusable skills with structured metadata: activation keywords/patterns, CodeAct code snippets, domain tags. Output is a `DocType::Skill` MemoryDoc with `V2SkillMetadata` JSON.
+
+4. **Conversation insights** (`conversation-insights`) — fires every 5 completed threads in a project. Extracts user preferences, domain knowledge, workflow patterns, and corrections.
 
 ### Context Injection
 
@@ -230,8 +232,9 @@ Skills inject knowledge at two levels:
 ### Confidence Tracking
 
 Auto-extracted skills track usage metrics via `SkillTracker`:
-- After each thread: `record_usage(doc_id, success)` increments counters
+- After each terminal thread: `record_usage(doc_id, success)` increments counters
 - Confidence = `success_count / (success_count + failure_count)` (1.0 if no data)
+- `success_count` reflects clean successful completions; recoverable auth interruptions do not count against the skill
 - Low-confidence skills get demoted in scoring via `apply_confidence_factor()`
 - `update_skill()` increments version with `parent_version` for rollback
 - `rollback_skill()` restores previous version if an update causes failures
@@ -261,19 +264,21 @@ Mission
 ### How Missions Fire
 
 - **Cron**: Background ticker checks every 60s, fires missions with past `next_fire_at`
-- **OnSystemEvent**: Event listener subscribes to ThreadManager events, fires matching missions when threads complete
+- **OnSystemEvent**: Event listener subscribes to ThreadManager events, fires matching missions when threads reach a terminal state
 - **Manual**: `mission_fire(id)` from CodeAct or API
 - **Webhook**: Bridge routes incoming webhooks to matching missions
 
 ### Learning Missions (Built-in)
 
-Three missions are created automatically at project bootstrap via `ensure_learning_missions()`:
+Five missions are created automatically at project bootstrap via `ensure_learning_missions()`:
 
 | Mission | Trigger | Max/day | What it does |
 |---------|---------|---------|-------------|
 | `self-improvement` | Thread completes with trace issues | 5 | Diagnoses errors, applies prompt overlays or orchestrator patches |
+| `skill-repair` | Active skill appears stale/incomplete in a terminal thread | 5 | Applies a minimal versioned skill patch and records repair metadata |
 | `skill-extraction` | Thread succeeds with 5+ steps, 3+ tools | 3 | Extracts reusable skills with activation metadata + CodeAct snippets |
 | `conversation-insights` | Every 5 completed threads | 2 | Extracts user preferences, domain knowledge, workflow patterns |
+| `expected-behavior` | User feedback emits `expected_behavior` | 5 | Investigates expectation gaps and applies fixes |
 
 ### Meta-Prompt Generation
 

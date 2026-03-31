@@ -40,7 +40,7 @@ use crate::types::event::{EventKind, ThreadEvent, summarize_params};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
 use crate::types::step::{StepId, TokenUsage};
-use crate::types::thread::Thread;
+use crate::types::thread::{ActiveSkillProvenance, Thread};
 
 use super::scripting::{execute_code, json_to_monty, monty_to_json, monty_to_string};
 
@@ -399,6 +399,9 @@ pub async fn execute_orchestrator(
 
                     // __list_skills__(max_candidates, max_tokens)
                     "__list_skills__" => handle_list_skills(args, thread, store).await,
+
+                    // __set_active_skills__(skills)
+                    "__set_active_skills__" => handle_set_active_skills(args, thread),
 
                     // __record_skill_usage__(doc_id, success)
                     "__record_skill_usage__" => handle_record_skill_usage(args, store).await,
@@ -1677,6 +1680,87 @@ async fn handle_list_skills(
         .collect();
 
     ExtFunctionResult::Return(json_to_monty(&serde_json::json!(skills)))
+}
+
+/// Handle `__set_active_skills__(skills)`.
+///
+/// Persists stable skill provenance on the thread so completion listeners can
+/// reason about which versioned skills were active even after checkpoints are
+/// cleared on successful completion.
+fn handle_set_active_skills(args: &[MontyObject], thread: &mut Thread) -> ExtFunctionResult {
+    let skills_json = args
+        .first()
+        .map(monty_to_json)
+        .unwrap_or(serde_json::json!([]));
+    let Some(skills) = skills_json.as_array() else {
+        return ExtFunctionResult::Error(monty::MontyException::new(
+            monty::ExcType::TypeError,
+            Some("__set_active_skills__ requires a list".into()),
+        ));
+    };
+
+    let mut provenance = Vec::new();
+
+    for skill in skills {
+        let doc_id = skill
+            .get("doc_id")
+            .and_then(|value| value.as_str())
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .map(crate::types::memory::DocId);
+        let Some(doc_id) = doc_id else {
+            continue;
+        };
+
+        let metadata = skill.get("metadata");
+        let name = metadata
+            .and_then(|value| value.get("name"))
+            .and_then(|value| value.as_str())
+            .or_else(|| skill.get("title").and_then(|value| value.as_str()))
+            .unwrap_or("unknown")
+            .trim_start_matches("skill:")
+            .to_string();
+        let version = metadata
+            .and_then(|value| value.get("version"))
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(1);
+        let snippet_names = metadata
+            .and_then(|value| value.get("code_snippets"))
+            .and_then(|value| value.as_array())
+            .map(|snippets| {
+                snippets
+                    .iter()
+                    .filter_map(|snippet| {
+                        snippet
+                            .get("name")
+                            .and_then(|value| value.as_str())
+                            .map(ToString::to_string)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let force_activated = skill
+            .get("force_activated")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        provenance.push(ActiveSkillProvenance {
+            doc_id,
+            name,
+            version,
+            snippet_names,
+            force_activated,
+        });
+    }
+
+    if let Err(e) = thread.set_active_skills(&provenance) {
+        return ExtFunctionResult::Error(monty::MontyException::new(
+            monty::ExcType::RuntimeError,
+            Some(format!("failed to persist active skills: {e}")),
+        ));
+    }
+
+    ExtFunctionResult::Return(MontyObject::None)
 }
 
 /// Handle `__record_skill_usage__(doc_id, success)`.

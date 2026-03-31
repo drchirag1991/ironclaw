@@ -83,11 +83,13 @@ Validated by `ThreadState::can_transition_to()`. Terminal states: `Done`, `Faile
 
 ## Learning Missions
 
-Three event-driven missions fire automatically after thread completion:
+Five event-driven missions fire automatically after thread completion:
 
 1. **Error diagnosis** (`self-improvement`) — fires when a thread completes with trace issues. Diagnoses root cause and applies prompt overlays or orchestrator patches.
-2. **Skill extraction** (`skill-extraction`) — fires when a thread succeeds with 5+ steps and 3+ tool actions. Extracts reusable skills with activation metadata, CodeAct code snippets, and domain tags. Output stored as `DocType::Skill` MemoryDoc.
-3. **Conversation insights** (`conversation-insights`) — fires every 5 completed threads in a project. Extracts user preferences, domain knowledge, and workflow patterns.
+2. **Skill repair** (`skill-repair`) — fires when an active skill looks stale or incomplete for a completed thread. Applies a minimal versioned repair and records repair metadata for rollback/evaluation.
+3. **Skill extraction** (`skill-extraction`) — fires when a thread succeeds with 5+ steps and 3+ tool actions. Extracts reusable skills with activation metadata, CodeAct code snippets, and domain tags. Output stored as `DocType::Skill` MemoryDoc.
+4. **Conversation insights** (`conversation-insights`) — fires every 5 completed threads in a project. Extracts user preferences, domain knowledge, and workflow patterns.
+5. **Expected behavior** (`expected-behavior`) — fires from user feedback events and investigates reported expectation gaps.
 
 Created by `MissionManager::ensure_learning_missions()` at project bootstrap.
 
@@ -131,6 +133,12 @@ Python execution via Monty interpreter (`executor/scripting.rs`). Follows the RL
 **Compact output metadata**: Between code steps, only a summary is added to chat context (`"[code output] stdout (4532 chars): The results show..."`) — not the full output. This prevents context bloat across iterations.
 
 **Resource limits**: 30s timeout, 64MB memory, 1M allocations. All execution wrapped in `catch_unwind` for Monty panic safety.
+
+### Orchestrator Extern Functions (Python → Rust)
+
+Custom Python orchestrators (replacements for `orchestrator/default.py`) may call these extern functions. Required externs for skill-repair to function:
+
+- `__set_active_skills__(skills)` — persists skill provenance on the thread so the learning-mission event listener can determine which versioned skills were active. Must be called after `select_skills()` on step 0. Without this, skill-repair and per-skill usage tracking are silently disabled.
 
 ## Capability Leases
 
