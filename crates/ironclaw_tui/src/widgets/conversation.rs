@@ -491,6 +491,16 @@ impl ConversationWidget {
             ]));
         }
 
+        // Context window
+        let ctx_label = format!(
+            "{}K context",
+            state.context_window / 1000
+        );
+        left_lines.push(Line::from(vec![
+            Span::styled("  ".to_string(), Style::default()),
+            Span::styled(ctx_label, self.theme.dim_style()),
+        ]));
+
         // Session ID
         let session_id = state
             .session_start
@@ -500,6 +510,30 @@ impl ConversationWidget {
             Span::styled("  Session: ".to_string(), self.theme.dim_style()),
             Span::styled(session_id, self.theme.dim_style()),
         ]));
+
+        // Memory / workspace stats
+        if state.memory_count > 0 || !state.identity_files.is_empty() {
+            left_lines.push(Line::from(""));
+
+            if state.memory_count > 0 {
+                left_lines.push(Line::from(vec![
+                    Span::styled("  \u{25C8} ".to_string(), self.theme.accent_style()),
+                    Span::styled(
+                        format!("{} memories", state.memory_count),
+                        self.theme.dim_style(),
+                    ),
+                ]));
+            }
+
+            if !state.identity_files.is_empty() {
+                let files_str = state.identity_files.join(", ");
+                let files_display = truncate(&files_str, left_text_max.saturating_sub(4));
+                left_lines.push(Line::from(vec![
+                    Span::styled("  \u{25CB} ".to_string(), self.theme.accent_style()),
+                    Span::styled(files_display, self.theme.dim_style()),
+                ]));
+            }
+        }
 
         // Build right-column lines (tools + skills)
         let mut right_lines: Vec<Line<'_>> = Vec::new();
@@ -559,7 +593,7 @@ impl ConversationWidget {
         let total_tools: usize = state.welcome_tools.iter().map(|c| c.tools.len()).sum();
         let total_skills: usize = state.welcome_skills.iter().map(|c| c.skills.len()).sum();
         right_lines.push(Line::from(""));
-        right_lines.push(Line::from(vec![
+        let mut footer_spans = vec![
             Span::styled(
                 format!("{total_tools} tools"),
                 self.theme.accent_style(),
@@ -569,9 +603,17 @@ impl ConversationWidget {
                 format!("{total_skills} skills"),
                 self.theme.accent_style(),
             ),
-            Span::styled("  \u{00B7}  ".to_string(), self.theme.dim_style()),
-            Span::styled("/help for commands".to_string(), self.theme.dim_style()),
-        ]));
+        ];
+        if state.memory_count > 0 {
+            footer_spans.push(Span::styled("  \u{00B7}  ".to_string(), self.theme.dim_style()));
+            footer_spans.push(Span::styled(
+                format!("{} memories", state.memory_count),
+                self.theme.accent_style(),
+            ));
+        }
+        footer_spans.push(Span::styled("  \u{00B7}  ".to_string(), self.theme.dim_style()));
+        footer_spans.push(Span::styled("/help for commands".to_string(), self.theme.dim_style()));
+        right_lines.push(Line::from(footer_spans));
 
         // Compose two columns side-by-side
         let total_rows = left_lines.len().max(right_lines.len());

@@ -2,8 +2,9 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Widget;
+use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::layout::TuiSlot;
 use crate::render::truncate;
@@ -31,25 +32,34 @@ impl TuiWidget for ToolPanelWidget {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer, state: &AppState) {
-        if area.height == 0 || area.width < 4 {
+        if area.height == 0 || area.width < 6 {
             return;
         }
 
-        let max_name_len = (area.width as usize).saturating_sub(12);
-        let mut lines: Vec<Line<'_>> = Vec::new();
-
-        // Section header
+        // Bordered block with title
         let active_count = state.active_tools.len();
         let total_count = active_count + state.recent_tools.len();
-        lines.push(Line::from(vec![
-            Span::styled(" Tools", self.theme.bold_style()),
-            Span::styled(
-                format!("  {active_count}/{total_count}"),
-                self.theme.dim_style(),
-            ),
-        ]));
+        let title = format!(" Tools {active_count}/{total_count} ");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border_style())
+            .title(Span::styled(
+                title,
+                self.theme
+                    .accent_style()
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        block.render(area, buf);
 
-        let show_detail = area.width >= 12;
+        if inner.height == 0 || inner.width < 4 {
+            return;
+        }
+
+        let max_name_len = (inner.width as usize).saturating_sub(10);
+        let mut lines: Vec<Line<'_>> = Vec::new();
+
+        let show_detail = inner.width >= 10;
 
         // Active tools
         for tool in &state.active_tools {
@@ -63,8 +73,10 @@ impl TuiWidget for ToolPanelWidget {
                 Span::styled(name, self.theme.accent_style()),
                 Span::styled(format!("  {elapsed}ms"), self.theme.dim_style()),
             ]));
-            if show_detail && let Some(ref d) = tool.detail {
-                let detail_max = (area.width as usize).saturating_sub(4);
+            if show_detail
+                && let Some(ref d) = tool.detail
+            {
+                let detail_max = (inner.width as usize).saturating_sub(4);
                 lines.push(Line::from(Span::styled(
                     format!("   {}", truncate(d, detail_max)),
                     self.theme.dim_style(),
@@ -78,9 +90,8 @@ impl TuiWidget for ToolPanelWidget {
             .iter()
             .rev()
             .take(
-                (area.height as usize)
-                    .saturating_sub(lines.len())
-                    .saturating_sub(1),
+                (inner.height as usize)
+                    .saturating_sub(lines.len()),
             )
             .enumerate()
         {
@@ -104,7 +115,7 @@ impl TuiWidget for ToolPanelWidget {
                 && recent_shown < 3
                 && let Some(d) = tool.result_preview.as_deref().or(tool.detail.as_deref())
             {
-                let detail_max = (area.width as usize).saturating_sub(4);
+                let detail_max = (inner.width as usize).saturating_sub(4);
                 lines.push(Line::from(Span::styled(
                     format!("   {}", truncate(d, detail_max)),
                     self.theme.dim_style(),
@@ -113,6 +124,6 @@ impl TuiWidget for ToolPanelWidget {
         }
 
         let paragraph = ratatui::widgets::Paragraph::new(lines);
-        paragraph.render(area, buf);
+        paragraph.render(inner, buf);
     }
 }

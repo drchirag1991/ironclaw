@@ -428,6 +428,21 @@ async fn async_main() -> anyhow::Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
 
+        // Gather memory/workspace stats for the welcome screen
+        let (memory_count, identity_files) = if let Some(ref ws) = components.workspace {
+            let count = ws.list_all().await.map(|v| v.len()).unwrap_or(0);
+            let identity_names = ["AGENTS.md", "SOUL.md", "USER.md", "IDENTITY.md"];
+            let mut found = Vec::new();
+            for name in &identity_names {
+                if ws.read(name).await.is_ok() {
+                    found.push((*name).to_string());
+                }
+            }
+            (count, found)
+        } else {
+            (0, Vec::new())
+        };
+
         let tui_channel = ironclaw::channels::TuiChannel::new(
             config.owner_id.clone(),
             env!("CARGO_PKG_VERSION"),
@@ -436,7 +451,9 @@ async fn async_main() -> anyhow::Result<()> {
         .with_log_broadcaster(Arc::clone(&log_broadcaster))
         .with_tools(tool_categories)
         .with_skills(skill_categories)
-        .with_workspace_path(workspace_path);
+        .with_workspace_path(workspace_path)
+        .with_memory_count(memory_count)
+        .with_identity_files(identity_files);
         channels.add(Box::new(tui_channel)).await;
         channel_names.push("tui".to_string());
         tracing::debug!("TUI mode enabled");

@@ -16,8 +16,9 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Widget;
+use ratatui::widgets::{Block, Borders, Widget};
 
 use crate::layout::TuiSlot;
 use crate::render::truncate;
@@ -122,11 +123,28 @@ impl TuiWidget for ThreadListWidget {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer, state: &AppState) {
-        if area.height == 0 || area.width < 4 {
+        if area.height == 0 || area.width < 6 {
             return;
         }
 
-        let width = area.width as usize;
+        // Bordered block with "Activity" title
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.theme.border_style())
+            .title(Span::styled(
+                " Activity ",
+                self.theme
+                    .accent_style()
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        if inner.height == 0 || inner.width < 4 {
+            return;
+        }
+
+        let width = inner.width as usize;
         let mut lines: Vec<Line<'_>> = Vec::new();
 
         // Column layout: " {icon} {name}  {status}  {uptime}"
@@ -297,9 +315,9 @@ impl TuiWidget for ThreadListWidget {
             ]));
         }
 
-        let visible: Vec<Line<'_>> = lines.into_iter().take(area.height as usize).collect();
+        let visible: Vec<Line<'_>> = lines.into_iter().take(inner.height as usize).collect();
         let paragraph = ratatui::widgets::Paragraph::new(visible);
-        paragraph.render(area, buf);
+        paragraph.render(inner, buf);
     }
 }
 

@@ -124,6 +124,12 @@ fn main() {
         workspace_path: std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "~/projects/ironclaw".into()),
+        memory_count: 42,
+        identity_files: vec![
+            "AGENTS.md".into(),
+            "SOUL.md".into(),
+            "USER.md".into(),
+        ],
     };
 
     let handle = start_tui(config);

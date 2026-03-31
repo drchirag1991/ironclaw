@@ -61,6 +61,10 @@ pub struct TuiAppConfig {
     pub skills: Vec<SkillCategory>,
     /// Workspace directory path.
     pub workspace_path: String,
+    /// Number of memory entries in the workspace.
+    pub memory_count: usize,
+    /// Identity files loaded at startup (e.g. "AGENTS.md", "SOUL.md").
+    pub identity_files: Vec<String>,
 }
 
 /// Start the TUI application. Returns a handle for bi-directional communication.
@@ -123,6 +127,8 @@ async fn run_tui(
         welcome_tools: config.tools,
         welcome_skills: config.skills,
         workspace_path: config.workspace_path,
+        memory_count: config.memory_count,
+        identity_files: config.identity_files,
         ..AppState::default()
     };
 

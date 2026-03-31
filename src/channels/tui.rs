@@ -81,6 +81,8 @@ pub struct TuiChannel {
     tools: Vec<ToolCategory>,
     skills: Vec<SkillCategory>,
     workspace_path: String,
+    memory_count: usize,
+    identity_files: Vec<String>,
 }
 
 impl TuiChannel {
@@ -101,6 +103,8 @@ impl TuiChannel {
             tools: Vec::new(),
             skills: Vec::new(),
             workspace_path: String::new(),
+            memory_count: 0,
+            identity_files: Vec::new(),
         }
     }
 
@@ -133,6 +137,18 @@ impl TuiChannel {
         self.workspace_path = path.into();
         self
     }
+
+    /// Set the memory entry count for the welcome screen.
+    pub fn with_memory_count(mut self, count: usize) -> Self {
+        self.memory_count = count;
+        self
+    }
+
+    /// Set the identity files for the welcome screen.
+    pub fn with_identity_files(mut self, files: Vec<String>) -> Self {
+        self.identity_files = files;
+        self
+    }
 }
 
 #[async_trait]
@@ -159,6 +175,8 @@ impl Channel for TuiChannel {
             tools: self.tools.clone(),
             skills: self.skills.clone(),
             workspace_path: self.workspace_path.clone(),
+            memory_count: self.memory_count,
+            identity_files: self.identity_files.clone(),
         };
 
         let ironclaw_tui::TuiAppHandle {

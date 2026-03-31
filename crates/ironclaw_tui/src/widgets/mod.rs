@@ -139,6 +139,12 @@ pub struct AppState {
 
     /// Workspace directory path (for display on welcome screen).
     pub workspace_path: String,
+
+    /// Number of memory entries in the workspace.
+    pub memory_count: usize,
+
+    /// Identity files loaded at startup (e.g. "AGENTS.md", "SOUL.md").
+    pub identity_files: Vec<String>,
 }
 
 impl Default for AppState {
@@ -180,6 +186,8 @@ impl Default for AppState {
             welcome_tools: Vec::new(),
             welcome_skills: Vec::new(),
             workspace_path: String::new(),
+            memory_count: 0,
+            identity_files: Vec::new(),
         }
     }
 }
