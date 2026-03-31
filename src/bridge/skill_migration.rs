@@ -93,7 +93,9 @@ pub async fn migrate_v1_skill_list(
 /// Convert a single v1 `LoadedSkill` to a v2 `MemoryDoc`.
 fn v1_skill_to_memory_doc(skill: &LoadedSkill, project_id: ProjectId) -> MemoryDoc {
     let v2_source = match &skill.source {
-        SkillSource::Workspace(_) | SkillSource::User(_) => V2SkillSource::Migrated,
+        SkillSource::Workspace(_) | SkillSource::User(_) | SkillSource::Installed(_) => {
+            V2SkillSource::Migrated
+        }
         SkillSource::Bundled(_) => V2SkillSource::Migrated,
     };
 
