@@ -1150,6 +1150,7 @@ impl Tool for RoutineCreateTool {
             name: normalized.name.clone(),
             description: normalized.description.clone(),
             user_id: ctx.user_id.clone(),
+            workspace_id: ctx.workspace_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()),
             enabled: true,
             trigger,
             action,
@@ -1315,7 +1316,13 @@ impl Tool for RoutineUpdateTool {
 
         let mut routine = self
             .store
-            .get_routine_by_name(&ctx.user_id, name)
+            .get_routine_by_name(
+                &ctx.user_id,
+                ctx.workspace_id
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok()),
+                name,
+            )
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("DB error: {e}")))?
             .ok_or_else(|| ToolError::ExecutionFailed(format!("routine '{}' not found", name)))?;
@@ -1472,7 +1479,13 @@ impl Tool for RoutineDeleteTool {
 
         let routine = self
             .store
-            .get_routine_by_name(&ctx.user_id, &name)
+            .get_routine_by_name(
+                &ctx.user_id,
+                ctx.workspace_id
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok()),
+                &name,
+            )
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("DB error: {e}")))?
             .ok_or_else(|| ToolError::ExecutionFailed(format!("routine '{}' not found", name)))?;
@@ -1552,7 +1565,13 @@ impl Tool for RoutineFireTool {
 
         let routine = self
             .store
-            .get_routine_by_name(&ctx.user_id, name)
+            .get_routine_by_name(
+                &ctx.user_id,
+                ctx.workspace_id
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok()),
+                name,
+            )
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("DB error: {e}")))?
             .ok_or_else(|| ToolError::ExecutionFailed(format!("routine '{}' not found", name)))?;
@@ -1637,7 +1656,13 @@ impl Tool for RoutineHistoryTool {
 
         let routine = self
             .store
-            .get_routine_by_name(&ctx.user_id, name)
+            .get_routine_by_name(
+                &ctx.user_id,
+                ctx.workspace_id
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok()),
+                name,
+            )
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("DB error: {e}")))?
             .ok_or_else(|| ToolError::ExecutionFailed(format!("routine '{}' not found", name)))?;
@@ -1672,7 +1697,14 @@ impl Tool for RoutineHistoryTool {
         // so the user can see the full output of routine runs.
         let (conversation_id, recent_output) = match self
             .store
-            .get_or_create_routine_conversation(routine.id, name, &ctx.user_id)
+            .get_or_create_routine_conversation(
+                routine.id,
+                name,
+                &ctx.user_id,
+                ctx.workspace_id
+                    .as_deref()
+                    .and_then(|id| Uuid::parse_str(id).ok()),
+            )
             .await
         {
             Ok(conv_id) => {

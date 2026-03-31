@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     channel TEXT NOT NULL,
     user_id TEXT NOT NULL,
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
     thread_id TEXT,
     started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     last_activity TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -43,16 +44,21 @@ CREATE TABLE IF NOT EXISTS conversations (
 
 CREATE INDEX IF NOT EXISTS idx_conversations_channel ON conversations(channel);
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_workspace ON conversations(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_last_activity ON conversations(last_activity);
 
 -- Partial unique indexes to prevent duplicate singleton conversations.
-CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_routine
+CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_routine_personal
 ON conversations (user_id, json_extract(metadata, '$.routine_id'))
-WHERE json_extract(metadata, '$.routine_id') IS NOT NULL;
+WHERE workspace_id IS NULL AND json_extract(metadata, '$.routine_id') IS NOT NULL;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_heartbeat
+CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_routine_workspace
+ON conversations (workspace_id, json_extract(metadata, '$.routine_id'))
+WHERE workspace_id IS NOT NULL AND json_extract(metadata, '$.routine_id') IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_heartbeat_personal
 ON conversations (user_id)
-WHERE json_extract(metadata, '$.thread_type') = 'heartbeat';
+WHERE workspace_id IS NULL AND json_extract(metadata, '$.thread_type') = 'heartbeat';
 
 CREATE TABLE IF NOT EXISTS conversation_messages (
     id TEXT PRIMARY KEY,
@@ -77,6 +83,7 @@ CREATE TABLE IF NOT EXISTS agent_jobs (
     status TEXT NOT NULL,
     source TEXT NOT NULL,
     user_id TEXT NOT NULL DEFAULT 'default',
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
     project_dir TEXT,
     job_mode TEXT NOT NULL DEFAULT 'worker',
     budget_amount TEXT,
@@ -101,6 +108,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_jobs_marketplace ON agent_jobs(marketplace_
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_conversation ON agent_jobs(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_source ON agent_jobs(source);
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_user ON agent_jobs(user_id);
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_workspace ON agent_jobs(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_created ON agent_jobs(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS job_actions (
@@ -203,18 +211,28 @@ CREATE INDEX IF NOT EXISTS idx_repair_attempts_created ON repair_attempts(create
 CREATE TABLE IF NOT EXISTS memory_documents (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
     agent_id TEXT,
     path TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    metadata TEXT NOT NULL DEFAULT '{}',
-    UNIQUE (user_id, agent_id, path)
+    metadata TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_documents_user ON memory_documents(user_id);
+CREATE INDEX IF NOT EXISTS idx_memory_documents_workspace ON memory_documents(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_memory_documents_path ON memory_documents(user_id, path);
+CREATE INDEX IF NOT EXISTS idx_memory_documents_workspace_path ON memory_documents(workspace_id, path);
 CREATE INDEX IF NOT EXISTS idx_memory_documents_updated ON memory_documents(updated_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_documents_personal
+    ON memory_documents(user_id, agent_id, path)
+    WHERE workspace_id IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_documents_workspace
+    ON memory_documents(workspace_id, agent_id, path)
+    WHERE workspace_id IS NOT NULL;
 
 -- Trigger to auto-update updated_at on memory_documents
 CREATE TRIGGER IF NOT EXISTS update_memory_documents_updated_at
@@ -453,6 +471,7 @@ CREATE TABLE IF NOT EXISTS routines (
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     user_id TEXT NOT NULL,
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
     enabled INTEGER NOT NULL DEFAULT 1,
     trigger_type TEXT NOT NULL,
     trigger_config TEXT NOT NULL,
@@ -472,11 +491,23 @@ CREATE TABLE IF NOT EXISTS routines (
     run_count INTEGER NOT NULL DEFAULT 0,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (user_id, name)
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_routines_user ON routines(user_id);
+CREATE INDEX IF NOT EXISTS idx_routines_workspace ON routines(workspace_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_routines_personal_name
+    ON routines(user_id, name)
+    WHERE workspace_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_routines_workspace_name
+    ON routines(workspace_id, name)
+    WHERE workspace_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_routines_event_triggers
+    ON routines(trigger_type, user_id)
+    WHERE enabled = 1 AND trigger_type IN ('event', 'system_event') AND workspace_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_routines_event_triggers_workspace
+    ON routines(trigger_type, workspace_id)
+    WHERE enabled = 1 AND trigger_type IN ('event', 'system_event') AND workspace_id IS NOT NULL;
 
 -- ==================== Routine Runs ====================
 
@@ -500,13 +531,20 @@ CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id);
 
 CREATE TABLE IF NOT EXISTS settings (
     user_id TEXT NOT NULL,
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
     key TEXT NOT NULL,
     value TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    PRIMARY KEY (user_id, key)
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_settings_user ON settings(user_id);
+CREATE INDEX IF NOT EXISTS idx_settings_workspace ON settings(workspace_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_settings_personal
+    ON settings(user_id, key)
+    WHERE workspace_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_settings_workspace
+    ON settings(workspace_id, key)
+    WHERE workspace_id IS NOT NULL;
 
 -- ==================== Missing indexes (parity with PostgreSQL) ====================
 
@@ -608,6 +646,33 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
+
+-- ==================== Workspace entities (V15) ====================
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    created_by TEXT NOT NULL REFERENCES users(id),
+    settings TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspaces_status ON workspaces(status);
+
+CREATE TABLE IF NOT EXISTS workspace_members (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'member',
+    joined_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    invited_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    PRIMARY KEY (workspace_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id);
 
 "#;
 
@@ -785,6 +850,187 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
+"#,
+    ),
+    (
+        15,
+        "workspaces",
+        r#"
+CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    created_by TEXT NOT NULL REFERENCES users(id),
+    settings TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspaces_status ON workspaces(status);
+
+CREATE TABLE IF NOT EXISTS workspace_members (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'member',
+    joined_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    invited_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    PRIMARY KEY (workspace_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id);
+
+ALTER TABLE conversations ADD COLUMN workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_conversations_workspace ON conversations(workspace_id);
+DROP INDEX IF EXISTS uq_conv_routine;
+DROP INDEX IF EXISTS uq_conv_heartbeat;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_routine_personal
+    ON conversations (user_id, json_extract(metadata, '$.routine_id'))
+    WHERE workspace_id IS NULL AND json_extract(metadata, '$.routine_id') IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_routine_workspace
+    ON conversations (workspace_id, json_extract(metadata, '$.routine_id'))
+    WHERE workspace_id IS NOT NULL AND json_extract(metadata, '$.routine_id') IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_conv_heartbeat_personal
+    ON conversations (user_id)
+    WHERE workspace_id IS NULL AND json_extract(metadata, '$.thread_type') = 'heartbeat';
+
+ALTER TABLE agent_jobs ADD COLUMN workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_workspace ON agent_jobs(workspace_id);
+
+PRAGMA foreign_keys=OFF;
+
+DROP TRIGGER IF EXISTS update_memory_documents_updated_at;
+
+CREATE TABLE IF NOT EXISTS memory_documents_new (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+    agent_id TEXT,
+    path TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+INSERT INTO memory_documents_new (
+    id, user_id, workspace_id, agent_id, path, content, created_at, updated_at, metadata
+)
+SELECT id, user_id, NULL, agent_id, path, content, created_at, updated_at, metadata
+FROM memory_documents;
+
+DROP TABLE memory_documents;
+ALTER TABLE memory_documents_new RENAME TO memory_documents;
+
+CREATE INDEX IF NOT EXISTS idx_memory_documents_user ON memory_documents(user_id);
+CREATE INDEX IF NOT EXISTS idx_memory_documents_workspace ON memory_documents(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_memory_documents_path ON memory_documents(user_id, path);
+CREATE INDEX IF NOT EXISTS idx_memory_documents_workspace_path ON memory_documents(workspace_id, path);
+CREATE INDEX IF NOT EXISTS idx_memory_documents_updated ON memory_documents(updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_documents_personal
+    ON memory_documents(user_id, agent_id, path)
+    WHERE workspace_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_documents_workspace
+    ON memory_documents(workspace_id, agent_id, path)
+    WHERE workspace_id IS NOT NULL;
+
+CREATE TRIGGER IF NOT EXISTS update_memory_documents_updated_at
+    AFTER UPDATE ON memory_documents
+    FOR EACH ROW
+    WHEN NEW.updated_at = OLD.updated_at
+    BEGIN
+        UPDATE memory_documents SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = NEW.id;
+    END;
+
+CREATE TABLE IF NOT EXISTS routines_new (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL,
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    trigger_type TEXT NOT NULL,
+    trigger_config TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    action_config TEXT NOT NULL,
+    cooldown_secs INTEGER NOT NULL DEFAULT 300,
+    max_concurrent INTEGER NOT NULL DEFAULT 1,
+    dedup_window_secs INTEGER,
+    notify_channel TEXT,
+    notify_user TEXT,
+    notify_on_success INTEGER NOT NULL DEFAULT 0,
+    notify_on_failure INTEGER NOT NULL DEFAULT 1,
+    notify_on_attention INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT '{}',
+    last_run_at TEXT,
+    next_fire_at TEXT,
+    run_count INTEGER NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+INSERT INTO routines_new (
+    id, name, description, user_id, workspace_id, enabled,
+    trigger_type, trigger_config, action_type, action_config,
+    cooldown_secs, max_concurrent, dedup_window_secs,
+    notify_channel, notify_user, notify_on_success, notify_on_failure, notify_on_attention,
+    state, last_run_at, next_fire_at, run_count, consecutive_failures,
+    created_at, updated_at
+)
+SELECT
+    id, name, description, user_id, NULL, enabled,
+    trigger_type, trigger_config, action_type, action_config,
+    cooldown_secs, max_concurrent, dedup_window_secs,
+    notify_channel, notify_user, notify_on_success, notify_on_failure, notify_on_attention,
+    state, last_run_at, next_fire_at, run_count, consecutive_failures,
+    created_at, updated_at
+FROM routines;
+
+DROP TABLE routines;
+ALTER TABLE routines_new RENAME TO routines;
+
+CREATE INDEX IF NOT EXISTS idx_routines_user ON routines(user_id);
+CREATE INDEX IF NOT EXISTS idx_routines_workspace ON routines(workspace_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_routines_personal_name
+    ON routines(user_id, name)
+    WHERE workspace_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_routines_workspace_name
+    ON routines(workspace_id, name)
+    WHERE workspace_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_routines_event_triggers
+    ON routines(trigger_type, user_id)
+    WHERE enabled = 1 AND trigger_type IN ('event', 'system_event') AND workspace_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_routines_event_triggers_workspace
+    ON routines(trigger_type, workspace_id)
+    WHERE enabled = 1 AND trigger_type IN ('event', 'system_event') AND workspace_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_routines_next_fire ON routines(next_fire_at);
+
+CREATE TABLE IF NOT EXISTS settings_new (
+    user_id TEXT NOT NULL,
+    workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+INSERT INTO settings_new (user_id, workspace_id, key, value, updated_at)
+SELECT user_id, NULL, key, value, updated_at FROM settings;
+
+DROP TABLE settings;
+ALTER TABLE settings_new RENAME TO settings;
+
+CREATE INDEX IF NOT EXISTS idx_settings_user ON settings(user_id);
+CREATE INDEX IF NOT EXISTS idx_settings_workspace ON settings(workspace_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_settings_personal
+    ON settings(user_id, key)
+    WHERE workspace_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_settings_workspace
+    ON settings(workspace_id, key)
+    WHERE workspace_id IS NOT NULL;
+
+PRAGMA foreign_keys=ON;
 "#,
     ),
 ];

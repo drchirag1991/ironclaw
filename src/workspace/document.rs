@@ -63,6 +63,8 @@ pub struct MemoryDocument {
     pub id: Uuid,
     /// User identifier.
     pub user_id: String,
+    /// Shared workspace scope when this document belongs to a workspace entity.
+    pub workspace_id: Option<Uuid>,
     /// Optional agent ID for multi-agent isolation.
     pub agent_id: Option<Uuid>,
     /// File path within the workspace (e.g., "context/vision.md").
@@ -81,6 +83,7 @@ impl MemoryDocument {
     /// Create a new document with a path.
     pub fn new(
         user_id: impl Into<String>,
+        workspace_id: Option<Uuid>,
         agent_id: Option<Uuid>,
         path: impl Into<String>,
     ) -> Self {
@@ -88,6 +91,7 @@ impl MemoryDocument {
         Self {
             id: Uuid::new_v4(),
             user_id: user_id.into(),
+            workspace_id,
             agent_id,
             path: path.into(),
             content: String::new(),

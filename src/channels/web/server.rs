@@ -49,6 +49,12 @@ use crate::channels::web::handlers::routines::{
 use crate::channels::web::handlers::skills::{
     skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
 };
+use crate::channels::web::handlers::workspaces::{
+    ResolvedWorkspace, WorkspaceQuery, resolve_workspace_scope, workspace_members_delete_handler, workspace_members_list_handler,
+    workspace_members_upsert_handler, workspace_scope_user_id, workspaces_archive_handler,
+    workspaces_create_handler, workspaces_detail_handler, workspaces_list_handler,
+    workspaces_update_handler,
+};
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
@@ -267,10 +273,22 @@ impl WorkspacePool {
     /// Applies search config, memory layers, embedding cache, and read scopes
     /// (both from global config and from the token's `workspace_read_scopes`).
     pub async fn get_or_create(&self, identity: &UserIdentity) -> Arc<Workspace> {
+        self.get_or_create_scoped(identity, None).await
+    }
+
+    pub async fn get_or_create_scoped(
+        &self,
+        identity: &UserIdentity,
+        workspace_scope: Option<&ResolvedWorkspace>,
+    ) -> Arc<Workspace> {
+        let scope_user_id = workspace_scope
+            .map(|scope| workspace_scope_user_id(scope.workspace.id))
+            .unwrap_or_else(|| identity.user_id.clone());
+
         // Fast path: check read lock
         {
             let cache = self.cache.read().await;
-            if let Some(ws) = cache.get(&identity.user_id) {
+            if let Some(ws) = cache.get(&scope_user_id) {
                 return Arc::clone(ws);
             }
         }
@@ -278,20 +296,21 @@ impl WorkspacePool {
         // Slow path: create workspace under write lock
         let mut cache = self.cache.write().await;
         // Double-check after acquiring write lock
-        if let Some(ws) = cache.get(&identity.user_id) {
+        if let Some(ws) = cache.get(&scope_user_id) {
             return Arc::clone(ws);
         }
 
-        let mut ws = self.build_workspace(&identity.user_id);
+        let mut ws = self.build_workspace(&scope_user_id);
 
-        // Apply per-token read scopes from identity.
-        if !identity.workspace_read_scopes.is_empty() {
+        // Shared workspaces use a dedicated synthetic scope and do not inherit
+        // legacy token read scopes.
+        if workspace_scope.is_none() && !identity.workspace_read_scopes.is_empty() {
             ws = ws.with_additional_read_scopes(identity.workspace_read_scopes.clone());
         }
 
         let ws = Arc::new(ws);
 
-        cache.insert(identity.user_id.clone(), Arc::clone(&ws));
+        cache.insert(scope_user_id.clone(), Arc::clone(&ws));
 
         // Seed identity files after inserting into cache (so the lock can be
         // dropped) but before returning, so callers see a seeded workspace.
@@ -300,7 +319,7 @@ impl WorkspacePool {
         drop(cache);
         if let Err(e) = ws.seed_if_empty().await {
             tracing::warn!(
-                user_id = identity.user_id,
+                user_id = scope_user_id,
                 "Failed to seed workspace: {}",
                 e
             );
@@ -331,6 +350,31 @@ impl crate::tools::builtin::memory::WorkspaceResolver for WorkspacePool {
         cache.insert(user_id.to_string(), Arc::clone(&ws));
         tracing::debug!(user_id = user_id, "Created per-user workspace");
         ws
+    }
+
+    async fn resolve_for_context(&self, user_id: &str, workspace_id: Option<&str>) -> Arc<Workspace> {
+        if let Some(workspace_id) = workspace_id
+            && let Ok(parsed) = Uuid::parse_str(workspace_id)
+        {
+            let scoped_user_id = workspace_scope_user_id(parsed);
+            {
+                let cache = self.cache.read().await;
+                if let Some(ws) = cache.get(&scoped_user_id) {
+                    return Arc::clone(ws);
+                }
+            }
+
+            let mut cache = self.cache.write().await;
+            if let Some(ws) = cache.get(&scoped_user_id) {
+                return Arc::clone(ws);
+            }
+
+            let ws = Arc::new(self.build_workspace(&scoped_user_id));
+            cache.insert(scoped_user_id, Arc::clone(&ws));
+            return ws;
+        }
+
+        self.resolve(user_id).await
     }
 }
 
@@ -508,6 +552,27 @@ pub async fn start_server(
             axum::routing::delete(routines_delete_handler),
         )
         .route("/api/routines/{id}/runs", get(routines_runs_handler))
+        // Workspaces
+        .route("/api/workspaces", get(workspaces_list_handler))
+        .route("/api/workspaces", post(workspaces_create_handler))
+        .route("/api/workspaces/{slug}", get(workspaces_detail_handler))
+        .route("/api/workspaces/{slug}", put(workspaces_update_handler))
+        .route(
+            "/api/workspaces/{slug}/archive",
+            post(workspaces_archive_handler),
+        )
+        .route(
+            "/api/workspaces/{slug}/members",
+            get(workspace_members_list_handler),
+        )
+        .route(
+            "/api/workspaces/{slug}/members/{user_id}",
+            put(workspace_members_upsert_handler),
+        )
+        .route(
+            "/api/workspaces/{slug}/members/{user_id}",
+            axum::routing::delete(workspace_members_delete_handler),
+        )
         // Skills
         .route("/api/skills", get(skills_list_handler))
         .route("/api/skills/search", post(skills_search_handler))
@@ -1408,9 +1473,29 @@ fn mime_to_ext(mime: &str) -> &str {
     }
 }
 
+async fn resolve_chat_workspace_id(
+    state: &GatewayState,
+    user: &UserIdentity,
+    workspace_slug: Option<&str>,
+) -> Result<Option<Uuid>, (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        if workspace_slug.is_some() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database not available".to_string(),
+            ));
+        }
+        return Ok(None);
+    };
+    Ok(resolve_workspace_scope(store, user, workspace_slug)
+        .await?
+        .map(|scope| scope.workspace.id))
+}
+
 async fn chat_send_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
     headers: axum::http::HeaderMap,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<SendMessageResponse>), (StatusCode, String)> {
@@ -1427,7 +1512,12 @@ async fn chat_send_handler(
         ));
     }
 
+    let workspace_id =
+        resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref()).await?;
     let mut msg = IncomingMessage::new("gateway", &user.user_id, &req.content);
+    if let Some(workspace_id) = workspace_id {
+        msg.workspace_id = Some(workspace_id.to_string());
+    }
     // Prefer timezone from JSON body, fall back to X-Timezone header
     let tz = req
         .timezone
@@ -1439,6 +1529,9 @@ async fn chat_send_handler(
 
     // Always include user_id in metadata so downstream SSE broadcasts can scope events.
     let mut meta = serde_json::json!({"user_id": &user.user_id});
+    if let Some(workspace_id) = workspace_id {
+        meta["workspace_id"] = serde_json::json!(workspace_id);
+    }
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
         meta["thread_id"] = serde_json::json!(thread_id);
@@ -1532,6 +1625,33 @@ async fn chat_approval_handler(
 
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
+        if let Some(ref sm) = state.session_manager
+            && let Ok(thread_uuid) = Uuid::parse_str(thread_id)
+        {
+            let session = sm.get_or_create_session(&user.user_id).await;
+            let sess = session.lock().await;
+            if let Some(workspace_id) = sess
+                .threads
+                .get(&thread_uuid)
+                .and_then(|thread| thread.pending_approval.as_ref())
+                .and_then(|pending| pending.workspace_id.clone())
+            {
+                msg.workspace_id = Some(workspace_id.clone());
+                msg = msg.with_metadata(serde_json::json!({
+                    "user_id": &user.user_id,
+                    "thread_id": thread_id,
+                    "workspace_id": workspace_id,
+                }));
+            }
+        }
+    }
+
+    if msg.metadata.is_null() {
+        let mut metadata = serde_json::json!({"user_id": &user.user_id});
+        if let Some(ref thread_id) = req.thread_id {
+            metadata["thread_id"] = serde_json::json!(thread_id);
+        }
+        msg = msg.with_metadata(metadata);
     }
 
     let msg_id = msg.id;
@@ -1672,11 +1792,16 @@ pub async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
 async fn chat_events_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let sse = state.sse.subscribe(Some(user.user_id)).ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Too many connections".to_string(),
-    ))?;
+    let workspace_scope =
+        resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref())
+            .await?
+            .map(|id| id.to_string());
+    let sse = state
+        .sse
+        .subscribe_scoped(Some(user.user_id), workspace_scope)
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Too many connections".to_string()))?;
     Ok((
         [("X-Accel-Buffering", "no"), ("Cache-Control", "no-cache")],
         sse,
@@ -1708,6 +1833,7 @@ fn is_local_origin(origin: &str) -> bool {
 
 async fn chat_ws_handler(
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
     State(state): State<Arc<GatewayState>>,
@@ -1732,8 +1858,11 @@ async fn chat_ws_handler(
             "WebSocket origin not allowed".to_string(),
         ));
     }
+    let workspace_id = resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref())
+        .await?
+        .map(|id| id.to_string());
     Ok(ws.on_upgrade(move |socket| {
-        crate::channels::web::ws::handle_ws_connection(socket, state, user)
+        crate::channels::web::ws::handle_ws_connection(socket, state, user, workspace_id)
     }))
 }
 
@@ -1742,6 +1871,7 @@ struct HistoryQuery {
     thread_id: Option<String>,
     limit: Option<usize>,
     before: Option<String>,
+    workspace: Option<String>,
 }
 
 async fn chat_history_handler(
@@ -1783,13 +1913,14 @@ async fn chat_history_handler(
     };
 
     // Verify the thread belongs to the authenticated user before returning any data.
+    let workspace_id = resolve_chat_workspace_id(&state, &user, query.workspace.as_deref()).await?;
     // In-memory threads are already scoped by user via session_manager, but DB
     // lookups could expose another user's conversation if the UUID is guessed.
     if query.thread_id.is_some()
         && let Some(ref store) = state.store
     {
         let owned = store
-            .conversation_belongs_to_user(thread_id, &user.user_id)
+            .conversation_belongs_to_user(thread_id, &user.user_id, workspace_id)
             .await
             .map_err(|e| {
                 tracing::error!(thread_id = %thread_id, error = %e, "DB error during thread ownership check");
@@ -1908,6 +2039,7 @@ async fn chat_history_handler(
 async fn chat_threads_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
 ) -> Result<Json<ThreadListResponse>, (StatusCode, String)> {
     let session_manager = state.session_manager.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1919,14 +2051,17 @@ async fn chat_threads_handler(
 
     // Try DB first for persistent thread list
     if let Some(ref store) = state.store {
+        let workspace_id =
+            resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref())
+                .await?;
         // Auto-create assistant thread if it doesn't exist
         let assistant_id = store
-            .get_or_create_assistant_conversation(&user.user_id, "gateway")
+            .get_or_create_assistant_conversation(&user.user_id, workspace_id, "gateway")
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         match store
-            .list_conversations_all_channels(&user.user_id, 50)
+            .list_conversations_all_channels(&user.user_id, workspace_id, 50)
             .await
         {
             Ok(summaries) => {
@@ -2005,6 +2140,7 @@ async fn chat_threads_handler(
 async fn chat_new_thread_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
 ) -> Result<Json<ThreadInfo>, (StatusCode, String)> {
     let session_manager = state.session_manager.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -2032,8 +2168,11 @@ async fn chat_new_thread_handler(
     // Persist the empty conversation row with thread_type metadata synchronously
     // so that the subsequent loadThreads() call from the frontend sees it.
     if let Some(ref store) = state.store {
+        let workspace_id =
+            resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref())
+                .await?;
         match store
-            .ensure_conversation(thread_id, "gateway", &user.user_id, None)
+            .ensure_conversation(thread_id, "gateway", &user.user_id, workspace_id, None)
             .await
         {
             Ok(true) => {}
@@ -2678,6 +2817,7 @@ async fn pairing_approve_handler(
 async fn routines_runs_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let store = state.store.as_ref().ok_or((
@@ -2688,14 +2828,18 @@ async fn routines_runs_handler(
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
-    // Verify ownership before listing runs.
+    let scope = resolve_workspace_scope(store, &user, workspace_query.workspace.as_deref()).await?;
     let routine = store
         .get_routine(routine_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
 
-    if routine.user_id != user.user_id {
+    let visible = match scope {
+        Some(scope) => routine.workspace_id == Some(scope.workspace.id),
+        None => routine.workspace_id.is_none() && routine.user_id == user.user_id,
+    };
+    if !visible {
         return Err((StatusCode::NOT_FOUND, "Routine not found".to_string()));
     }
 
@@ -2729,15 +2873,29 @@ async fn routines_runs_handler(
 async fn settings_list_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
 ) -> Result<Json<SettingsListResponse>, StatusCode> {
     let store = state
         .store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let rows = store.list_settings(&user.user_id).await.map_err(|e| {
-        tracing::error!("Failed to list settings: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let scope = resolve_workspace_scope(store, &user, workspace_query.workspace.as_deref())
+        .await
+        .map_err(|(status, _)| status)?;
+    let rows = if let Some(scope) = scope {
+        store
+            .list_settings_for_workspace(scope.workspace.id)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to list workspace settings: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    } else {
+        store.list_settings(&user.user_id).await.map_err(|e| {
+            tracing::error!("Failed to list settings: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    };
 
     let settings = rows
         .into_iter()
@@ -2754,20 +2912,34 @@ async fn settings_list_handler(
 async fn settings_get_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
     Path(key): Path<String>,
 ) -> Result<Json<SettingResponse>, StatusCode> {
     let store = state
         .store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let row = store
-        .get_setting_full(&user.user_id, &key)
+    let scope = resolve_workspace_scope(store, &user, workspace_query.workspace.as_deref())
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to get setting '{}': {}", key, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(|(status, _)| status)?;
+    let row = if let Some(scope) = scope {
+        store
+            .get_setting_full_for_workspace(scope.workspace.id, &key)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to get workspace setting '{}': {}", key, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    } else {
+        store
+            .get_setting_full(&user.user_id, &key)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to get setting '{}': {}", key, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    }
+    .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(SettingResponse {
         key: row.key,
@@ -2779,6 +2951,7 @@ async fn settings_get_handler(
 async fn settings_set_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
     Path(key): Path<String>,
     Json(body): Json<SettingWriteRequest>,
 ) -> Result<StatusCode, StatusCode> {
@@ -2786,13 +2959,26 @@ async fn settings_set_handler(
         .store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    store
-        .set_setting(&user.user_id, &key, &body.value)
+    let scope = resolve_workspace_scope(store, &user, workspace_query.workspace.as_deref())
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to set setting '{}': {}", key, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .map_err(|(status, _)| status)?;
+    if let Some(scope) = scope {
+        store
+            .set_setting_for_workspace(scope.workspace.id, &key, &body.value)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to set workspace setting '{}': {}", key, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    } else {
+        store
+            .set_setting(&user.user_id, &key, &body.value)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to set setting '{}': {}", key, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2800,19 +2986,33 @@ async fn settings_set_handler(
 async fn settings_delete_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
     Path(key): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let store = state
         .store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    store
-        .delete_setting(&user.user_id, &key)
+    let scope = resolve_workspace_scope(store, &user, workspace_query.workspace.as_deref())
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to delete setting '{}': {}", key, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .map_err(|(status, _)| status)?;
+    if let Some(scope) = scope {
+        store
+            .delete_setting_for_workspace(scope.workspace.id, &key)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to delete workspace setting '{}': {}", key, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    } else {
+        store
+            .delete_setting(&user.user_id, &key)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to delete setting '{}': {}", key, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2820,15 +3020,29 @@ async fn settings_delete_handler(
 async fn settings_export_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
 ) -> Result<Json<SettingsExportResponse>, StatusCode> {
     let store = state
         .store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let settings = store.get_all_settings(&user.user_id).await.map_err(|e| {
-        tracing::error!("Failed to export settings: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let scope = resolve_workspace_scope(store, &user, workspace_query.workspace.as_deref())
+        .await
+        .map_err(|(status, _)| status)?;
+    let settings = if let Some(scope) = scope {
+        store
+            .get_all_settings_for_workspace(scope.workspace.id)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to export workspace settings: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    } else {
+        store.get_all_settings(&user.user_id).await.map_err(|e| {
+            tracing::error!("Failed to export settings: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    };
 
     Ok(Json(SettingsExportResponse { settings }))
 }
@@ -2836,19 +3050,33 @@ async fn settings_export_handler(
 async fn settings_import_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
     Json(body): Json<SettingsImportRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let store = state
         .store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    store
-        .set_all_settings(&user.user_id, &body.settings)
+    let scope = resolve_workspace_scope(store, &user, workspace_query.workspace.as_deref())
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to import settings: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .map_err(|(status, _)| status)?;
+    if let Some(scope) = scope {
+        store
+            .set_all_settings_for_workspace(scope.workspace.id, &body.settings)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to import workspace settings: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    } else {
+        store
+            .set_all_settings(&user.user_id, &body.settings)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to import settings: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

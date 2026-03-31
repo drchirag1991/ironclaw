@@ -66,6 +66,7 @@ pub async fn handle_ws_connection(
     socket: WebSocket,
     state: Arc<GatewayState>,
     user: crate::channels::web::auth::UserIdentity,
+    workspace_id: Option<String>,
 ) {
     let (mut ws_sink, mut ws_stream) = socket.split();
 
@@ -77,7 +78,10 @@ pub async fn handle_ws_connection(
 
     // Subscribe to broadcast events (same source as SSE), scoped to this user.
     // Reject if we've hit the connection limit.
-    let Some(raw_stream) = state.sse.subscribe_raw(Some(user.user_id.clone())) else {
+    let Some(raw_stream) = state
+        .sse
+        .subscribe_raw_scoped(Some(user.user_id.clone()), workspace_id.clone())
+    else {
         tracing::warn!("WebSocket rejected: too many connections");
         // Decrement the WS tracker we already incremented above.
         if let Some(ref tracker) = tracker_for_drop {
@@ -128,7 +132,14 @@ pub async fn handle_ws_connection(
                 let parsed: Result<WsClientMessage, _> = serde_json::from_str(&text);
                 match parsed {
                     Ok(client_msg) => {
-                        handle_client_message(client_msg, &state, &user_id, &direct_tx).await;
+                        handle_client_message(
+                            client_msg,
+                            &state,
+                            &user_id,
+                            workspace_id.as_deref(),
+                            &direct_tx,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         let _ = direct_tx
@@ -157,6 +168,7 @@ async fn handle_client_message(
     msg: WsClientMessage,
     state: &GatewayState,
     user_id: &str,
+    workspace_id: Option<&str>,
     direct_tx: &mpsc::Sender<WsServerMessage>,
 ) {
     match msg {
@@ -167,12 +179,23 @@ async fn handle_client_message(
             images,
         } => {
             let mut incoming = IncomingMessage::new("gateway", user_id, &content);
+            if let Some(workspace_id) = workspace_id {
+                incoming.workspace_id = Some(workspace_id.to_string());
+            }
             if let Some(ref tz) = timezone {
                 incoming = incoming.with_timezone(tz);
             }
             if let Some(ref tid) = thread_id {
                 incoming = incoming.with_thread(tid);
             }
+            let mut metadata = serde_json::json!({ "user_id": user_id });
+            if let Some(ref tid) = thread_id {
+                metadata["thread_id"] = serde_json::json!(tid);
+            }
+            if let Some(workspace_id) = workspace_id {
+                metadata["workspace_id"] = serde_json::json!(workspace_id);
+            }
+            incoming = incoming.with_metadata(metadata);
 
             // Convert uploaded images to IncomingAttachments
             if !images.is_empty() {
@@ -253,6 +276,17 @@ async fn handle_client_message(
             if let Some(ref tid) = thread_id {
                 msg = msg.with_thread(tid);
             }
+            if let Some(workspace_id) = workspace_id {
+                msg.workspace_id = Some(workspace_id.to_string());
+            }
+            let mut metadata = serde_json::json!({ "user_id": user_id });
+            if let Some(ref tid) = thread_id {
+                metadata["thread_id"] = serde_json::json!(tid);
+            }
+            if let Some(workspace_id) = workspace_id {
+                metadata["workspace_id"] = serde_json::json!(workspace_id);
+            }
+            msg = msg.with_metadata(metadata);
             // Clone sender to avoid holding RwLock read guard across send().await
             let tx = {
                 let tx_guard = state.msg_tx.read().await;

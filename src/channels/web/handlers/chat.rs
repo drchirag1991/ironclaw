@@ -13,15 +13,36 @@ use uuid::Uuid;
 
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::AuthenticatedUser;
+use crate::channels::web::handlers::workspaces::{WorkspaceQuery, resolve_workspace_scope};
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
 use crate::channels::web::util::{
     build_turns_from_db_messages, tool_error_for_display, truncate_preview,
 };
 
+async fn resolve_chat_workspace_id(
+    state: &GatewayState,
+    user: &crate::channels::web::auth::UserIdentity,
+    workspace_slug: Option<&str>,
+) -> Result<Option<Uuid>, (StatusCode, String)> {
+    let Some(store) = state.store.as_ref() else {
+        if workspace_slug.is_some() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Database not available".to_string(),
+            ));
+        }
+        return Ok(None);
+    };
+    Ok(resolve_workspace_scope(store, user, workspace_slug)
+        .await?
+        .map(|scope| scope.workspace.id))
+}
+
 pub async fn chat_send_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(identity): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
     Json(req): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<SendMessageResponse>), (StatusCode, String)> {
     if !state.chat_rate_limiter.check(&identity.user_id) {
@@ -31,12 +52,24 @@ pub async fn chat_send_handler(
         ));
     }
 
+    let workspace_id =
+        resolve_chat_workspace_id(&state, &identity, workspace_query.workspace.as_deref())
+            .await?
+            .map(|id| id.to_string());
     let mut msg = IncomingMessage::new("gateway", &identity.user_id, &req.content);
+    if let Some(ref workspace_id) = workspace_id {
+        msg.workspace_id = Some(workspace_id.clone());
+    }
 
+    let mut metadata = serde_json::json!({ "user_id": &identity.user_id });
+    if let Some(ref workspace_id) = workspace_id {
+        metadata["workspace_id"] = serde_json::json!(workspace_id);
+    }
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
-        msg = msg.with_metadata(serde_json::json!({"thread_id": thread_id}));
+        metadata["thread_id"] = serde_json::json!(thread_id);
     }
+    msg = msg.with_metadata(metadata);
 
     let msg_id = msg.id;
     let thread_id = msg.thread_id.clone();
@@ -118,6 +151,33 @@ pub async fn chat_approval_handler(
 
     if let Some(ref thread_id) = req.thread_id {
         msg = msg.with_thread(thread_id);
+        if let Some(ref sm) = state.session_manager
+            && let Ok(thread_uuid) = Uuid::parse_str(thread_id)
+        {
+            let session = sm.get_or_create_session(&identity.user_id).await;
+            let sess = session.lock().await;
+            if let Some(workspace_id) = sess
+                .threads
+                .get(&thread_uuid)
+                .and_then(|thread| thread.pending_approval.as_ref())
+                .and_then(|pending| pending.workspace_id.clone())
+            {
+                msg.workspace_id = Some(workspace_id.clone());
+                msg = msg.with_metadata(serde_json::json!({
+                    "user_id": &identity.user_id,
+                    "thread_id": thread_id,
+                    "workspace_id": workspace_id,
+                }));
+            }
+        }
+    }
+
+    if msg.metadata.is_null() {
+        let mut metadata = serde_json::json!({ "user_id": &identity.user_id });
+        if let Some(ref thread_id) = req.thread_id {
+            metadata["thread_id"] = serde_json::json!(thread_id);
+        }
+        msg = msg.with_metadata(metadata);
     }
 
     let msg_id = msg.id;
@@ -243,11 +303,19 @@ pub async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
 pub async fn chat_events_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    state.sse.subscribe(Some(user.user_id)).ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Too many connections".to_string(),
-    ))
+    let workspace_scope =
+        resolve_chat_workspace_id(&state, &user, workspace_query.workspace.as_deref())
+            .await?
+            .map(|id| id.to_string());
+    state
+        .sse
+        .subscribe_scoped(Some(user.user_id), workspace_scope)
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Too many connections".to_string(),
+        ))
 }
 
 pub async fn chat_ws_handler(
@@ -255,6 +323,7 @@ pub async fn chat_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(identity): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     // Validate Origin header to prevent cross-site WebSocket hijacking.
     let origin = headers
@@ -280,8 +349,12 @@ pub async fn chat_ws_handler(
             "WebSocket origin not allowed".to_string(),
         ));
     }
+    let workspace_id =
+        resolve_chat_workspace_id(&state, &identity, workspace_query.workspace.as_deref())
+            .await?
+            .map(|id| id.to_string());
     Ok(ws.on_upgrade(move |socket| {
-        crate::channels::web::ws::handle_ws_connection(socket, state, identity)
+        crate::channels::web::ws::handle_ws_connection(socket, state, identity, workspace_id)
     }))
 }
 
@@ -290,6 +363,7 @@ pub struct HistoryQuery {
     pub thread_id: Option<String>,
     pub limit: Option<usize>,
     pub before: Option<String>,
+    pub workspace: Option<String>,
 }
 
 pub async fn chat_history_handler(
@@ -333,11 +407,13 @@ pub async fn chat_history_handler(
     };
 
     // Verify the thread belongs to the authenticated user before returning any data.
+    let workspace_id =
+        resolve_chat_workspace_id(&state, &identity, query.workspace.as_deref()).await?;
     if query.thread_id.is_some()
         && let Some(ref store) = state.store
     {
         let owned = store
-            .conversation_belongs_to_user(thread_id, &identity.user_id)
+            .conversation_belongs_to_user(thread_id, &identity.user_id, workspace_id)
             .await
             .unwrap_or(false);
         if !owned {
@@ -460,6 +536,7 @@ pub async fn chat_history_handler(
 pub async fn chat_threads_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(identity): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
 ) -> Result<Json<ThreadListResponse>, (StatusCode, String)> {
     let session_manager = state.session_manager.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -472,14 +549,17 @@ pub async fn chat_threads_handler(
 
     // Try DB first for persistent thread list
     if let Some(ref store) = state.store {
+        let workspace_id =
+            resolve_chat_workspace_id(&state, &identity, workspace_query.workspace.as_deref())
+                .await?;
         // Auto-create assistant thread if it doesn't exist
         let assistant_id = store
-            .get_or_create_assistant_conversation(&identity.user_id, "gateway")
+            .get_or_create_assistant_conversation(&identity.user_id, workspace_id, "gateway")
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         if let Ok(summaries) = store
-            .list_conversations_all_channels(&identity.user_id, 50)
+            .list_conversations_all_channels(&identity.user_id, workspace_id, 50)
             .await
         {
             let mut assistant_thread = None;
@@ -563,6 +643,7 @@ pub async fn chat_threads_handler(
 pub async fn chat_new_thread_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(identity): AuthenticatedUser,
+    Query(workspace_query): Query<WorkspaceQuery>,
 ) -> Result<Json<ThreadInfo>, (StatusCode, String)> {
     let session_manager = state.session_manager.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -592,8 +673,11 @@ pub async fn chat_new_thread_handler(
     // Persist the empty conversation row with thread_type metadata synchronously
     // so that the subsequent loadThreads() call from the frontend sees it.
     if let Some(ref store) = state.store {
+        let workspace_id =
+            resolve_chat_workspace_id(&state, &identity, workspace_query.workspace.as_deref())
+                .await?;
         match store
-            .ensure_conversation(thread_id, "gateway", &identity.user_id, None)
+            .ensure_conversation(thread_id, "gateway", &identity.user_id, workspace_id, None)
             .await
         {
             Ok(true) => {}

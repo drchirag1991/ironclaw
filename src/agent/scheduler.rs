@@ -203,6 +203,10 @@ impl Scheduler {
         let ctx = if let Some(meta) = metadata {
             self.context_manager
                 .update_context_and_get(job_id, |ctx| {
+                    ctx.workspace_id = meta
+                        .get("workspace_id")
+                        .and_then(|value| value.as_str())
+                        .map(ToOwned::to_owned);
                     ctx.metadata = meta;
                     if max_tokens > 0 {
                         ctx.max_tokens = max_tokens;

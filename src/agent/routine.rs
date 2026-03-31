@@ -35,6 +35,7 @@ pub struct Routine {
     pub name: String,
     pub description: String,
     pub user_id: String,
+    pub workspace_id: Option<Uuid>,
     pub enabled: bool,
     pub trigger: Trigger,
     pub action: RoutineAction,

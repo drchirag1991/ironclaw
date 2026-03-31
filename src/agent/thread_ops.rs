@@ -25,6 +25,10 @@ use ironclaw_common::truncate_preview;
 
 const FORGED_THREAD_ID_ERROR: &str = "Invalid or unauthorized thread ID.";
 
+fn parsed_workspace_id(workspace_id: Option<&str>) -> Option<Uuid> {
+    workspace_id.and_then(|id| Uuid::parse_str(id).ok())
+}
+
 fn requires_preexisting_uuid_thread(channel: &str) -> bool {
     // Gateway-style channels send server-issued conversation UUIDs.
     // Unknown UUIDs should be rejected instead of silently creating a new thread.
@@ -72,7 +76,11 @@ impl Agent {
             // Never hydrate history from a conversation UUID that isn't owned
             // by the current authenticated user.
             let owned = match store
-                .conversation_belongs_to_user(thread_uuid, &message.user_id)
+                .conversation_belongs_to_user(
+                    thread_uuid,
+                    &message.user_id,
+                    parsed_workspace_id(message.workspace_id.as_deref()),
+                )
                 .await
             {
                 Ok(v) => v,
@@ -636,7 +644,7 @@ impl Agent {
         user_id: &str,
     ) -> bool {
         match store
-            .ensure_conversation(thread_id, channel, user_id, None)
+            .ensure_conversation(thread_id, channel, user_id, None, None)
             .await
         {
             Ok(true) => true,
@@ -1048,6 +1056,7 @@ impl Agent {
             let mut job_ctx =
                 JobContext::with_user(&message.user_id, "chat", "Interactive chat session")
                     .with_requester_id(&message.sender_id);
+            job_ctx.workspace_id = message.workspace_id.clone();
             job_ctx.http_interceptor = self.deps.http_interceptor.clone();
             job_ctx.metadata = crate::agent::agent_loop::chat_tool_execution_metadata(message);
             // Prefer a valid timezone from the approval message, fall back to the
@@ -1433,6 +1442,7 @@ impl Agent {
                     deferred_tool_calls: deferred_tool_calls[approval_idx + 1..].to_vec(),
                     // Carry forward the resolved timezone from the original pending approval
                     user_timezone: pending.user_timezone.clone(),
+                    workspace_id: pending.workspace_id.clone(),
                     allow_always,
                 };
 
@@ -2130,6 +2140,7 @@ mod tests {
             context_messages: vec![],
             deferred_tool_calls: vec![],
             user_timezone: None,
+            workspace_id: None,
             allow_always: false,
         };
         thread.await_approval(pending);

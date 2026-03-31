@@ -148,6 +148,7 @@ impl Agent {
         let mut job_ctx =
             JobContext::with_user(&message.user_id, "chat", "Interactive chat session")
                 .with_requester_id(&message.sender_id);
+        job_ctx.workspace_id = message.workspace_id.clone();
         job_ctx.http_interceptor = self.deps.http_interceptor.clone();
         job_ctx.user_timezone = user_tz.name().to_string();
         job_ctx.metadata = crate::agent::agent_loop::chat_tool_execution_metadata(message);
@@ -1007,6 +1008,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 context_messages: reason_ctx.messages.clone(),
                 deferred_tool_calls: tool_calls[approval_idx + 1..].to_vec(),
                 user_timezone: Some(self.user_tz.name().to_string()),
+                workspace_id: self.job_ctx.workspace_id.clone(),
                 allow_always,
             };
 
@@ -1615,6 +1617,7 @@ mod tests {
                 },
             ],
             user_timezone: None,
+            workspace_id: None,
             allow_always: true,
         };
 

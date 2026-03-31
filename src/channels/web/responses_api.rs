@@ -1056,7 +1056,7 @@ pub async fn get_response_handler(
 
     // Verify the authenticated user owns this conversation.
     let owns = store
-        .conversation_belongs_to_user(thread_uuid, &user.user_id)
+        .conversation_belongs_to_user(thread_uuid, &user.user_id, None)
         .await
         .map_err(|e| {
             api_error(

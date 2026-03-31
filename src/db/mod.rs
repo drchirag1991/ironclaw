@@ -346,6 +346,39 @@ pub struct ApiTokenRecord {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+/// A first-class shared workspace entity.
+#[derive(Debug, Clone)]
+pub struct WorkspaceRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub slug: String,
+    pub description: String,
+    /// `active` or `archived`.
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub created_by: String,
+    pub settings: serde_json::Value,
+}
+
+/// A user's membership in a shared workspace.
+#[derive(Debug, Clone)]
+pub struct WorkspaceMemberRecord {
+    pub workspace_id: Uuid,
+    pub user_id: String,
+    /// `owner`, `admin`, `member`, or `viewer`.
+    pub role: String,
+    pub joined_at: DateTime<Utc>,
+    pub invited_by: Option<String>,
+}
+
+/// Resolved workspace plus the caller's membership role.
+#[derive(Debug, Clone)]
+pub struct WorkspaceMembership {
+    pub workspace: WorkspaceRecord,
+    pub role: String,
+}
+
 // ==================== Sub-traits ====================
 //
 // Each sub-trait groups related persistence methods. The `Database` supertrait
@@ -358,6 +391,7 @@ pub trait ConversationStore: Send + Sync {
         &self,
         channel: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         thread_id: Option<&str>,
     ) -> Result<Uuid, DatabaseError>;
     async fn touch_conversation(&self, id: Uuid) -> Result<(), DatabaseError>;
@@ -372,17 +406,20 @@ pub trait ConversationStore: Send + Sync {
         id: Uuid,
         channel: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         thread_id: Option<&str>,
     ) -> Result<bool, DatabaseError>;
     async fn list_conversations_with_preview(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         channel: &str,
         limit: i64,
     ) -> Result<Vec<ConversationSummary>, DatabaseError>;
     async fn list_conversations_all_channels(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<ConversationSummary>, DatabaseError>;
     async fn get_or_create_routine_conversation(
@@ -390,6 +427,7 @@ pub trait ConversationStore: Send + Sync {
         routine_id: Uuid,
         routine_name: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<Uuid, DatabaseError>;
     /// Read-only lookup for an existing routine conversation. Returns `None`
     /// if the routine has never executed (no conversation created yet).
@@ -397,20 +435,24 @@ pub trait ConversationStore: Send + Sync {
         &self,
         routine_id: Uuid,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<Option<Uuid>, DatabaseError>;
     async fn get_or_create_heartbeat_conversation(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<Uuid, DatabaseError>;
     async fn get_or_create_assistant_conversation(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         channel: &str,
     ) -> Result<Uuid, DatabaseError>;
     async fn create_conversation_with_metadata(
         &self,
         channel: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         metadata: &serde_json::Value,
     ) -> Result<Uuid, DatabaseError>;
     async fn list_conversation_messages_paginated(
@@ -437,6 +479,7 @@ pub trait ConversationStore: Send + Sync {
         &self,
         conversation_id: Uuid,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<bool, DatabaseError>;
 }
 
@@ -457,10 +500,18 @@ pub trait JobStore: Send + Sync {
         &self,
         user_id: &str,
     ) -> Result<Vec<AgentJobRecord>, DatabaseError>;
+    async fn list_agent_jobs_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<AgentJobRecord>, DatabaseError>;
     async fn agent_job_summary(&self) -> Result<AgentJobSummary, DatabaseError>;
     async fn agent_job_summary_for_user(
         &self,
         user_id: &str,
+    ) -> Result<AgentJobSummary, DatabaseError>;
+    async fn agent_job_summary_for_workspace(
+        &self,
+        workspace_id: Uuid,
     ) -> Result<AgentJobSummary, DatabaseError>;
     /// Get the failure reason for a single agent job (O(1) lookup).
     async fn get_agent_job_failure_reason(&self, id: Uuid)
@@ -506,9 +557,17 @@ pub trait SandboxStore: Send + Sync {
         &self,
         user_id: &str,
     ) -> Result<Vec<SandboxJobRecord>, DatabaseError>;
+    async fn list_sandbox_jobs_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError>;
     async fn sandbox_job_summary_for_user(
         &self,
         user_id: &str,
+    ) -> Result<SandboxJobSummary, DatabaseError>;
+    async fn sandbox_job_summary_for_workspace(
+        &self,
+        workspace_id: Uuid,
     ) -> Result<SandboxJobSummary, DatabaseError>;
     async fn sandbox_job_belongs_to_user(
         &self,
@@ -537,9 +596,14 @@ pub trait RoutineStore: Send + Sync {
     async fn get_routine_by_name(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         name: &str,
     ) -> Result<Option<Routine>, DatabaseError>;
     async fn list_routines(&self, user_id: &str) -> Result<Vec<Routine>, DatabaseError>;
+    async fn list_routines_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<Routine>, DatabaseError>;
     async fn list_all_routines(&self) -> Result<Vec<Routine>, DatabaseError>;
     async fn list_event_routines(&self) -> Result<Vec<Routine>, DatabaseError>;
     async fn list_due_cron_routines(&self) -> Result<Vec<Routine>, DatabaseError>;
@@ -616,9 +680,19 @@ pub trait SettingsStore: Send + Sync {
         user_id: &str,
         key: &str,
     ) -> Result<Option<serde_json::Value>, DatabaseError>;
+    async fn get_setting_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, DatabaseError>;
     async fn get_setting_full(
         &self,
         user_id: &str,
+        key: &str,
+    ) -> Result<Option<SettingRow>, DatabaseError>;
+    async fn get_setting_full_for_workspace(
+        &self,
+        workspace_id: Uuid,
         key: &str,
     ) -> Result<Option<SettingRow>, DatabaseError>;
     async fn set_setting(
@@ -627,18 +701,43 @@ pub trait SettingsStore: Send + Sync {
         key: &str,
         value: &serde_json::Value,
     ) -> Result<(), DatabaseError>;
+    async fn set_setting_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), DatabaseError>;
     async fn delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError>;
+    async fn delete_setting_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        key: &str,
+    ) -> Result<bool, DatabaseError>;
     async fn list_settings(&self, user_id: &str) -> Result<Vec<SettingRow>, DatabaseError>;
+    async fn list_settings_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<SettingRow>, DatabaseError>;
     async fn get_all_settings(
         &self,
         user_id: &str,
+    ) -> Result<HashMap<String, serde_json::Value>, DatabaseError>;
+    async fn get_all_settings_for_workspace(
+        &self,
+        workspace_id: Uuid,
     ) -> Result<HashMap<String, serde_json::Value>, DatabaseError>;
     async fn set_all_settings(
         &self,
         user_id: &str,
         settings: &HashMap<String, serde_json::Value>,
     ) -> Result<(), DatabaseError>;
+    async fn set_all_settings_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        settings: &HashMap<String, serde_json::Value>,
+    ) -> Result<(), DatabaseError>;
     async fn has_settings(&self, user_id: &str) -> Result<bool, DatabaseError>;
+    async fn has_settings_for_workspace(&self, workspace_id: Uuid) -> Result<bool, DatabaseError>;
 }
 
 #[async_trait]
@@ -889,6 +988,67 @@ pub trait UserStore: Send + Sync {
     ) -> Result<ApiTokenRecord, DatabaseError>;
 }
 
+#[async_trait]
+pub trait WorkspaceMgmtStore: Send + Sync {
+    async fn create_workspace(
+        &self,
+        name: &str,
+        slug: &str,
+        description: &str,
+        created_by: &str,
+        settings: &serde_json::Value,
+    ) -> Result<WorkspaceRecord, DatabaseError>;
+    async fn get_workspace(&self, id: Uuid) -> Result<Option<WorkspaceRecord>, DatabaseError>;
+    async fn get_workspace_by_slug(
+        &self,
+        slug: &str,
+    ) -> Result<Option<WorkspaceRecord>, DatabaseError>;
+    async fn list_workspaces_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<WorkspaceMembership>, DatabaseError>;
+    async fn update_workspace(
+        &self,
+        id: Uuid,
+        name: &str,
+        description: &str,
+        settings: &serde_json::Value,
+    ) -> Result<Option<WorkspaceRecord>, DatabaseError>;
+    async fn archive_workspace(&self, id: Uuid) -> Result<bool, DatabaseError>;
+    async fn add_workspace_member(
+        &self,
+        workspace_id: Uuid,
+        user_id: &str,
+        role: &str,
+        invited_by: Option<&str>,
+    ) -> Result<(), DatabaseError>;
+    async fn remove_workspace_member(
+        &self,
+        workspace_id: Uuid,
+        user_id: &str,
+    ) -> Result<bool, DatabaseError>;
+    async fn list_workspace_members(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<(UserRecord, WorkspaceMemberRecord)>, DatabaseError>;
+    async fn get_member_role(
+        &self,
+        workspace_id: Uuid,
+        user_id: &str,
+    ) -> Result<Option<String>, DatabaseError>;
+    async fn update_member_role(
+        &self,
+        workspace_id: Uuid,
+        user_id: &str,
+        role: &str,
+    ) -> Result<bool, DatabaseError>;
+    async fn is_workspace_member(
+        &self,
+        workspace_id: Uuid,
+        user_id: &str,
+    ) -> Result<bool, DatabaseError>;
+}
+
 /// Per-user LLM usage statistics.
 #[derive(Debug, Clone)]
 pub struct UserUsageStats {
@@ -926,6 +1086,7 @@ pub trait Database:
     + SettingsStore
     + WorkspaceStore
     + UserStore
+    + WorkspaceMgmtStore
     + Send
     + Sync
 {

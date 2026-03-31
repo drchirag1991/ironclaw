@@ -5,7 +5,10 @@ use chrono::{DateTime, Utc};
 use libsql::params;
 use uuid::Uuid;
 
-use super::{LibSqlBackend, fmt_ts, get_i64, get_json, get_opt_text, get_text, get_ts, opt_text};
+use super::{
+    LibSqlBackend, fmt_ts, get_i64, get_json, get_opt_text, get_text, get_ts, opt_text,
+    opt_text_owned,
+};
 use crate::db::ConversationStore;
 use crate::error::DatabaseError;
 use crate::history::{ConversationMessage, ConversationSummary};
@@ -16,14 +19,22 @@ impl ConversationStore for LibSqlBackend {
         &self,
         channel: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         thread_id: Option<&str>,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.connect().await?;
         let id = Uuid::new_v4();
         let now = fmt_ts(&Utc::now());
         conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, thread_id, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![id.to_string(), channel, user_id, opt_text(thread_id), now],
+            "INSERT INTO conversations (id, channel, user_id, workspace_id, thread_id, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                id.to_string(),
+                channel,
+                user_id,
+                opt_text_owned(workspace_id.map(|id| id.to_string())),
+                opt_text(thread_id),
+                now
+            ],
         )
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -66,6 +77,7 @@ impl ConversationStore for LibSqlBackend {
         id: Uuid,
         channel: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         thread_id: Option<&str>,
     ) -> Result<bool, DatabaseError> {
         let conn = self.connect().await?;
@@ -73,13 +85,21 @@ impl ConversationStore for LibSqlBackend {
         let affected = conn
             .execute(
             r#"
-                INSERT INTO conversations (id, channel, user_id, thread_id, started_at, last_activity)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                INSERT INTO conversations (id, channel, user_id, workspace_id, thread_id, started_at, last_activity)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
                 ON CONFLICT (id) DO UPDATE SET last_activity = excluded.last_activity
                 WHERE conversations.user_id = excluded.user_id
                   AND conversations.channel = excluded.channel
+                  AND conversations.workspace_id IS excluded.workspace_id
                 "#,
-            params![id.to_string(), channel, user_id, opt_text(thread_id), now],
+            params![
+                id.to_string(),
+                channel,
+                user_id,
+                opt_text_owned(workspace_id.map(|id| id.to_string())),
+                opt_text(thread_id),
+                now
+            ],
         )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -89,6 +109,7 @@ impl ConversationStore for LibSqlBackend {
     async fn list_conversations_with_preview(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         channel: &str,
         limit: i64,
     ) -> Result<Vec<ConversationSummary>, DatabaseError> {
@@ -102,6 +123,7 @@ impl ConversationStore for LibSqlBackend {
                     c.last_activity,
                     c.metadata,
                     c.channel,
+                    c.workspace_id,
                     (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id AND m.role = 'user') AS message_count,
                     (SELECT substr(m2.content, 1, 100)
                      FROM conversation_messages m2
@@ -110,11 +132,16 @@ impl ConversationStore for LibSqlBackend {
                      LIMIT 1
                     ) AS title
                 FROM conversations c
-                WHERE c.user_id = ?1 AND c.channel = ?2
+                WHERE c.user_id = ?1 AND c.workspace_id IS ?2 AND c.channel = ?3
                 ORDER BY datetime(c.last_activity) DESC
-                LIMIT ?3
+                LIMIT ?4
                 "#,
-                params![user_id, channel, limit],
+                params![
+                    user_id,
+                    opt_text_owned(workspace_id.map(|id| id.to_string())),
+                    channel,
+                    limit
+                ],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -130,7 +157,7 @@ impl ConversationStore for LibSqlBackend {
                 .get("thread_type")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let sql_title = get_opt_text(&row, 6);
+            let sql_title = get_opt_text(&row, 7);
             let title = sql_title.or_else(|| {
                 metadata
                     .get("routine_name")
@@ -145,10 +172,11 @@ impl ConversationStore for LibSqlBackend {
                     .unwrap_or_default(),
                 started_at: get_ts(&row, 1),
                 last_activity: get_ts(&row, 2),
-                message_count: get_i64(&row, 5),
+                message_count: get_i64(&row, 6),
                 title,
                 thread_type,
                 channel: get_text(&row, 4),
+                workspace_id: get_opt_text(&row, 5).and_then(|s| s.parse().ok()),
             });
         }
         Ok(results)
@@ -157,6 +185,7 @@ impl ConversationStore for LibSqlBackend {
     async fn list_conversations_all_channels(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<ConversationSummary>, DatabaseError> {
         let conn = self.connect().await?;
@@ -169,6 +198,7 @@ impl ConversationStore for LibSqlBackend {
                     c.last_activity,
                     c.metadata,
                     c.channel,
+                    c.workspace_id,
                     (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id AND m.role = 'user') AS message_count,
                     (SELECT substr(m2.content, 1, 100)
                      FROM conversation_messages m2
@@ -177,11 +207,11 @@ impl ConversationStore for LibSqlBackend {
                      LIMIT 1
                     ) AS title
                 FROM conversations c
-                WHERE c.user_id = ?1
+                WHERE c.user_id = ?1 AND c.workspace_id IS ?2
                 ORDER BY datetime(c.last_activity) DESC
-                LIMIT ?2
+                LIMIT ?3
                 "#,
-                params![user_id, limit],
+                params![user_id, opt_text_owned(workspace_id.map(|id| id.to_string())), limit],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -197,7 +227,7 @@ impl ConversationStore for LibSqlBackend {
                 .get("thread_type")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let sql_title = get_opt_text(&row, 6);
+            let sql_title = get_opt_text(&row, 7);
             let title = sql_title.or_else(|| {
                 metadata
                     .get("routine_name")
@@ -212,10 +242,11 @@ impl ConversationStore for LibSqlBackend {
                     .unwrap_or_default(),
                 started_at: get_ts(&row, 1),
                 last_activity: get_ts(&row, 2),
-                message_count: get_i64(&row, 5),
+                message_count: get_i64(&row, 6),
                 title,
                 thread_type,
                 channel: get_text(&row, 4),
+                workspace_id: get_opt_text(&row, 5).and_then(|s| s.parse().ok()),
             });
         }
         Ok(results)
@@ -228,6 +259,7 @@ impl ConversationStore for LibSqlBackend {
         routine_id: Uuid,
         routine_name: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.connect().await?;
         let rid = routine_id.to_string();
@@ -241,10 +273,14 @@ impl ConversationStore for LibSqlBackend {
                 .query(
                     r#"
                     SELECT id FROM conversations
-                    WHERE user_id = ?1 AND json_extract(metadata, '$.routine_id') = ?2
+                    WHERE user_id = ?1 AND workspace_id IS ?2 AND json_extract(metadata, '$.routine_id') = ?3
                     LIMIT 1
                     "#,
-                    params![user_id, rid],
+                    params![
+                        user_id,
+                        opt_text_owned(workspace_id.map(|id| id.to_string())),
+                        rid
+                    ],
                 )
                 .await
                 .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -268,8 +304,15 @@ impl ConversationStore for LibSqlBackend {
                 "routine_name": routine_name,
             });
             conn.execute(
-                "INSERT INTO conversations (id, channel, user_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                params![id.to_string(), "routine", user_id, metadata.to_string(), now],
+                "INSERT INTO conversations (id, channel, user_id, workspace_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![
+                    id.to_string(),
+                    "routine",
+                    user_id,
+                    opt_text_owned(workspace_id.map(|id| id.to_string())),
+                    metadata.to_string(),
+                    now
+                ],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -294,6 +337,7 @@ impl ConversationStore for LibSqlBackend {
         &self,
         routine_id: Uuid,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<Option<Uuid>, DatabaseError> {
         let conn = self.connect().await?;
         let rid = routine_id.to_string();
@@ -301,10 +345,14 @@ impl ConversationStore for LibSqlBackend {
             .query(
                 r#"
                 SELECT id FROM conversations
-                WHERE user_id = ?1 AND json_extract(metadata, '$.routine_id') = ?2
+                WHERE user_id = ?1 AND workspace_id IS ?2 AND json_extract(metadata, '$.routine_id') = ?3
                 LIMIT 1
                 "#,
-                params![user_id, rid],
+                params![
+                    user_id,
+                    opt_text_owned(workspace_id.map(|id| id.to_string())),
+                    rid
+                ],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -330,6 +378,7 @@ impl ConversationStore for LibSqlBackend {
     async fn get_or_create_heartbeat_conversation(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.connect().await?;
 
@@ -342,10 +391,11 @@ impl ConversationStore for LibSqlBackend {
                 .query(
                     r#"
                     SELECT id FROM conversations
-                    WHERE user_id = ?1 AND json_extract(metadata, '$.thread_type') = 'heartbeat'
+                    WHERE user_id = ?1 AND workspace_id IS ?2
+                      AND json_extract(metadata, '$.thread_type') = 'heartbeat'
                     LIMIT 1
                     "#,
-                    params![user_id],
+                    params![user_id, opt_text_owned(workspace_id.map(|id| id.to_string()))],
                 )
                 .await
                 .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -365,8 +415,15 @@ impl ConversationStore for LibSqlBackend {
             let now = fmt_ts(&Utc::now());
             let metadata = serde_json::json!({ "thread_type": "heartbeat" });
             conn.execute(
-                "INSERT INTO conversations (id, channel, user_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                params![id.to_string(), "heartbeat", user_id, metadata.to_string(), now],
+                "INSERT INTO conversations (id, channel, user_id, workspace_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![
+                    id.to_string(),
+                    "heartbeat",
+                    user_id,
+                    opt_text_owned(workspace_id.map(|id| id.to_string())),
+                    metadata.to_string(),
+                    now
+                ],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -390,6 +447,7 @@ impl ConversationStore for LibSqlBackend {
     async fn get_or_create_assistant_conversation(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         channel: &str,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.connect().await?;
@@ -398,11 +456,15 @@ impl ConversationStore for LibSqlBackend {
             .query(
                 r#"
                 SELECT id FROM conversations
-                WHERE user_id = ?1 AND channel = ?2
+                WHERE user_id = ?1 AND workspace_id IS ?2 AND channel = ?3
                   AND json_extract(metadata, '$.thread_type') = 'assistant'
                 LIMIT 1
                 "#,
-                params![user_id, channel],
+                params![
+                    user_id,
+                    opt_text_owned(workspace_id.map(|id| id.to_string())),
+                    channel
+                ],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -423,8 +485,15 @@ impl ConversationStore for LibSqlBackend {
         let now = fmt_ts(&Utc::now());
         let metadata = serde_json::json!({"thread_type": "assistant", "title": "Assistant"});
         conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![id.to_string(), channel, user_id, metadata.to_string(), now],
+            "INSERT INTO conversations (id, channel, user_id, workspace_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                id.to_string(),
+                channel,
+                user_id,
+                opt_text_owned(workspace_id.map(|id| id.to_string())),
+                metadata.to_string(),
+                now
+            ],
         )
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -435,14 +504,22 @@ impl ConversationStore for LibSqlBackend {
         &self,
         channel: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         metadata: &serde_json::Value,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.connect().await?;
         let id = Uuid::new_v4();
         let now = fmt_ts(&Utc::now());
         conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![id.to_string(), channel, user_id, metadata.to_string(), now],
+            "INSERT INTO conversations (id, channel, user_id, workspace_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                id.to_string(),
+                channel,
+                user_id,
+                opt_text_owned(workspace_id.map(|id| id.to_string())),
+                metadata.to_string(),
+                now
+            ],
         )
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -585,12 +662,17 @@ impl ConversationStore for LibSqlBackend {
         &self,
         conversation_id: Uuid,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<bool, DatabaseError> {
         let conn = self.connect().await?;
         let mut rows = conn
             .query(
-                "SELECT 1 FROM conversations WHERE id = ?1 AND user_id = ?2",
-                libsql::params![conversation_id.to_string(), user_id],
+                "SELECT 1 FROM conversations WHERE id = ?1 AND user_id = ?2 AND workspace_id IS ?3",
+                libsql::params![
+                    conversation_id.to_string(),
+                    user_id,
+                    opt_text_owned(workspace_id.map(|id| id.to_string()))
+                ],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -619,13 +701,13 @@ mod tests {
 
         // First call — creates the conversation
         let id1 = backend
-            .get_or_create_routine_conversation(routine_id, "my-routine", user_id)
+            .get_or_create_routine_conversation(routine_id, "my-routine", user_id, None)
             .await
             .unwrap();
 
         // Second call — should return the SAME conversation
         let id2 = backend
-            .get_or_create_routine_conversation(routine_id, "my-routine", user_id)
+            .get_or_create_routine_conversation(routine_id, "my-routine", user_id, None)
             .await
             .unwrap();
 
@@ -633,7 +715,7 @@ mod tests {
 
         // Third call — still the same
         let id3 = backend
-            .get_or_create_routine_conversation(routine_id, "my-routine", user_id)
+            .get_or_create_routine_conversation(routine_id, "my-routine", user_id, None)
             .await
             .unwrap();
 
@@ -642,7 +724,7 @@ mod tests {
         // Different routine_id should get a different conversation
         let other_routine_id = Uuid::new_v4();
         let id4 = backend
-            .get_or_create_routine_conversation(other_routine_id, "other-routine", user_id)
+            .get_or_create_routine_conversation(other_routine_id, "other-routine", user_id, None)
             .await
             .unwrap();
 
@@ -664,7 +746,7 @@ mod tests {
 
         // First invocation: create conversation and add a message
         let id1 = backend
-            .get_or_create_routine_conversation(routine_id, "my-routine", user_id)
+            .get_or_create_routine_conversation(routine_id, "my-routine", user_id, None)
             .await
             .unwrap();
 
@@ -675,7 +757,7 @@ mod tests {
 
         // Second invocation: should find existing conversation
         let id2 = backend
-            .get_or_create_routine_conversation(routine_id, "my-routine", user_id)
+            .get_or_create_routine_conversation(routine_id, "my-routine", user_id, None)
             .await
             .unwrap();
 
@@ -688,7 +770,7 @@ mod tests {
 
         // Verify only one routine conversation exists (not two)
         let convs = backend
-            .list_conversations_all_channels(user_id, 50)
+            .list_conversations_all_channels(user_id, None, 50)
             .await
             .unwrap();
 
@@ -711,12 +793,12 @@ mod tests {
         let user_id = "test_user";
 
         let id1 = backend
-            .get_or_create_heartbeat_conversation(user_id)
+            .get_or_create_heartbeat_conversation(user_id, None)
             .await
             .unwrap();
 
         let id2 = backend
-            .get_or_create_heartbeat_conversation(user_id)
+            .get_or_create_heartbeat_conversation(user_id, None)
             .await
             .unwrap();
 

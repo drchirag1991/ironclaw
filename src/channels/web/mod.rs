@@ -61,6 +61,13 @@ use self::server::GatewayState;
 use self::sse::SseManager;
 use self::types::AppEvent;
 
+fn workspace_scope_from_metadata(metadata: &serde_json::Value) -> Option<&str> {
+    metadata
+        .get("workspace_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+}
+
 /// Web gateway channel implementing the Channel trait.
 pub struct GatewayChannel {
     config: GatewayConfig,
@@ -354,8 +361,9 @@ impl Channel for GatewayChannel {
             }
         };
 
-        self.state.sse.broadcast_for_user(
+        self.state.sse.broadcast_for_user_in_workspace(
             &msg.user_id,
+            msg.workspace_id.as_deref(),
             AppEvent::Response {
                 content: response.content,
                 thread_id,
@@ -491,7 +499,11 @@ impl Channel for GatewayChannel {
         // When user_id is missing (heartbeat, routines), events go to all
         // subscribers. In multi-tenant mode this leaks status across users.
         if let Some(uid) = metadata.get("user_id").and_then(|v| v.as_str()) {
-            self.state.sse.broadcast_for_user(uid, event);
+            self.state.sse.broadcast_for_user_in_workspace(
+                uid,
+                workspace_scope_from_metadata(metadata),
+                event,
+            );
         } else {
             tracing::debug!("Status event missing user_id in metadata; broadcasting globally");
             self.state.sse.broadcast(event);
@@ -513,8 +525,9 @@ impl Channel for GatewayChannel {
                 });
             }
         };
-        self.state.sse.broadcast_for_user(
+        self.state.sse.broadcast_for_user_in_workspace(
             user_id,
+            workspace_scope_from_metadata(&response.metadata),
             AppEvent::Response {
                 content: response.content,
                 thread_id,

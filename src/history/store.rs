@@ -92,14 +92,15 @@ impl Store {
         &self,
         channel: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         thread_id: Option<&str>,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.conn().await?;
         let id = Uuid::new_v4();
 
         conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, thread_id) VALUES ($1, $2, $3, $4)",
-            &[&id, &channel, &user_id, &thread_id],
+            "INSERT INTO conversations (id, channel, user_id, workspace_id, thread_id) VALUES ($1, $2, $3, $4, $5)",
+            &[&id, &channel, &user_id, &workspace_id, &thread_id],
         )
         .await?;
 
@@ -152,17 +153,18 @@ impl Store {
             r#"
             INSERT INTO agent_jobs (
                 id, conversation_id, title, description, category, status, source,
-                user_id,
+                user_id, workspace_id,
                 budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
                 actual_cost, repair_attempts, max_tokens, total_tokens_used,
                 created_at, started_at, completed_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
             ON CONFLICT (id) DO UPDATE SET
                 title = EXCLUDED.title,
                 description = EXCLUDED.description,
                 category = EXCLUDED.category,
                 status = EXCLUDED.status,
                 user_id = EXCLUDED.user_id,
+                workspace_id = EXCLUDED.workspace_id,
                 estimated_cost = EXCLUDED.estimated_cost,
                 estimated_time_secs = EXCLUDED.estimated_time_secs,
                 actual_cost = EXCLUDED.actual_cost,
@@ -181,6 +183,7 @@ impl Store {
                 &status,
                 &"direct", // source
                 &ctx.user_id,
+                &ctx.workspace_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()),
                 &ctx.budget,
                 &ctx.budget_token,
                 &ctx.bid_amount,
@@ -208,7 +211,7 @@ impl Store {
             .query_opt(
                 r#"
                 SELECT id, conversation_id, title, description, category, status, user_id,
-                       budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
+                       workspace_id, budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
                        actual_cost, repair_attempts, max_tokens, total_tokens_used,
                        created_at, started_at, completed_at
                 FROM agent_jobs WHERE id = $1
@@ -227,6 +230,9 @@ impl Store {
                     job_id: row.get("id"),
                     state,
                     user_id: row.get::<_, String>("user_id"),
+                    workspace_id: row
+                        .get::<_, Option<Uuid>>("workspace_id")
+                        .map(|id| id.to_string()),
                     requester_id: None,
                     conversation_id: row.get("conversation_id"),
                     title: row.get("title"),
@@ -483,6 +489,7 @@ pub struct SandboxJobRecord {
     pub task: String,
     pub status: String,
     pub user_id: String,
+    pub workspace_id: Option<Uuid>,
     pub project_dir: String,
     pub success: Option<bool>,
     pub failure_reason: Option<String>,
@@ -512,6 +519,7 @@ pub struct AgentJobRecord {
     pub title: String,
     pub status: String,
     pub user_id: String,
+    pub workspace_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -552,13 +560,14 @@ impl Store {
         conn.execute(
             r#"
             INSERT INTO agent_jobs (
-                id, title, description, status, source, user_id, project_dir,
+                id, title, description, status, source, user_id, workspace_id, project_dir,
                 success, failure_reason, created_at, started_at, completed_at
-            ) VALUES ($1, $2, $3, $4, 'sandbox', $5, $6, $7, $8, $9, $10, $11)
+            ) VALUES ($1, $2, $3, $4, 'sandbox', $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
                 success = EXCLUDED.success,
                 failure_reason = EXCLUDED.failure_reason,
+                workspace_id = EXCLUDED.workspace_id,
                 started_at = EXCLUDED.started_at,
                 completed_at = EXCLUDED.completed_at
             "#,
@@ -568,6 +577,7 @@ impl Store {
                 &job.credential_grants_json,
                 &job.status,
                 &job.user_id,
+                &job.workspace_id,
                 &job.project_dir,
                 &job.success,
                 &job.failure_reason,
@@ -589,7 +599,7 @@ impl Store {
         let row = conn
             .query_opt(
                 r#"
-                SELECT id, title, description, status, user_id, project_dir,
+                SELECT id, title, description, status, user_id, workspace_id, project_dir,
                        success, failure_reason, created_at, started_at, completed_at
                 FROM agent_jobs WHERE id = $1 AND source = 'sandbox'
                 "#,
@@ -602,6 +612,7 @@ impl Store {
             task: r.get("title"),
             status: r.get("status"),
             user_id: r.get("user_id"),
+            workspace_id: r.get("workspace_id"),
             project_dir: r
                 .get::<_, Option<String>>("project_dir")
                 .unwrap_or_default(),
@@ -620,7 +631,7 @@ impl Store {
         let rows = conn
             .query(
                 r#"
-                SELECT id, title, description, status, user_id, project_dir,
+                SELECT id, title, description, status, user_id, workspace_id, project_dir,
                        success, failure_reason, created_at, started_at, completed_at
                 FROM agent_jobs WHERE source = 'sandbox'
                 ORDER BY created_at DESC
@@ -636,6 +647,7 @@ impl Store {
                 task: r.get("title"),
                 status: r.get("status"),
                 user_id: r.get("user_id"),
+                workspace_id: r.get("workspace_id"),
                 project_dir: r
                     .get::<_, Option<String>>("project_dir")
                     .unwrap_or_default(),
@@ -658,9 +670,9 @@ impl Store {
         let rows = conn
             .query(
                 r#"
-                SELECT id, title, description, status, user_id, project_dir,
+                SELECT id, title, description, status, user_id, workspace_id, project_dir,
                        success, failure_reason, created_at, started_at, completed_at
-                FROM agent_jobs WHERE source = 'sandbox' AND user_id = $1
+                FROM agent_jobs WHERE source = 'sandbox' AND user_id = $1 AND workspace_id IS NULL
                 ORDER BY created_at DESC
                 "#,
                 &[&user_id],
@@ -674,6 +686,7 @@ impl Store {
                 task: r.get("title"),
                 status: r.get("status"),
                 user_id: r.get("user_id"),
+                workspace_id: r.get("workspace_id"),
                 project_dir: r
                     .get::<_, Option<String>>("project_dir")
                     .unwrap_or_default(),
@@ -695,8 +708,78 @@ impl Store {
         let conn = self.conn().await?;
         let rows = conn
             .query(
-                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE source = 'sandbox' AND user_id = $1 GROUP BY status",
+                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE source = 'sandbox' AND user_id = $1 AND workspace_id IS NULL GROUP BY status",
                 &[&user_id],
+            )
+            .await?;
+
+        let mut summary = SandboxJobSummary::default();
+        for row in &rows {
+            let status: String = row.get("status");
+            let count: i64 = row.get("cnt");
+            let c = count as usize;
+            summary.total += c;
+            match status.as_str() {
+                "creating" => summary.creating += c,
+                "running" => summary.running += c,
+                "completed" => summary.completed += c,
+                "failed" => summary.failed += c,
+                "interrupted" => summary.interrupted += c,
+                _ => {}
+            }
+        }
+        Ok(summary)
+    }
+
+    /// List sandbox jobs for a shared workspace, most recent first.
+    pub async fn list_sandbox_jobs_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, title, description, status, user_id, workspace_id, project_dir,
+                       success, failure_reason, created_at, started_at, completed_at
+                FROM agent_jobs WHERE source = 'sandbox' AND workspace_id = $1
+                ORDER BY created_at DESC
+                "#,
+                &[&workspace_id],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| SandboxJobRecord {
+                id: r.get("id"),
+                task: r.get("title"),
+                status: r.get("status"),
+                user_id: r.get("user_id"),
+                workspace_id: r.get("workspace_id"),
+                project_dir: r
+                    .get::<_, Option<String>>("project_dir")
+                    .unwrap_or_default(),
+                success: r.get("success"),
+                failure_reason: r.get("failure_reason"),
+                created_at: r.get("created_at"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+                credential_grants_json: r.get::<_, String>("description"),
+            })
+            .collect())
+    }
+
+    /// Get a summary of sandbox job counts by status for a shared workspace.
+    pub async fn sandbox_job_summary_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<SandboxJobSummary, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE source = 'sandbox' AND workspace_id = $1 GROUP BY status",
+                &[&workspace_id],
             )
             .await?;
 
@@ -727,7 +810,7 @@ impl Store {
         let conn = self.conn().await?;
         let row = conn
             .query_opt(
-                "SELECT 1 FROM agent_jobs WHERE id = $1 AND user_id = $2 AND source = 'sandbox'",
+                "SELECT 1 FROM agent_jobs WHERE id = $1 AND user_id = $2 AND source = 'sandbox' AND workspace_id IS NULL",
                 &[&job_id, &user_id],
             )
             .await?;
@@ -818,7 +901,7 @@ impl Store {
         let rows = conn
             .query(
                 r#"
-                SELECT id, title, status, user_id, failure_reason,
+                SELECT id, title, status, user_id, workspace_id, failure_reason,
                        created_at, started_at, completed_at
                 FROM agent_jobs WHERE source = 'direct'
                 ORDER BY created_at DESC
@@ -834,6 +917,7 @@ impl Store {
                 title: r.get("title"),
                 status: r.get("status"),
                 user_id: r.get::<_, Option<String>>("user_id").unwrap_or_default(),
+                workspace_id: r.get("workspace_id"),
                 created_at: r.get("created_at"),
                 started_at: r.get("started_at"),
                 completed_at: r.get("completed_at"),
@@ -850,9 +934,9 @@ impl Store {
         let rows = conn
             .query(
                 r#"
-                SELECT id, title, status, user_id, failure_reason,
+                SELECT id, title, status, user_id, workspace_id, failure_reason,
                        created_at, started_at, completed_at
-                FROM agent_jobs WHERE source = 'direct' AND user_id = $1
+                FROM agent_jobs WHERE source = 'direct' AND user_id = $1 AND workspace_id IS NULL
                 ORDER BY created_at DESC
                 "#,
                 &[&user_id],
@@ -866,6 +950,7 @@ impl Store {
                 title: r.get("title"),
                 status: r.get("status"),
                 user_id: r.get::<_, Option<String>>("user_id").unwrap_or_default(),
+                workspace_id: r.get("workspace_id"),
                 created_at: r.get("created_at"),
                 started_at: r.get("started_at"),
                 completed_at: r.get("completed_at"),
@@ -915,8 +1000,62 @@ impl Store {
         let conn = self.conn().await?;
         let rows = conn
             .query(
-                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE source = 'direct' AND user_id = $1 GROUP BY status",
+                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE source = 'direct' AND user_id = $1 AND workspace_id IS NULL GROUP BY status",
                 &[&user_id],
+            )
+            .await?;
+
+        let mut summary = AgentJobSummary::default();
+        for row in &rows {
+            let status: String = row.get("status");
+            let count: i64 = row.get("cnt");
+            summary.add_count(&status, count as usize);
+        }
+        Ok(summary)
+    }
+
+    pub async fn list_agent_jobs_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<AgentJobRecord>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, title, status, user_id, workspace_id, failure_reason,
+                       created_at, started_at, completed_at
+                FROM agent_jobs WHERE source = 'direct' AND workspace_id = $1
+                ORDER BY created_at DESC
+                "#,
+                &[&workspace_id],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| AgentJobRecord {
+                id: r.get("id"),
+                title: r.get("title"),
+                status: r.get("status"),
+                user_id: r.get::<_, Option<String>>("user_id").unwrap_or_default(),
+                workspace_id: r.get("workspace_id"),
+                created_at: r.get("created_at"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+                failure_reason: r.get("failure_reason"),
+            })
+            .collect())
+    }
+
+    pub async fn agent_job_summary_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<AgentJobSummary, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE source = 'direct' AND workspace_id = $1 GROUP BY status",
+                &[&workspace_id],
             )
             .await?;
 
@@ -1113,13 +1252,14 @@ impl Store {
     pub async fn get_routine_by_name(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         name: &str,
     ) -> Result<Option<Routine>, DatabaseError> {
         let conn = self.conn().await?;
         let row = conn
             .query_opt(
-                "SELECT * FROM routines WHERE user_id = $1 AND name = $2",
-                &[&user_id, &name],
+                "SELECT * FROM routines WHERE user_id = $1 AND workspace_id IS NOT DISTINCT FROM $2 AND name = $3",
+                &[&user_id, &workspace_id, &name],
             )
             .await?;
         row.map(|r| row_to_routine(&r)).transpose()
@@ -1130,8 +1270,22 @@ impl Store {
         let conn = self.conn().await?;
         let rows = conn
             .query(
-                "SELECT * FROM routines WHERE user_id = $1 ORDER BY name",
+                "SELECT * FROM routines WHERE user_id = $1 AND workspace_id IS NULL ORDER BY name",
                 &[&user_id],
+            )
+            .await?;
+        rows.iter().map(row_to_routine).collect()
+    }
+
+    pub async fn list_routines_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<Routine>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT * FROM routines WHERE workspace_id = $1 ORDER BY name",
+                &[&workspace_id],
             )
             .await?;
         rows.iter().map(row_to_routine).collect()
@@ -1495,6 +1649,7 @@ fn row_to_routine(row: &tokio_postgres::Row) -> Result<Routine, DatabaseError> {
         name: row.get("name"),
         description: row.get("description"),
         user_id: row.get("user_id"),
+        workspace_id: row.get("workspace_id"),
         enabled: row.get("enabled"),
         trigger,
         action,
@@ -1557,6 +1712,7 @@ pub struct ConversationSummary {
     pub thread_type: Option<String>,
     /// Channel that owns this conversation (e.g. "gateway", "telegram", "routine").
     pub channel: String,
+    pub workspace_id: Option<Uuid>,
 }
 
 /// A single message in a conversation.
@@ -1580,20 +1736,22 @@ impl Store {
         id: Uuid,
         channel: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         thread_id: Option<&str>,
     ) -> Result<bool, DatabaseError> {
         let conn = self.conn().await?;
         let affected = conn
             .execute(
                 r#"
-            INSERT INTO conversations (id, channel, user_id, thread_id)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO conversations (id, channel, user_id, workspace_id, thread_id)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (id) DO UPDATE
             SET last_activity = NOW()
             WHERE conversations.user_id = EXCLUDED.user_id
+              AND conversations.workspace_id IS NOT DISTINCT FROM EXCLUDED.workspace_id
               AND conversations.channel = EXCLUDED.channel
             "#,
-                &[&id, &channel, &user_id, &thread_id],
+                &[&id, &channel, &user_id, &workspace_id, &thread_id],
             )
             .await?;
         Ok(affected > 0)
@@ -1603,6 +1761,7 @@ impl Store {
     pub async fn list_conversations_with_preview(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         channel: &str,
         limit: i64,
     ) -> Result<Vec<ConversationSummary>, DatabaseError> {
@@ -1616,6 +1775,7 @@ impl Store {
                     c.last_activity,
                     c.metadata,
                     c.channel,
+                    c.workspace_id,
                     (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id AND m.role = 'user') AS message_count,
                     (SELECT LEFT(m2.content, 100)
                      FROM conversation_messages m2
@@ -1624,11 +1784,11 @@ impl Store {
                      LIMIT 1
                     ) AS title
                 FROM conversations c
-                WHERE c.user_id = $1 AND c.channel = $2
+                WHERE c.user_id = $1 AND c.workspace_id IS NOT DISTINCT FROM $2 AND c.channel = $3
                 ORDER BY c.last_activity DESC
-                LIMIT $3
+                LIMIT $4
                 "#,
-                &[&user_id, &channel, &limit],
+                &[&user_id, &workspace_id, &channel, &limit],
             )
             .await?;
 
@@ -1655,6 +1815,7 @@ impl Store {
                     last_activity: r.get("last_activity"),
                     thread_type,
                     channel: r.get("channel"),
+                    workspace_id: r.get("workspace_id"),
                 }
             })
             .collect())
@@ -1664,6 +1825,7 @@ impl Store {
     pub async fn list_conversations_all_channels(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<ConversationSummary>, DatabaseError> {
         let conn = self.conn().await?;
@@ -1676,6 +1838,7 @@ impl Store {
                     c.last_activity,
                     c.metadata,
                     c.channel,
+                    c.workspace_id,
                     (SELECT COUNT(*) FROM conversation_messages m WHERE m.conversation_id = c.id AND m.role = 'user') AS message_count,
                     (SELECT LEFT(m2.content, 100)
                      FROM conversation_messages m2
@@ -1684,11 +1847,11 @@ impl Store {
                      LIMIT 1
                     ) AS title
                 FROM conversations c
-                WHERE c.user_id = $1
+                WHERE c.user_id = $1 AND c.workspace_id IS NOT DISTINCT FROM $2
                 ORDER BY c.last_activity DESC
-                LIMIT $2
+                LIMIT $3
                 "#,
-                &[&user_id, &limit],
+                &[&user_id, &workspace_id, &limit],
             )
             .await?;
 
@@ -1717,6 +1880,7 @@ impl Store {
                     last_activity: r.get("last_activity"),
                     thread_type,
                     channel: r.get("channel"),
+                    workspace_id: r.get("workspace_id"),
                 }
             })
             .collect())
@@ -1732,6 +1896,7 @@ impl Store {
         routine_id: Uuid,
         routine_name: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.conn().await?;
         let rid = routine_id.to_string();
@@ -1746,13 +1911,11 @@ impl Store {
         });
         conn.execute(
             r#"
-            INSERT INTO conversations (id, channel, user_id, metadata)
-            VALUES ($1, 'routine', $2, $3)
-            ON CONFLICT (user_id, (metadata->>'routine_id'))
-                WHERE metadata->>'routine_id' IS NOT NULL
-                DO NOTHING
+            INSERT INTO conversations (id, channel, user_id, workspace_id, metadata)
+            VALUES ($1, 'routine', $2, $3, $4)
+            ON CONFLICT DO NOTHING
             "#,
-            &[&new_id, &user_id, &metadata],
+            &[&new_id, &user_id, &workspace_id, &metadata],
         )
         .await?;
 
@@ -1761,10 +1924,12 @@ impl Store {
             .query_one(
                 r#"
                 SELECT id FROM conversations
-                WHERE user_id = $1 AND metadata->>'routine_id' = $2
+                WHERE user_id = $1
+                  AND workspace_id IS NOT DISTINCT FROM $2
+                  AND metadata->>'routine_id' = $3
                 LIMIT 1
                 "#,
-                &[&user_id, &rid],
+                &[&user_id, &workspace_id, &rid],
             )
             .await?;
 
@@ -1776,6 +1941,7 @@ impl Store {
         &self,
         routine_id: Uuid,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<Option<Uuid>, DatabaseError> {
         let conn = self.conn().await?;
         let rid = routine_id.to_string();
@@ -1783,10 +1949,12 @@ impl Store {
             .query_opt(
                 r#"
                 SELECT id FROM conversations
-                WHERE user_id = $1 AND metadata->>'routine_id' = $2
+                WHERE user_id = $1
+                  AND workspace_id IS NOT DISTINCT FROM $2
+                  AND metadata->>'routine_id' = $3
                 LIMIT 1
                 "#,
-                &[&user_id, &rid],
+                &[&user_id, &workspace_id, &rid],
             )
             .await?;
         Ok(row.map(|r| r.get("id")))
@@ -1800,6 +1968,7 @@ impl Store {
     pub async fn get_or_create_heartbeat_conversation(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.conn().await?;
 
@@ -1811,13 +1980,11 @@ impl Store {
         });
         conn.execute(
             r#"
-            INSERT INTO conversations (id, channel, user_id, metadata)
-            VALUES ($1, 'heartbeat', $2, $3)
-            ON CONFLICT (user_id)
-                WHERE metadata->>'thread_type' = 'heartbeat'
-                DO NOTHING
+            INSERT INTO conversations (id, channel, user_id, workspace_id, metadata)
+            VALUES ($1, 'heartbeat', $2, $3, $4)
+            ON CONFLICT DO NOTHING
             "#,
-            &[&new_id, &user_id, &metadata],
+            &[&new_id, &user_id, &workspace_id, &metadata],
         )
         .await?;
 
@@ -1826,10 +1993,12 @@ impl Store {
             .query_one(
                 r#"
                 SELECT id FROM conversations
-                WHERE user_id = $1 AND metadata->>'thread_type' = 'heartbeat'
+                WHERE user_id = $1
+                  AND workspace_id IS NOT DISTINCT FROM $2
+                  AND metadata->>'thread_type' = 'heartbeat'
                 LIMIT 1
                 "#,
-                &[&user_id],
+                &[&user_id, &workspace_id],
             )
             .await?;
 
@@ -1843,6 +2012,7 @@ impl Store {
     pub async fn get_or_create_assistant_conversation(
         &self,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         channel: &str,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.conn().await?;
@@ -1852,10 +2022,13 @@ impl Store {
             .query_opt(
                 r#"
                 SELECT id FROM conversations
-                WHERE user_id = $1 AND channel = $2 AND metadata->>'thread_type' = 'assistant'
+                WHERE user_id = $1
+                  AND workspace_id IS NOT DISTINCT FROM $2
+                  AND channel = $3
+                  AND metadata->>'thread_type' = 'assistant'
                 LIMIT 1
                 "#,
-                &[&user_id, &channel],
+                &[&user_id, &workspace_id, &channel],
             )
             .await?;
 
@@ -1868,10 +2041,10 @@ impl Store {
         let metadata = serde_json::json!({"thread_type": "assistant", "title": "Assistant"});
         conn.execute(
             r#"
-            INSERT INTO conversations (id, channel, user_id, metadata)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO conversations (id, channel, user_id, workspace_id, metadata)
+            VALUES ($1, $2, $3, $4, $5)
             "#,
-            &[&id, &channel, &user_id, &metadata],
+            &[&id, &channel, &user_id, &workspace_id, &metadata],
         )
         .await?;
 
@@ -1883,14 +2056,15 @@ impl Store {
         &self,
         channel: &str,
         user_id: &str,
+        workspace_id: Option<Uuid>,
         metadata: &serde_json::Value,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.conn().await?;
         let id = Uuid::new_v4();
 
         conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, metadata) VALUES ($1, $2, $3, $4)",
-            &[&id, &channel, &user_id, metadata],
+            "INSERT INTO conversations (id, channel, user_id, workspace_id, metadata) VALUES ($1, $2, $3, $4, $5)",
+            &[&id, &channel, &user_id, &workspace_id, metadata],
         )
         .await?;
 
@@ -1902,12 +2076,13 @@ impl Store {
         &self,
         conversation_id: Uuid,
         user_id: &str,
+        workspace_id: Option<Uuid>,
     ) -> Result<bool, DatabaseError> {
         let conn = self.conn().await?;
         let row = conn
             .query_opt(
-                "SELECT 1 FROM conversations WHERE id = $1 AND user_id = $2",
-                &[&conversation_id, &user_id],
+                "SELECT 1 FROM conversations WHERE id = $1 AND user_id = $2 AND workspace_id IS NOT DISTINCT FROM $3",
+                &[&conversation_id, &user_id, &workspace_id],
             )
             .await?;
         Ok(row.is_some())
@@ -2142,6 +2317,7 @@ pub struct SettingRow {
     pub key: String,
     pub value: serde_json::Value,
     pub updated_at: DateTime<Utc>,
+    pub workspace_id: Option<Uuid>,
 }
 
 #[cfg(feature = "postgres")]
@@ -2155,8 +2331,23 @@ impl Store {
         let conn = self.conn().await?;
         let row = conn
             .query_opt(
-                "SELECT value FROM settings WHERE user_id = $1 AND key = $2",
+                "SELECT value FROM settings WHERE user_id = $1 AND workspace_id IS NULL AND key = $2",
                 &[&user_id, &key],
+            )
+            .await?;
+        Ok(row.map(|r| r.get("value")))
+    }
+
+    pub async fn get_setting_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT value FROM settings WHERE workspace_id = $1 AND key = $2",
+                &[&workspace_id, &key],
             )
             .await?;
         Ok(row.map(|r| r.get("value")))
@@ -2171,13 +2362,34 @@ impl Store {
         let conn = self.conn().await?;
         let row = conn
             .query_opt(
-                "SELECT key, value, updated_at FROM settings WHERE user_id = $1 AND key = $2",
+                "SELECT key, value, workspace_id, updated_at FROM settings WHERE user_id = $1 AND workspace_id IS NULL AND key = $2",
                 &[&user_id, &key],
             )
             .await?;
         Ok(row.map(|r| SettingRow {
             key: r.get("key"),
             value: r.get("value"),
+            workspace_id: r.get("workspace_id"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    pub async fn get_setting_full_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        key: &str,
+    ) -> Result<Option<SettingRow>, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT key, value, workspace_id, updated_at FROM settings WHERE workspace_id = $1 AND key = $2",
+                &[&workspace_id, &key],
+            )
+            .await?;
+        Ok(row.map(|r| SettingRow {
+            key: r.get("key"),
+            value: r.get("value"),
+            workspace_id: r.get("workspace_id"),
             updated_at: r.get("updated_at"),
         }))
     }
@@ -2192,13 +2404,49 @@ impl Store {
         let conn = self.conn().await?;
         conn.execute(
             r#"
-            INSERT INTO settings (user_id, key, value, updated_at)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (user_id, key) DO UPDATE SET
-                value = EXCLUDED.value,
-                updated_at = NOW()
+            INSERT INTO settings (user_id, workspace_id, key, value, updated_at)
+            VALUES ($1, NULL, $2, $3, NOW())
+            ON CONFLICT DO NOTHING
             "#,
             &[&user_id, &key, value],
+        )
+        .await?;
+        conn.execute(
+            r#"
+            UPDATE settings SET
+                value = $3,
+                updated_at = NOW()
+            WHERE user_id = $1 AND workspace_id IS NULL AND key = $2
+            "#,
+            &[&user_id, &key, value],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_setting_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn().await?;
+        let workspace_user_id = format!("workspace:{workspace_id}");
+        conn.execute(
+            r#"
+            INSERT INTO settings (user_id, workspace_id, key, value, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT DO NOTHING
+            "#,
+            &[&workspace_user_id, &workspace_id, &key, value],
+        )
+        .await?;
+        conn.execute(
+            r#"
+            UPDATE settings SET value = $3, updated_at = NOW()
+            WHERE workspace_id = $1 AND key = $2
+            "#,
+            &[&workspace_id, &key, value],
         )
         .await?;
         Ok(())
@@ -2209,8 +2457,23 @@ impl Store {
         let conn = self.conn().await?;
         let count = conn
             .execute(
-                "DELETE FROM settings WHERE user_id = $1 AND key = $2",
+                "DELETE FROM settings WHERE user_id = $1 AND workspace_id IS NULL AND key = $2",
                 &[&user_id, &key],
+            )
+            .await?;
+        Ok(count > 0)
+    }
+
+    pub async fn delete_setting_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        key: &str,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn().await?;
+        let count = conn
+            .execute(
+                "DELETE FROM settings WHERE workspace_id = $1 AND key = $2",
+                &[&workspace_id, &key],
             )
             .await?;
         Ok(count > 0)
@@ -2221,7 +2484,7 @@ impl Store {
         let conn = self.conn().await?;
         let rows = conn
             .query(
-                "SELECT key, value, updated_at FROM settings WHERE user_id = $1 ORDER BY key",
+                "SELECT key, value, workspace_id, updated_at FROM settings WHERE user_id = $1 AND workspace_id IS NULL ORDER BY key",
                 &[&user_id],
             )
             .await?;
@@ -2230,6 +2493,29 @@ impl Store {
             .map(|r| SettingRow {
                 key: r.get("key"),
                 value: r.get("value"),
+                workspace_id: r.get("workspace_id"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
+    }
+
+    pub async fn list_settings_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<Vec<SettingRow>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT key, value, workspace_id, updated_at FROM settings WHERE workspace_id = $1 ORDER BY key",
+                &[&workspace_id],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| SettingRow {
+                key: r.get("key"),
+                value: r.get("value"),
+                workspace_id: r.get("workspace_id"),
                 updated_at: r.get("updated_at"),
             })
             .collect())
@@ -2243,8 +2529,29 @@ impl Store {
         let conn = self.conn().await?;
         let rows = conn
             .query(
-                "SELECT key, value FROM settings WHERE user_id = $1",
+                "SELECT key, value FROM settings WHERE user_id = $1 AND workspace_id IS NULL",
                 &[&user_id],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let key: String = r.get("key");
+                let value: serde_json::Value = r.get("value");
+                (key, value)
+            })
+            .collect())
+    }
+
+    pub async fn get_all_settings_for_workspace(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT key, value FROM settings WHERE workspace_id = $1",
+                &[&workspace_id],
             )
             .await?;
         Ok(rows
@@ -2271,13 +2578,52 @@ impl Store {
         for (key, value) in settings {
             tx.execute(
                 r#"
-                INSERT INTO settings (user_id, key, value, updated_at)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (user_id, key) DO UPDATE SET
-                    value = EXCLUDED.value,
-                    updated_at = NOW()
+                INSERT INTO settings (user_id, workspace_id, key, value, updated_at)
+                VALUES ($1, NULL, $2, $3, NOW())
+                ON CONFLICT DO NOTHING
                 "#,
                 &[&user_id, &key, value],
+            )
+            .await?;
+            tx.execute(
+                r#"
+                UPDATE settings SET value = $3, updated_at = NOW()
+                WHERE user_id = $1 AND workspace_id IS NULL AND key = $2
+                "#,
+                &[&user_id, &key, value],
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn set_all_settings_for_workspace(
+        &self,
+        workspace_id: Uuid,
+        settings: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<(), DatabaseError> {
+        let mut conn = self.conn().await?;
+        let tx = conn.transaction().await?;
+        let workspace_user_id = format!("workspace:{workspace_id}");
+
+        for (key, value) in settings {
+            tx.execute(
+                r#"
+                INSERT INTO settings (user_id, workspace_id, key, value, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT DO NOTHING
+                "#,
+                &[&workspace_user_id, &workspace_id, &key, value],
+            )
+            .await?;
+            tx.execute(
+                r#"
+                UPDATE settings SET value = $3, updated_at = NOW()
+                WHERE workspace_id = $1 AND key = $2
+                "#,
+                &[&workspace_id, &key, value],
             )
             .await?;
         }
@@ -2291,8 +2637,20 @@ impl Store {
         let conn = self.conn().await?;
         let row = conn
             .query_one(
-                "SELECT COUNT(*) as cnt FROM settings WHERE user_id = $1",
+                "SELECT COUNT(*) as cnt FROM settings WHERE user_id = $1 AND workspace_id IS NULL",
                 &[&user_id],
+            )
+            .await?;
+        let count: i64 = row.get("cnt");
+        Ok(count > 0)
+    }
+
+    pub async fn has_settings_for_workspace(&self, workspace_id: Uuid) -> Result<bool, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_one(
+                "SELECT COUNT(*) as cnt FROM settings WHERE workspace_id = $1",
+                &[&workspace_id],
             )
             .await?;
         let count: i64 = row.get("cnt");

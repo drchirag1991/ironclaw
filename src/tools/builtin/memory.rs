@@ -30,6 +30,10 @@ use crate::workspace::{Workspace, paths};
 #[async_trait]
 pub trait WorkspaceResolver: Send + Sync {
     async fn resolve(&self, user_id: &str) -> Arc<Workspace>;
+
+    async fn resolve_for_context(&self, user_id: &str, _workspace_id: Option<&str>) -> Arc<Workspace> {
+        self.resolve(user_id).await
+    }
 }
 
 /// Returns a fixed workspace regardless of user ID (single-user mode).
@@ -155,7 +159,10 @@ impl Tool for MemorySearchTool {
             .unwrap_or(5)
             .min(20) as usize;
 
-        let workspace = self.resolver.resolve(&ctx.user_id).await;
+        let workspace = self
+            .resolver
+            .resolve_for_context(&ctx.user_id, ctx.workspace_id.as_deref())
+            .await;
         let results = workspace
             .search(query, limit)
             .await
@@ -274,7 +281,10 @@ impl Tool for MemoryWriteTool {
             )));
         }
 
-        let workspace = self.resolver.resolve(&ctx.user_id).await;
+        let workspace = self
+            .resolver
+            .resolve_for_context(&ctx.user_id, ctx.workspace_id.as_deref())
+            .await;
 
         // Bootstrap target: clear BOOTSTRAP.md to mark first-run ritual complete.
         // Handled early because it accepts empty content (unlike other targets).
@@ -524,7 +534,10 @@ impl Tool for MemoryReadTool {
             )));
         }
 
-        let workspace = self.resolver.resolve(&ctx.user_id).await;
+        let workspace = self
+            .resolver
+            .resolve_for_context(&ctx.user_id, ctx.workspace_id.as_deref())
+            .await;
         let doc = workspace
             .read(path)
             .await
@@ -661,7 +674,10 @@ impl Tool for MemoryTreeTool {
             .unwrap_or(1)
             .clamp(1, 10) as usize;
 
-        let workspace = self.resolver.resolve(&ctx.user_id).await;
+        let workspace = self
+            .resolver
+            .resolve_for_context(&ctx.user_id, ctx.workspace_id.as_deref())
+            .await;
         let tree = Self::build_tree(&workspace, path, 1, depth).await?;
 
         // Compact output: just the tree array

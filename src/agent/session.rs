@@ -188,6 +188,9 @@ pub struct PendingApproval {
     /// through the approval flow even if the approval message lacks timezone.
     #[serde(default)]
     pub user_timezone: Option<String>,
+    /// Workspace scope at the time the approval was requested.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     /// Whether the "always" auto-approve option should be offered to the user.
     /// `false` when the tool returned `ApprovalRequirement::Always` (e.g.
     /// destructive shell commands), meaning every invocation must be confirmed.
@@ -1273,6 +1276,7 @@ mod tests {
             context_messages: vec![ChatMessage::user("do it")],
             deferred_tool_calls: vec![],
             user_timezone: None,
+            workspace_id: None,
             allow_always: false,
         };
 
@@ -1300,6 +1304,7 @@ mod tests {
             context_messages: vec![],
             deferred_tool_calls: vec![],
             user_timezone: None,
+            workspace_id: None,
             allow_always: true,
         };
 

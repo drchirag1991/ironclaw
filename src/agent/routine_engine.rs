@@ -711,6 +711,7 @@ impl RoutineEngine {
             &self.notify_tx,
             &routine.notify,
             &routine.user_id,
+            routine.workspace_id,
             &routine.name,
             status,
             Some(summary),
@@ -1214,6 +1215,7 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
         &ctx.notify_tx,
         &routine.notify,
         &routine.user_id,
+        routine.workspace_id,
         &routine.name,
         status,
         summary.as_deref(),
@@ -1285,6 +1287,9 @@ async fn execute_full_job(
         "max_iterations": execution.max_iterations,
         "owner_id": routine.user_id
     });
+    if let Some(workspace_id) = routine.workspace_id {
+        metadata["workspace_id"] = serde_json::json!(workspace_id);
+    }
     // Carry the routine's notify config in job metadata so the message tool
     // can resolve channel/target per-job without global state mutation.
     if let Some(channel) = &routine.notify.channel {
@@ -1610,6 +1615,7 @@ async fn execute_lightweight_with_tools(
     let job_ctx = JobContext {
         job_id: run_id,
         user_id: routine.user_id.clone(),
+        workspace_id: routine.workspace_id.map(|id| id.to_string()),
         title: "Lightweight Routine".to_string(),
         description: routine.name.clone(),
         ..Default::default()
@@ -1844,6 +1850,7 @@ async fn send_notification(
     tx: &mpsc::Sender<OutgoingResponse>,
     notify: &NotifyConfig,
     owner_id: &str,
+    workspace_id: Option<uuid::Uuid>,
     routine_name: &str,
     status: RunStatus,
     summary: Option<&str>,
@@ -1881,6 +1888,7 @@ async fn send_notification(
             "routine_name": routine_name,
             "status": status.to_string(),
             "owner_id": owner_id,
+            "workspace_id": workspace_id,
             "notify_user": notify.user,
             "notify_channel": notify.channel,
         }),
