@@ -215,7 +215,11 @@ pub(crate) mod tests {
                 .find(|m| m.id == id)
                 .cloned())
         }
-        async fn list_missions(&self, project_id: ProjectId, _: &str) -> Result<Vec<Mission>, EngineError> {
+        async fn list_missions(
+            &self,
+            project_id: ProjectId,
+            _: &str,
+        ) -> Result<Vec<Mission>, EngineError> {
             Ok(self
                 .missions
                 .read()

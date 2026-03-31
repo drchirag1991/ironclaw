@@ -259,8 +259,14 @@ impl MissionManager {
 
     /// List all missions in a project for a given user.
     /// List missions visible to a user (own + system shared).
-    pub async fn list_missions(&self, project_id: ProjectId, user_id: &str) -> Result<Vec<Mission>, EngineError> {
-        self.store.list_missions_with_shared(project_id, user_id).await
+    pub async fn list_missions(
+        &self,
+        project_id: ProjectId,
+        user_id: &str,
+    ) -> Result<Vec<Mission>, EngineError> {
+        self.store
+            .list_missions_with_shared(project_id, user_id)
+            .await
     }
 
     /// Get a mission by ID.
@@ -483,16 +489,19 @@ impl MissionManager {
 
                         if (*count).is_multiple_of(CONVERSATION_INSIGHTS_INTERVAL) {
                             // Collect recent thread goals for context
-                            let thread_goals: Vec<String> =
-                                match mgr.store.list_threads(thread.project_id, &thread.user_id).await {
-                                    Ok(threads) => threads
-                                        .iter()
-                                        .rev()
-                                        .take(CONVERSATION_INSIGHTS_INTERVAL as usize)
-                                        .map(|t| t.goal.clone())
-                                        .collect(),
-                                    Err(_) => vec![thread.goal.clone()],
-                                };
+                            let thread_goals: Vec<String> = match mgr
+                                .store
+                                .list_threads(thread.project_id, &thread.user_id)
+                                .await
+                            {
+                                Ok(threads) => threads
+                                    .iter()
+                                    .rev()
+                                    .take(CONVERSATION_INSIGHTS_INTERVAL as usize)
+                                    .map(|t| t.goal.clone())
+                                    .collect(),
+                                Err(_) => vec![thread.goal.clone()],
+                            };
 
                             // Collect sample user messages from recent threads
                             let sample_messages: Vec<String> = thread
@@ -786,8 +795,7 @@ impl MissionManager {
 
             // Fire cron missions with the mission's own user_id so artifacts
             // are scoped to the correct tenant.
-            if should_fire
-                && let Some(tid) = self.fire_mission(mid, &mission.user_id, None).await?
+            if should_fire && let Some(tid) = self.fire_mission(mid, &mission.user_id, None).await?
             {
                 spawned.push(tid);
             }
@@ -1028,8 +1036,14 @@ async fn process_self_improvement_output(
             let mut overlay = if let Some(doc) = existing {
                 doc.clone()
             } else {
-                MemoryDoc::new(project_id, "system", DocType::Note, PREAMBLE_OVERLAY_TITLE, "")
-                    .with_tags(vec![PROMPT_OVERLAY_TAG.to_string()])
+                MemoryDoc::new(
+                    project_id,
+                    "system",
+                    DocType::Note,
+                    PREAMBLE_OVERLAY_TITLE,
+                    "",
+                )
+                .with_tags(vec![PROMPT_OVERLAY_TAG.to_string()])
             };
 
             // Append new rules
@@ -1302,7 +1316,11 @@ mod tests {
         async fn load_mission(&self, id: MissionId) -> Result<Option<Mission>, EngineError> {
             Ok(self.missions.read().await.get(&id).cloned())
         }
-        async fn list_missions(&self, project_id: ProjectId, user_id: &str) -> Result<Vec<Mission>, EngineError> {
+        async fn list_missions(
+            &self,
+            project_id: ProjectId,
+            user_id: &str,
+        ) -> Result<Vec<Mission>, EngineError> {
             Ok(self
                 .missions
                 .read()
@@ -1312,7 +1330,10 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn list_all_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError> {
+        async fn list_all_missions(
+            &self,
+            project_id: ProjectId,
+        ) -> Result<Vec<Mission>, EngineError> {
             Ok(self
                 .missions
                 .read()
@@ -1455,7 +1476,13 @@ mod tests {
         let project_id = ProjectId::new();
 
         let id = mgr
-            .create_mission(project_id, "test-user", "pausable", "goal", MissionCadence::Manual)
+            .create_mission(
+                project_id,
+                "test-user",
+                "pausable",
+                "goal",
+                MissionCadence::Manual,
+            )
             .await
             .unwrap();
 
@@ -1477,7 +1504,13 @@ mod tests {
         let project_id = ProjectId::new();
 
         let id = mgr
-            .create_mission(project_id, "test-user", "completable", "goal", MissionCadence::Manual)
+            .create_mission(
+                project_id,
+                "test-user",
+                "completable",
+                "goal",
+                MissionCadence::Manual,
+            )
             .await
             .unwrap();
 
@@ -1535,7 +1568,13 @@ mod tests {
         let project_id = ProjectId::new();
 
         let id = mgr
-            .create_mission(project_id, "test-user", "terminal", "goal", MissionCadence::Manual)
+            .create_mission(
+                project_id,
+                "test-user",
+                "terminal",
+                "goal",
+                MissionCadence::Manual,
+            )
             .await
             .unwrap();
 
@@ -1895,9 +1934,15 @@ mod tests {
         let mgr = make_mission_manager_with_response(Arc::clone(&store) as Arc<dyn Store>, "done");
         let project_id = ProjectId::new();
 
-        mgr.create_mission(project_id, "test-user", "manual", "goal", MissionCadence::Manual)
-            .await
-            .unwrap();
+        mgr.create_mission(
+            project_id,
+            "test-user",
+            "manual",
+            "goal",
+            MissionCadence::Manual,
+        )
+        .await
+        .unwrap();
         mgr.create_mission(
             project_id,
             "test-user",
@@ -1991,7 +2036,13 @@ mod tests {
         let store: Arc<dyn Store> = Arc::new(TestStore::new());
         let project_id = ProjectId::new();
 
-        let mission = Mission::new(project_id, "test-user", "regular", "do stuff", MissionCadence::Manual);
+        let mission = Mission::new(
+            project_id,
+            "test-user",
+            "regular",
+            "do stuff",
+            MissionCadence::Manual,
+        );
         let id = mission.id;
         store.save_mission(&mission).await.unwrap();
 
@@ -2065,7 +2116,13 @@ mod tests {
         let project_id = ProjectId::new();
 
         let id = mgr
-            .create_mission(project_id, "test-user", "budget test", "goal", MissionCadence::Manual)
+            .create_mission(
+                project_id,
+                "test-user",
+                "budget test",
+                "goal",
+                MissionCadence::Manual,
+            )
             .await
             .unwrap();
 
@@ -2100,21 +2157,26 @@ mod tests {
         let project_id = ProjectId::new();
 
         // Bootstrap learning missions for two different users
-        mgr.ensure_learning_missions(project_id, "alice").await.unwrap();
-        mgr.ensure_learning_missions(project_id, "bob").await.unwrap();
+        mgr.ensure_learning_missions(project_id, "alice")
+            .await
+            .unwrap();
+        mgr.ensure_learning_missions(project_id, "bob")
+            .await
+            .unwrap();
 
         // Each user should see only their own missions
         let alice_missions = store.list_missions(project_id, "alice").await.unwrap();
         let bob_missions = store.list_missions(project_id, "bob").await.unwrap();
 
         assert_eq!(alice_missions.len(), bob_missions.len());
-        assert!(alice_missions.len() >= 3, "at least 3 learning missions per user");
+        assert!(
+            alice_missions.len() >= 3,
+            "at least 3 learning missions per user"
+        );
 
         // No overlap in mission IDs
-        let alice_ids: std::collections::HashSet<_> =
-            alice_missions.iter().map(|m| m.id).collect();
-        let bob_ids: std::collections::HashSet<_> =
-            bob_missions.iter().map(|m| m.id).collect();
+        let alice_ids: std::collections::HashSet<_> = alice_missions.iter().map(|m| m.id).collect();
+        let bob_ids: std::collections::HashSet<_> = bob_missions.iter().map(|m| m.id).collect();
         assert!(
             alice_ids.is_disjoint(&bob_ids),
             "alice and bob should have separate mission instances"
@@ -2133,13 +2195,25 @@ mod tests {
 
         // Create a mission for alice
         let alice_id = mgr
-            .create_mission(project_id, "alice", "alice-task", "goal", MissionCadence::Manual)
+            .create_mission(
+                project_id,
+                "alice",
+                "alice-task",
+                "goal",
+                MissionCadence::Manual,
+            )
             .await
             .unwrap();
 
         // Create a mission for bob
         let bob_id = mgr
-            .create_mission(project_id, "bob", "bob-task", "goal", MissionCadence::Manual)
+            .create_mission(
+                project_id,
+                "bob",
+                "bob-task",
+                "goal",
+                MissionCadence::Manual,
+            )
             .await
             .unwrap();
 
@@ -2154,7 +2228,10 @@ mod tests {
 
         // Bob tries to resume alice's mission — should fail
         let result = mgr.resume_mission(alice_id, "bob").await;
-        assert!(result.is_err(), "bob should not be able to resume alice's mission");
+        assert!(
+            result.is_err(),
+            "bob should not be able to resume alice's mission"
+        );
         assert!(
             matches!(result.unwrap_err(), EngineError::AccessDenied { .. }),
             "should be AccessDenied"
@@ -2173,8 +2250,12 @@ mod tests {
         let project_id = ProjectId::new();
 
         // Bootstrap per-user learning missions
-        mgr.ensure_learning_missions(project_id, "alice").await.unwrap();
-        mgr.ensure_learning_missions(project_id, "bob").await.unwrap();
+        mgr.ensure_learning_missions(project_id, "alice")
+            .await
+            .unwrap();
+        mgr.ensure_learning_missions(project_id, "bob")
+            .await
+            .unwrap();
 
         // Get alice's self-improvement mission
         let alice_missions = store.list_missions(project_id, "alice").await.unwrap();
@@ -2328,8 +2409,12 @@ mod tests {
         let project_id = ProjectId::new();
 
         // Bootstrap per-user learning missions
-        mgr.ensure_learning_missions(project_id, "alice").await.unwrap();
-        mgr.ensure_learning_missions(project_id, "bob").await.unwrap();
+        mgr.ensure_learning_missions(project_id, "alice")
+            .await
+            .unwrap();
+        mgr.ensure_learning_missions(project_id, "bob")
+            .await
+            .unwrap();
 
         // Count active missions for each user
         let alice_missions = store.list_missions(project_id, "alice").await.unwrap();
@@ -2349,7 +2434,12 @@ mod tests {
         // Fire system event as alice — should fire alice's missions, not bob's
         let payload = serde_json::json!({"source_thread_id": "test", "goal": "test"});
         let spawned = mgr
-            .fire_on_system_event("engine", "thread_completed_with_issues", "alice", Some(payload))
+            .fire_on_system_event(
+                "engine",
+                "thread_completed_with_issues",
+                "alice",
+                Some(payload),
+            )
             .await
             .unwrap();
 
@@ -2390,8 +2480,12 @@ mod tests {
         let project_id = ProjectId::new();
 
         // Call twice for the same user
-        mgr.ensure_learning_missions(project_id, "alice").await.unwrap();
-        mgr.ensure_learning_missions(project_id, "alice").await.unwrap();
+        mgr.ensure_learning_missions(project_id, "alice")
+            .await
+            .unwrap();
+        mgr.ensure_learning_missions(project_id, "alice")
+            .await
+            .unwrap();
 
         // Should not create duplicates
         let alice_missions = store.list_missions(project_id, "alice").await.unwrap();
@@ -2399,6 +2493,9 @@ mod tests {
             .iter()
             .filter(|m| is_self_improvement_mission(m))
             .count();
-        assert_eq!(self_imp_count, 1, "should not duplicate self-improvement mission");
+        assert_eq!(
+            self_imp_count, 1,
+            "should not duplicate self-improvement mission"
+        );
     }
 }

@@ -322,11 +322,7 @@ impl ThreadManager {
     }
 
     /// Send a stop signal to a running thread.
-    pub async fn stop_thread(
-        &self,
-        thread_id: ThreadId,
-        user_id: &str,
-    ) -> Result<(), EngineError> {
+    pub async fn stop_thread(&self, thread_id: ThreadId, user_id: &str) -> Result<(), EngineError> {
         // Validate ownership before allowing stop.
         if let Some(thread) = self.store.load_thread(thread_id).await?
             && thread.user_id != user_id
@@ -658,7 +654,11 @@ mod tests {
         async fn load_thread(&self, id: ThreadId) -> Result<Option<Thread>, EngineError> {
             Ok(self.threads.read().await.get(&id).cloned())
         }
-        async fn list_threads(&self, project_id: ProjectId, user_id: &str) -> Result<Vec<Thread>, EngineError> {
+        async fn list_threads(
+            &self,
+            project_id: ProjectId,
+            user_id: &str,
+        ) -> Result<Vec<Thread>, EngineError> {
             Ok(self
                 .threads
                 .read()
@@ -668,7 +668,10 @@ mod tests {
                 .cloned()
                 .collect())
         }
-        async fn list_all_threads(&self, project_id: ProjectId) -> Result<Vec<Thread>, EngineError> {
+        async fn list_all_threads(
+            &self,
+            project_id: ProjectId,
+        ) -> Result<Vec<Thread>, EngineError> {
             Ok(self
                 .threads
                 .read()
@@ -722,7 +725,11 @@ mod tests {
         async fn load_memory_doc(&self, _: DocId) -> Result<Option<MemoryDoc>, EngineError> {
             Ok(None)
         }
-        async fn list_memory_docs(&self, _: ProjectId, _: &str) -> Result<Vec<MemoryDoc>, EngineError> {
+        async fn list_memory_docs(
+            &self,
+            _: ProjectId,
+            _: &str,
+        ) -> Result<Vec<MemoryDoc>, EngineError> {
             Ok(vec![])
         }
         async fn save_lease(&self, _: &CapabilityLease) -> Result<(), EngineError> {

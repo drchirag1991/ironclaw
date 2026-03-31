@@ -544,7 +544,11 @@ mod tests {
         async fn load_memory_doc(&self, _: DocId) -> Result<Option<MemoryDoc>, EngineError> {
             Ok(None)
         }
-        async fn list_memory_docs(&self, _: ProjectId, _: &str) -> Result<Vec<MemoryDoc>, EngineError> {
+        async fn list_memory_docs(
+            &self,
+            _: ProjectId,
+            _: &str,
+        ) -> Result<Vec<MemoryDoc>, EngineError> {
             Ok(vec![])
         }
         async fn save_lease(&self, _: &CapabilityLease) -> Result<(), EngineError> {

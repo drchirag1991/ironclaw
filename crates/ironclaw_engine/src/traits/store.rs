@@ -151,20 +151,14 @@ pub trait Store: Send + Sync {
 
     /// List all threads in a project regardless of user.
     /// Used by: recovery, background thread resume at startup.
-    async fn list_all_threads(
-        &self,
-        project_id: ProjectId,
-    ) -> Result<Vec<Thread>, EngineError> {
+    async fn list_all_threads(&self, project_id: ProjectId) -> Result<Vec<Thread>, EngineError> {
         let _ = project_id;
         Ok(Vec::new())
     }
 
     /// List all missions in a project regardless of user.
     /// Used by: cron ticker, event listener, bootstrap.
-    async fn list_all_missions(
-        &self,
-        project_id: ProjectId,
-    ) -> Result<Vec<Mission>, EngineError> {
+    async fn list_all_missions(&self, project_id: ProjectId) -> Result<Vec<Mission>, EngineError> {
         let _ = project_id;
         Ok(Vec::new())
     }

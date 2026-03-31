@@ -128,7 +128,11 @@ mod tests {
             Ok(threads.iter().find(|t| t.id == id).cloned())
         }
 
-        async fn list_threads(&self, project_id: ProjectId, user_id: &str) -> Result<Vec<Thread>, EngineError> {
+        async fn list_threads(
+            &self,
+            project_id: ProjectId,
+            user_id: &str,
+        ) -> Result<Vec<Thread>, EngineError> {
             let threads = self.threads.read().await;
             Ok(threads
                 .iter()
@@ -267,7 +271,11 @@ mod tests {
             Ok(missions.iter().find(|m| m.id == id).cloned())
         }
 
-        async fn list_missions(&self, project_id: ProjectId, user_id: &str) -> Result<Vec<Mission>, EngineError> {
+        async fn list_missions(
+            &self,
+            project_id: ProjectId,
+            user_id: &str,
+        ) -> Result<Vec<Mission>, EngineError> {
             let missions = self.missions.read().await;
             Ok(missions
                 .iter()
@@ -301,7 +309,13 @@ mod tests {
         let project_id = ProjectId::new();
 
         let doc = store
-            .create_doc(project_id, "test-user", DocType::Summary, "Test Doc", "Some content")
+            .create_doc(
+                project_id,
+                "test-user",
+                DocType::Summary,
+                "Test Doc",
+                "Some content",
+            )
             .await
             .unwrap();
 
@@ -377,15 +391,33 @@ mod tests {
         let project_id = ProjectId::new();
 
         store
-            .create_doc(project_id, "test-user", DocType::Summary, "S1", "summary content")
+            .create_doc(
+                project_id,
+                "test-user",
+                DocType::Summary,
+                "S1",
+                "summary content",
+            )
             .await
             .unwrap();
         store
-            .create_doc(project_id, "test-user", DocType::Lesson, "L1", "lesson content")
+            .create_doc(
+                project_id,
+                "test-user",
+                DocType::Lesson,
+                "L1",
+                "lesson content",
+            )
             .await
             .unwrap();
         store
-            .create_doc(project_id, "test-user", DocType::Summary, "S2", "another summary")
+            .create_doc(
+                project_id,
+                "test-user",
+                DocType::Summary,
+                "S2",
+                "another summary",
+            )
             .await
             .unwrap();
 

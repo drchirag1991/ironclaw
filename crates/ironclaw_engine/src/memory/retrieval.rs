@@ -377,13 +377,34 @@ mod tests {
     async fn retrieve_respects_max_docs_limit() {
         let project = ProjectId::new();
         let store = DocStore::new(vec![
-            MemoryDoc::new(project, "test-user", DocType::Lesson, "Lesson 1", "Content 1"),
-            MemoryDoc::new(project, "test-user", DocType::Lesson, "Lesson 2", "Content 2"),
-            MemoryDoc::new(project, "test-user", DocType::Lesson, "Lesson 3", "Content 3"),
+            MemoryDoc::new(
+                project,
+                "test-user",
+                DocType::Lesson,
+                "Lesson 1",
+                "Content 1",
+            ),
+            MemoryDoc::new(
+                project,
+                "test-user",
+                DocType::Lesson,
+                "Lesson 2",
+                "Content 2",
+            ),
+            MemoryDoc::new(
+                project,
+                "test-user",
+                DocType::Lesson,
+                "Lesson 3",
+                "Content 3",
+            ),
         ]);
         let engine = RetrievalEngine::new(store);
 
-        let docs = engine.retrieve_context(project, "test-user", "lesson", 2).await.unwrap();
+        let docs = engine
+            .retrieve_context(project, "test-user", "lesson", 2)
+            .await
+            .unwrap();
         assert_eq!(docs.len(), 2);
     }
 
@@ -421,7 +442,10 @@ mod tests {
         ]);
         let engine = RetrievalEngine::new(store);
 
-        let docs = engine.retrieve_context(project, "test-user", "search", 5).await.unwrap();
+        let docs = engine
+            .retrieve_context(project, "test-user", "search", 5)
+            .await
+            .unwrap();
         assert_eq!(docs.len(), 2);
         // Spec should rank first due to higher type weight
         assert_eq!(docs[0].doc_type, DocType::Spec);

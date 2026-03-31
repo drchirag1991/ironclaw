@@ -166,14 +166,23 @@ pub async fn record_orchestrator_failure(
 ) {
     use crate::types::memory::{DocType, MemoryDoc};
 
-    let docs = store.list_memory_docs(project_id, "system").await.unwrap_or_default();
+    let docs = store
+        .list_memory_docs(project_id, "system")
+        .await
+        .unwrap_or_default();
     let existing = docs.iter().find(|d| d.title == FAILURE_TRACKER_TITLE);
 
     let mut tracker = if let Some(doc) = existing {
         doc.clone()
     } else {
-        MemoryDoc::new(project_id, "system", DocType::Note, FAILURE_TRACKER_TITLE, "")
-            .with_tags(vec!["orchestrator_meta".to_string()])
+        MemoryDoc::new(
+            project_id,
+            "system",
+            DocType::Note,
+            FAILURE_TRACKER_TITLE,
+            "",
+        )
+        .with_tags(vec!["orchestrator_meta".to_string()])
     };
 
     // Store failure count as JSON in content: {"version": N, "count": M}
@@ -204,7 +213,10 @@ pub async fn record_orchestrator_failure(
 
 /// Reset the failure counter (called after successful execution).
 pub async fn reset_orchestrator_failures(store: &Arc<dyn Store>, project_id: ProjectId) {
-    let docs = store.list_memory_docs(project_id, "system").await.unwrap_or_default();
+    let docs = store
+        .list_memory_docs(project_id, "system")
+        .await
+        .unwrap_or_default();
     let existing = docs.iter().find(|d| d.title == FAILURE_TRACKER_TITLE);
 
     if let Some(doc) = existing {
@@ -1473,16 +1485,34 @@ mod tests {
     #[tokio::test]
     async fn load_orchestrator_picks_highest_version() {
         let project_id = ProjectId::new();
-        let mut doc_v1 = MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v1_code()")
-            .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
+        let mut doc_v1 = MemoryDoc::new(
+            project_id,
+            "system",
+            DocType::Note,
+            ORCHESTRATOR_TITLE,
+            "v1_code()",
+        )
+        .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v1.metadata = serde_json::json!({"version": 1});
 
-        let mut doc_v3 = MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v3_code()")
-            .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
+        let mut doc_v3 = MemoryDoc::new(
+            project_id,
+            "system",
+            DocType::Note,
+            ORCHESTRATOR_TITLE,
+            "v3_code()",
+        )
+        .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v3.metadata = serde_json::json!({"version": 3});
 
-        let mut doc_v2 = MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v2_code()")
-            .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
+        let mut doc_v2 = MemoryDoc::new(
+            project_id,
+            "system",
+            DocType::Note,
+            ORCHESTRATOR_TITLE,
+            "v2_code()",
+        )
+        .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v2.metadata = serde_json::json!({"version": 2});
 
         let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![
@@ -1498,15 +1528,25 @@ mod tests {
         let project_id = ProjectId::new();
 
         // Create v2 orchestrator
-        let mut doc_v2 =
-            MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v2_buggy()")
-                .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
+        let mut doc_v2 = MemoryDoc::new(
+            project_id,
+            "system",
+            DocType::Note,
+            ORCHESTRATOR_TITLE,
+            "v2_buggy()",
+        )
+        .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v2.metadata = serde_json::json!({"version": 2});
 
         // Create v1 orchestrator (fallback)
-        let mut doc_v1 =
-            MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v1_stable()")
-                .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
+        let mut doc_v1 = MemoryDoc::new(
+            project_id,
+            "system",
+            DocType::Note,
+            ORCHESTRATOR_TITLE,
+            "v1_stable()",
+        )
+        .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v1.metadata = serde_json::json!({"version": 1});
 
         // Create failure tracker showing v2 has 3 failures
@@ -1534,9 +1574,14 @@ mod tests {
         let project_id = ProjectId::new();
 
         // Single version with 3 failures
-        let mut doc_v1 =
-            MemoryDoc::new(project_id, "system", DocType::Note, ORCHESTRATOR_TITLE, "v1_broken()")
-                .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
+        let mut doc_v1 = MemoryDoc::new(
+            project_id,
+            "system",
+            DocType::Note,
+            ORCHESTRATOR_TITLE,
+            "v1_broken()",
+        )
+        .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc_v1.metadata = serde_json::json!({"version": 1});
 
         let tracker = MemoryDoc::new(
