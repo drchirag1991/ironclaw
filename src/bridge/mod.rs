@@ -46,3 +46,6 @@ pub use router::{
     pending_approval_for_user_thread,
     resume_engine_mission,
 };
+
+#[cfg(feature = "libsql")]
+pub use router::reset_engine_state;

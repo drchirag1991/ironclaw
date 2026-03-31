@@ -903,7 +903,11 @@ pub async fn handle_interrupt(
     let mut stopped = 0u32;
     for tid in &active_threads {
         if state.thread_manager.is_running(*tid).await {
-            if let Err(e) = state.thread_manager.stop_thread(*tid, &message.user_id).await {
+            if let Err(e) = state
+                .thread_manager
+                .stop_thread(*tid, &message.user_id)
+                .await
+            {
                 debug!(thread_id = %tid, error = %e, "engine v2: failed to stop thread");
             } else {
                 stopped += 1;
@@ -1658,11 +1662,7 @@ async fn forward_event_to_channel(
         } => {
             if let Some(text) = interpret_message_event(role, content_preview) {
                 let _ = channels
-                    .send_status(
-                        channel_name,
-                        StatusUpdate::Thinking(text.into()),
-                        metadata,
-                    )
+                    .send_status(channel_name, StatusUpdate::Thinking(text.into()), metadata)
                     .await;
             }
         }
@@ -1891,7 +1891,10 @@ fn thread_to_info(t: &ironclaw_engine::Thread) -> EngineThreadInfo {
 }
 
 /// List engine threads, optionally filtered by project.
-pub async fn list_engine_threads(project_id: Option<&str>, user_id: &str) -> Result<Vec<EngineThreadInfo>, Error> {
+pub async fn list_engine_threads(
+    project_id: Option<&str>,
+    user_id: &str,
+) -> Result<Vec<EngineThreadInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(Vec::new());
     };
@@ -1918,7 +1921,10 @@ pub async fn list_engine_threads(project_id: Option<&str>, user_id: &str) -> Res
 }
 
 /// Get a single engine thread by ID.
-pub async fn get_engine_thread(thread_id: &str, user_id: &str) -> Result<Option<EngineThreadDetail>, Error> {
+pub async fn get_engine_thread(
+    thread_id: &str,
+    user_id: &str,
+) -> Result<Option<EngineThreadDetail>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(None);
     };
@@ -2085,7 +2091,10 @@ pub async fn list_engine_projects(user_id: &str) -> Result<Vec<EngineProjectInfo
 }
 
 /// Get a single project by ID.
-pub async fn get_engine_project(project_id: &str, user_id: &str) -> Result<Option<EngineProjectInfo>, Error> {
+pub async fn get_engine_project(
+    project_id: &str,
+    user_id: &str,
+) -> Result<Option<EngineProjectInfo>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(None);
     };
@@ -2155,7 +2164,10 @@ pub async fn list_engine_missions(
 }
 
 /// Get a single mission by ID.
-pub async fn get_engine_mission(mission_id: &str, user_id: &str) -> Result<Option<EngineMissionDetail>, Error> {
+pub async fn get_engine_mission(
+    mission_id: &str,
+    user_id: &str,
+) -> Result<Option<EngineMissionDetail>, Error> {
     let Some(lock) = ENGINE_STATE.get() else {
         return Ok(None);
     };
@@ -2298,6 +2310,17 @@ pub async fn resume_engine_mission(
         .map_err(|e| engine_err("resume mission", e))
 }
 
+/// Reset the global engine state so a fresh engine can be initialized.
+///
+/// Used by the test rig to isolate engine v2 tests — each test gets a clean
+/// engine state instead of inheriting the prior test's `OnceLock` singleton.
+#[cfg(feature = "libsql")]
+pub async fn reset_engine_state() {
+    if let Some(lock) = ENGINE_STATE.get() {
+        *lock.write().await = None;
+    }
+}
+
 /// Resolve the effective user_id for mission management operations.
 ///
 /// If the mission is system-owned, requires admin role and returns "system"
@@ -2341,10 +2364,8 @@ async fn migrate_legacy_user_ids(store: &Arc<dyn ironclaw_engine::Store>, owner_
 
     // We need a project_id to query threads/missions/docs. Use list_projects
     // with the now-migrated owner_id, or fall back to "legacy" in case save failed.
-    let all_projects: Vec<ironclaw_engine::Project> = store
-        .list_projects(owner_id)
-        .await
-        .unwrap_or_default();
+    let all_projects: Vec<ironclaw_engine::Project> =
+        store.list_projects(owner_id).await.unwrap_or_default();
 
     for project in &all_projects {
         let pid = project.id;

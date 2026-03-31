@@ -520,7 +520,7 @@ impl Agent {
 
         // Eagerly initialize engine v2 so gateway API endpoints can serve
         // data (projects, missions, threads) before the first chat message.
-        if crate::bridge::is_engine_v2_enabled()
+        if self.config.engine_v2
             && let Err(e) = crate::bridge::init_engine(&self).await
         {
             tracing::debug!("engine v2: eager init failed: {e}");
@@ -1180,7 +1180,7 @@ impl Agent {
         }
 
         // Engine V2 routing (Strategy C: parallel deployment)
-        if crate::bridge::is_engine_v2_enabled() {
+        if self.config.engine_v2 {
             match &submission {
                 Submission::UserInput { content } => {
                     return crate::bridge::handle_with_engine(self, message, content).await;
