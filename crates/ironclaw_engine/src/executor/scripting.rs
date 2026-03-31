@@ -595,7 +595,8 @@ pub async fn execute_code_with_skills(
                 let pending_ids = resolve.pending_call_ids().to_vec();
                 debug!(pending = ?pending_ids, "Monty: ResolveFutures — resolving pending tools");
 
-                let mut results: Vec<(u32, ExtFunctionResult)> = Vec::with_capacity(pending_ids.len());
+                let mut results: Vec<(u32, ExtFunctionResult)> =
+                    Vec::with_capacity(pending_ids.len());
 
                 for &mid in &pending_ids {
                     if let Some(pt) = pending_tools.remove(&mid) {
@@ -1323,4 +1324,461 @@ fn monty_args_to_json(
         map.insert(key, monty_to_json(v));
     }
     serde_json::Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capability::lease::LeaseManager;
+    use crate::capability::policy::PolicyEngine;
+    use crate::traits::effect::ThreadExecutionContext;
+    use crate::types::capability::{ActionDef, CapabilityLease, EffectType};
+    use crate::types::project::ProjectId;
+    use crate::types::step::{ActionResult, StepId};
+    use crate::types::thread::{Thread, ThreadConfig, ThreadType};
+    use std::sync::Mutex;
+
+    struct MockEffects {
+        results: Mutex<Vec<Result<ActionResult, EngineError>>>,
+        actions: Vec<ActionDef>,
+    }
+
+    impl MockEffects {
+        fn new(actions: Vec<ActionDef>, results: Vec<Result<ActionResult, EngineError>>) -> Self {
+            Self {
+                results: Mutex::new(results),
+                actions,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for MockEffects {
+        async fn execute_action(
+            &self,
+            name: &str,
+            _params: serde_json::Value,
+            _lease: &CapabilityLease,
+            _ctx: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            let mut results = self.results.lock().unwrap();
+            if results.is_empty() {
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: name.into(),
+                    output: serde_json::json!({"result": "ok"}),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                })
+            } else {
+                results.remove(0)
+            }
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(self.actions.clone())
+        }
+    }
+
+    fn test_action(name: &str) -> ActionDef {
+        ActionDef {
+            name: name.into(),
+            description: "Test tool".into(),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: vec![EffectType::ReadLocal],
+            requires_approval: false,
+        }
+    }
+
+    fn make_test_thread() -> Thread {
+        Thread::new(
+            "test goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        )
+    }
+
+    fn make_exec_context(thread: &Thread) -> ThreadExecutionContext {
+        ThreadExecutionContext {
+            thread_id: thread.id,
+            thread_type: thread.thread_type,
+            project_id: thread.project_id,
+            user_id: "test".into(),
+            step_id: StepId::new(),
+        }
+    }
+
+    /// Stub LLM that always returns text "stub". Only used so execute_code
+    /// doesn't need a real LLM — our tests exercise tool dispatch, not LLM calls.
+    struct StubLlm;
+
+    #[async_trait::async_trait]
+    impl crate::traits::llm::LlmBackend for StubLlm {
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[crate::types::message::ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &crate::traits::llm::LlmCallConfig,
+        ) -> Result<crate::traits::llm::LlmOutput, EngineError> {
+            Ok(crate::traits::llm::LlmOutput {
+                response: crate::types::step::LlmResponse::Text("stub".into()),
+                usage: crate::types::step::TokenUsage::default(),
+            })
+        }
+    }
+
+    async fn run_code(
+        code: &str,
+        effects: Arc<dyn EffectExecutor>,
+        thread: &Thread,
+    ) -> Result<CodeExecutionResult, EngineError> {
+        let leases = LeaseManager::new();
+        let policy = PolicyEngine::new();
+        let ctx = make_exec_context(thread);
+
+        // Grant a wildcard lease
+        leases.grant(thread.id, "tools", vec![], None, None).await;
+
+        execute_code(
+            code,
+            thread,
+            &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &effects,
+            &leases,
+            &policy,
+            &ctx,
+            &[],
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    // ── Single await tool call ──────────────────────────────
+
+    #[tokio::test]
+    async fn single_await_tool_call() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("echo")],
+            vec![Ok(ActionResult {
+                call_id: String::new(),
+                action_name: "echo".into(),
+                output: serde_json::json!("hello world"),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })],
+        ));
+
+        let code = r#"
+result = await echo(message="hello")
+FINAL(str(result))
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(
+            result.final_answer.is_some(),
+            "should have final answer, stdout: {}",
+            result.stdout
+        );
+        assert!(
+            !result.had_error,
+            "should not error, stdout: {}",
+            result.stdout
+        );
+        assert_eq!(result.action_results.len(), 1);
+    }
+
+    // ── asyncio.gather parallel execution ───────────────────
+
+    #[tokio::test]
+    async fn asyncio_gather_two_tools() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("tool_a"), test_action("tool_b")],
+            vec![
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "tool_a".into(),
+                    output: serde_json::json!(10),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "tool_b".into(),
+                    output: serde_json::json!(32),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+            ],
+        ));
+
+        let code = r#"
+import asyncio
+a, b = await asyncio.gather(tool_a(), tool_b())
+FINAL(str(a + b))
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(
+            result.final_answer.is_some(),
+            "should have final answer, stdout: {}",
+            result.stdout
+        );
+        assert_eq!(
+            result.final_answer.as_deref(),
+            Some("42"),
+            "10 + 32 = 42, got: {:?}, stdout: {}",
+            result.final_answer,
+            result.stdout
+        );
+        assert_eq!(result.action_results.len(), 2);
+        assert!(!result.had_error);
+    }
+
+    // ── asyncio.gather three tools ──────────────────────────
+
+    #[tokio::test]
+    async fn asyncio_gather_three_tools() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![
+                test_action("web_search"),
+                test_action("http"),
+                test_action("memory_search"),
+            ],
+            vec![
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "web_search".into(),
+                    output: serde_json::json!("search results"),
+                    is_error: false,
+                    duration: Duration::from_millis(50),
+                }),
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "http".into(),
+                    output: serde_json::json!("page content"),
+                    is_error: false,
+                    duration: Duration::from_millis(100),
+                }),
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "memory_search".into(),
+                    output: serde_json::json!("memories"),
+                    is_error: false,
+                    duration: Duration::from_millis(25),
+                }),
+            ],
+        ));
+
+        let code = r#"
+import asyncio
+s, h, m = await asyncio.gather(
+    web_search(query="test"),
+    http(url="https://example.com"),
+    memory_search(query="prior"),
+)
+FINAL(str(s) + "|" + str(h) + "|" + str(m))
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        assert_eq!(result.action_results.len(), 3);
+        let answer = result.final_answer.unwrap();
+        assert!(answer.contains("search results"), "got: {answer}");
+        assert!(answer.contains("page content"), "got: {answer}");
+        assert!(answer.contains("memories"), "got: {answer}");
+    }
+
+    // ── Data-dependent chain (sequential await) ─────────────
+
+    #[tokio::test]
+    async fn sequential_dependent_calls() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("step1"), test_action("step2")],
+            vec![
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "step1".into(),
+                    output: serde_json::json!("intermediate"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "step2".into(),
+                    output: serde_json::json!("final"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+            ],
+        ));
+
+        let code = r#"
+a = await step1()
+b = await step2(input=a)
+FINAL(str(b))
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        assert_eq!(result.action_results.len(), 2);
+        assert_eq!(result.final_answer.as_deref(), Some("final"));
+    }
+
+    // ── Error in one gathered tool ──────────────────────────
+
+    #[tokio::test]
+    async fn gather_with_error_propagates() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("good"), test_action("bad")],
+            vec![
+                Ok(ActionResult {
+                    call_id: String::new(),
+                    action_name: "good".into(),
+                    output: serde_json::json!("ok"),
+                    is_error: false,
+                    duration: Duration::from_millis(1),
+                }),
+                Err(EngineError::Effect {
+                    reason: "tool exploded".into(),
+                }),
+            ],
+        ));
+
+        let code = r#"
+import asyncio
+a, b = await asyncio.gather(good(), bad())
+FINAL("should not reach")
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        // Error in gather propagates as exception — code should error
+        assert!(
+            result.had_error,
+            "should have error, stdout: {}",
+            result.stdout
+        );
+        assert!(
+            result.final_answer.is_none()
+                || result.final_answer.as_deref() != Some("should not reach")
+        );
+    }
+
+    // ── Tool with no lease (denied in preflight) ────────────
+
+    #[tokio::test]
+    async fn denied_tool_raises_exception() {
+        let thread = make_test_thread();
+        // No actions registered — tool has no lease
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+
+        let code = r#"
+try:
+    result = await unknown_tool()
+    FINAL("should not reach")
+except:
+    FINAL("caught error")
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        // Tool not found raises NameError before we even get to dispatch
+        assert!(result.final_answer.is_some(), "stdout: {}", result.stdout);
+    }
+
+    // ── FINAL works without await ───────────────────────────
+
+    #[tokio::test]
+    async fn final_is_sync() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+
+        let code = r#"
+FINAL("hello from sync")
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert_eq!(result.final_answer.as_deref(), Some("hello from sync"));
+        assert!(!result.had_error);
+    }
+
+    // ── globals() still works ───────────────────────────────
+
+    #[tokio::test]
+    async fn globals_returns_known_tools() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("web_search"), test_action("http")],
+            vec![],
+        ));
+
+        let code = r#"
+g = globals()
+has_search = "web_search" in g
+has_http = "http" in g
+FINAL(str(has_search) + "|" + str(has_http))
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        assert_eq!(result.final_answer.as_deref(), Some("True|True"));
+    }
+
+    // ── Empty gather ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn empty_gather() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+
+        let code = r#"
+import asyncio
+results = await asyncio.gather()
+FINAL(str(len(results)))
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        assert_eq!(result.final_answer.as_deref(), Some("0"));
+    }
+
+    // ── Single-item gather ──────────────────────────────────
+
+    #[tokio::test]
+    async fn single_item_gather() {
+        let thread = make_test_thread();
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(
+            vec![test_action("echo")],
+            vec![Ok(ActionResult {
+                call_id: String::new(),
+                action_name: "echo".into(),
+                output: serde_json::json!("gathered"),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })],
+        ));
+
+        let code = r#"
+import asyncio
+results = await asyncio.gather(echo())
+FINAL(str(results[0]))
+"#;
+
+        let result = run_code(code, effects, &thread).await.unwrap();
+        assert!(!result.had_error, "stdout: {}", result.stdout);
+        assert_eq!(result.final_answer.as_deref(), Some("gathered"));
+        assert_eq!(result.action_results.len(), 1);
+    }
 }

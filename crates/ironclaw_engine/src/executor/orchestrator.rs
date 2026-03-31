@@ -1954,13 +1954,27 @@ mod tests {
 
     #[test]
     fn signals_tool_intent_true_positives() {
-        assert!(eval_python_bool(r#"signals_tool_intent("Let me search for that file.")"#));
-        assert!(eval_python_bool(r#"signals_tool_intent("I'll fetch the data now.")"#));
-        assert!(eval_python_bool(r#"signals_tool_intent("I'm going to check the logs.")"#));
-        assert!(eval_python_bool(r#"signals_tool_intent("Let me add it now.")"#));
-        assert!(eval_python_bool(r#"signals_tool_intent("I will run the tests to verify.")"#));
-        assert!(eval_python_bool(r#"signals_tool_intent("I'll look up the documentation.")"#));
-        assert!(eval_python_bool(r#"signals_tool_intent("Let me read the file contents.")"#));
+        assert!(eval_python_bool(
+            r#"signals_tool_intent("Let me search for that file.")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_tool_intent("I'll fetch the data now.")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_tool_intent("I'm going to check the logs.")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_tool_intent("Let me add it now.")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_tool_intent("I will run the tests to verify.")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_tool_intent("I'll look up the documentation.")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_tool_intent("Let me read the file contents.")"#
+        ));
         assert!(eval_python_bool(
             r#"signals_tool_intent("I'm going to execute the command.")"#
         ));
