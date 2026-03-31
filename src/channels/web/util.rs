@@ -1,6 +1,7 @@
 //! Shared utility functions for the web gateway.
 
-use crate::channels::web::types::{ToolCallInfo, TurnInfo};
+use crate::channels::web::types::{GeneratedImageInfo, ToolCallInfo, TurnInfo};
+use crate::generated_images::GeneratedImageSentinel;
 
 pub use ironclaw_common::truncate_preview;
 
@@ -22,6 +23,40 @@ fn parse_tool_call_infos(calls: &[serde_json::Value]) -> Vec<ToolCallInfo> {
             rationale: c["rationale"].as_str().map(String::from),
         })
         .collect()
+}
+
+fn parse_image_generated_sentinel_from_value(
+    value: &serde_json::Value,
+) -> Option<GeneratedImageInfo> {
+    let sentinel = GeneratedImageSentinel::from_value(value)?;
+    let data_url = sentinel.data_url()?.to_string();
+    if data_url.is_empty() {
+        return None;
+    }
+    let path = sentinel.path().map(String::from);
+    Some(GeneratedImageInfo { data_url, path })
+}
+
+pub fn collect_generated_images_from_tool_results<'a>(
+    tool_results: impl IntoIterator<Item = Option<&'a serde_json::Value>>,
+) -> Vec<GeneratedImageInfo> {
+    tool_results
+        .into_iter()
+        .flatten()
+        .filter_map(parse_image_generated_sentinel_from_value)
+        .collect()
+}
+
+pub fn tool_result_preview(result: Option<&serde_json::Value>) -> Option<String> {
+    let result = result?;
+    if parse_image_generated_sentinel_from_value(result).is_some() {
+        return Some("Generated image".to_string());
+    }
+    let s = match result {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    Some(truncate_preview(&s, 500))
 }
 
 /// Build TurnInfo pairs from flat DB messages (user/tool_calls/assistant triples).
@@ -47,6 +82,7 @@ pub fn build_turns_from_db_messages(
                 started_at: msg.created_at.to_rfc3339(),
                 completed_at: None,
                 tool_calls: Vec::new(),
+                generated_images: Vec::new(),
                 narrative: None,
             };
 
@@ -61,6 +97,9 @@ pub fn build_turns_from_db_messages(
                     Ok(serde_json::Value::Array(calls)) => {
                         // Old format: plain array
                         turn.tool_calls = parse_tool_call_infos(&calls);
+                        turn.generated_images = collect_generated_images_from_tool_results(
+                            calls.iter().map(|call| call.get("result")),
+                        );
                     }
                     Ok(serde_json::Value::Object(obj)) => {
                         // New wrapped format with narrative
@@ -70,6 +109,9 @@ pub fn build_turns_from_db_messages(
                             .map(String::from);
                         if let Some(serde_json::Value::Array(calls)) = obj.get("calls") {
                             turn.tool_calls = parse_tool_call_infos(calls);
+                            turn.generated_images = collect_generated_images_from_tool_results(
+                                calls.iter().map(|call| call.get("result")),
+                            );
                         }
                     }
                     Ok(_) => {
@@ -114,6 +156,7 @@ pub fn build_turns_from_db_messages(
                 started_at: msg.created_at.to_rfc3339(),
                 completed_at: Some(msg.created_at.to_rfc3339()),
                 tool_calls: Vec::new(),
+                generated_images: Vec::new(),
                 narrative: None,
             });
             turn_number += 1;
@@ -303,5 +346,67 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert!(turns[0].narrative.is_none());
         assert_eq!(turns[0].tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn test_collect_generated_images_from_tool_results_parses_stringified_sentinel() {
+        let sentinel = serde_json::json!({
+            "type": "image_generated",
+            "data": "data:image/jpeg;base64,abc123",
+            "path": "/tmp/cat.jpg"
+        })
+        .to_string();
+        let tool_results = [serde_json::Value::String(sentinel)];
+
+        let images = collect_generated_images_from_tool_results(tool_results.iter().map(Some));
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data_url, "data:image/jpeg;base64,abc123");
+        assert_eq!(images[0].path.as_deref(), Some("/tmp/cat.jpg"));
+    }
+
+    #[test]
+    fn test_build_turns_collects_generated_images_from_persisted_tool_results() {
+        let tool_calls = serde_json::json!({
+            "calls": [{
+                "name": "image_generate",
+                "result_preview": "Generated image",
+                "result": serde_json::json!({
+                    "type": "image_generated",
+                    "data": "data:image/jpeg;base64,abc123",
+                    "media_type": "image/jpeg"
+                }).to_string()
+            }]
+        });
+        let messages = vec![
+            make_msg("user", "Draw a cat", 0),
+            make_msg("tool_calls", &tool_calls.to_string(), 500),
+            make_msg("assistant", "Generated image.", 1000),
+        ];
+
+        let turns = build_turns_from_db_messages(&messages);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].generated_images.len(), 1);
+        assert_eq!(
+            turns[0].generated_images[0].data_url,
+            "data:image/jpeg;base64,abc123"
+        );
+    }
+
+    #[test]
+    fn test_collect_generated_images_from_double_stringified_sentinel() {
+        let sentinel = serde_json::json!({
+            "type": "image_generated",
+            "data": "data:image/jpeg;base64,abc123",
+            "media_type": "image/jpeg"
+        })
+        .to_string();
+        let double_wrapped = serde_json::Value::String(serde_json::to_string(&sentinel).unwrap());
+
+        let images = collect_generated_images_from_tool_results([Some(&double_wrapped)]);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data_url, "data:image/jpeg;base64,abc123");
     }
 }

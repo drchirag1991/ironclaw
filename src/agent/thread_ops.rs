@@ -19,11 +19,47 @@ use crate::agent::submission::SubmissionResult;
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
+use crate::generated_images::GeneratedImageSentinel;
 use crate::llm::{ChatMessage, ToolCall};
 use crate::tools::redact_params;
 use ironclaw_common::truncate_preview;
 
 const FORGED_THREAD_ID_ERROR: &str = "Invalid or unauthorized thread ID.";
+
+fn tool_result_preview_for_persistence(result: &serde_json::Value) -> String {
+    if GeneratedImageSentinel::from_value(result).is_some() {
+        return "Generated image".to_string();
+    }
+    match result {
+        serde_json::Value::String(s) => truncate_preview(s, 500),
+        other => truncate_preview(&other.to_string(), 500),
+    }
+}
+
+fn tool_result_content_for_persistence(result: &serde_json::Value) -> String {
+    if let Some(sentinel) = GeneratedImageSentinel::from_value(result) {
+        return sentinel.value.to_string();
+    }
+    match result {
+        serde_json::Value::String(s) => truncate_preview(s, 1000),
+        other => truncate_preview(&other.to_string(), 1000),
+    }
+}
+
+fn tool_result_content_for_rebuild(result: &str) -> String {
+    let Some(sentinel) =
+        GeneratedImageSentinel::from_value(&serde_json::Value::String(result.to_string()))
+    else {
+        return result.to_string();
+    };
+    let media_type = sentinel.media_type().unwrap_or("image");
+    if let Some(path) = sentinel.path()
+        && !path.is_empty()
+    {
+        return format!("Generated image ({media_type}) at {path}");
+    }
+    format!("Generated image ({media_type})")
+}
 
 fn requires_preexisting_uuid_thread(channel: &str) -> bool {
     // Gateway-style channels send server-issued conversation UUIDs.
@@ -757,16 +793,12 @@ impl Agent {
                     "call_id": format!("turn{}_{}", turn_number, i),
                 });
                 if let Some(ref result) = tc.result {
-                    let preview = match result {
-                        serde_json::Value::String(s) => truncate_preview(s, 500),
-                        other => truncate_preview(&other.to_string(), 500),
-                    };
+                    let preview = tool_result_preview_for_persistence(result);
                     obj["result_preview"] = serde_json::Value::String(preview);
-                    // Store full result (truncated to ~1000 chars) for LLM context rebuild
-                    let full_result = match result {
-                        serde_json::Value::String(s) => truncate_preview(s, 1000),
-                        other => truncate_preview(&other.to_string(), 1000),
-                    };
+                    // Persist full image sentinel payloads so the web history can
+                    // reconstruct generated image cards after refresh. Other tool
+                    // results remain truncated to keep DB rows bounded.
+                    let full_result = tool_result_content_for_persistence(result);
                     obj["result"] = serde_json::Value::String(full_result);
                 }
                 if let Some(ref error) = tc.error {
@@ -1912,7 +1944,7 @@ fn rebuild_chat_messages_from_db(
                                 // (e.g. "Tool 'http' failed: timeout"), so no prefix needed.
                                 err.to_string()
                             } else if let Some(res) = c.get("result").and_then(|v| v.as_str()) {
-                                res.to_string()
+                                tool_result_content_for_rebuild(res)
                             } else if let Some(preview) =
                                 c.get("result_preview").and_then(|v| v.as_str())
                             {
@@ -2097,6 +2129,51 @@ mod tests {
         assert!(result[5].tool_calls.is_some());
         assert_eq!(result[6].role, crate::llm::Role::Tool);
         assert_eq!(result[7].content, "Written");
+    }
+
+    #[test]
+    fn test_rebuild_chat_messages_summarizes_image_generated_result() {
+        let tool_json = serde_json::json!([
+            {
+                "name": "image_generate",
+                "call_id": "call_0",
+                "parameters": {"prompt": "cat"},
+                "result": serde_json::json!({
+                    "type": "image_generated",
+                    "data": "data:image/jpeg;base64,abc123",
+                    "media_type": "image/jpeg"
+                }).to_string(),
+                "result_preview": "Generated image"
+            }
+        ]);
+        let messages = vec![
+            make_db_msg("user", "Draw a cat"),
+            make_db_msg("tool_calls", &tool_json.to_string()),
+            make_db_msg("assistant", "Done"),
+        ];
+
+        let result = rebuild_chat_messages_from_db(&messages);
+
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[2].role, crate::llm::Role::Tool);
+        assert_eq!(result[2].content, "Generated image (image/jpeg)");
+    }
+
+    #[test]
+    fn test_tool_result_preview_for_persistence_handles_double_stringified_sentinel() {
+        let sentinel = serde_json::json!({
+            "type": "image_generated",
+            "data": "data:image/jpeg;base64,abc123",
+            "media_type": "image/jpeg"
+        })
+        .to_string();
+        let double_wrapped = serde_json::Value::String(serde_json::to_string(&sentinel).unwrap());
+
+        let preview = tool_result_preview_for_persistence(&double_wrapped);
+        let rebuilt = tool_result_content_for_rebuild(double_wrapped.as_str().unwrap());
+
+        assert_eq!(preview, "Generated image");
+        assert_eq!(rebuilt, "Generated image (image/jpeg)");
     }
 
     fn make_db_msg(role: &str, content: &str) -> crate::history::ConversationMessage {

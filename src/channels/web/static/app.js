@@ -95,6 +95,7 @@ let stagedImages = [];
 let authFlowPending = false;
 let _ghostSuggestion = '';
 let currentSettingsSubtab = 'inference';
+let generatedImagesByThread = new Map();
 
 // --- Streaming Debounce State ---
 let _streamBuffer = '';
@@ -620,6 +621,7 @@ function connectSSE() {
   eventSource.addEventListener('image_generated', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
+    rememberGeneratedImage(data.thread_id, data.data_url, data.path);
     addGeneratedImage(data.data_url, data.path);
   });
 
@@ -903,8 +905,7 @@ chatMessagesEl.addEventListener('copy', (e) => {
   e.clipboardData.setData('text/plain', text);
 });
 
-function addGeneratedImage(dataUrl, path) {
-  const container = document.getElementById('chat-messages');
+function createGeneratedImageElement(dataUrl, path) {
   const card = document.createElement('div');
   card.className = 'generated-image-card';
 
@@ -922,8 +923,47 @@ function addGeneratedImage(dataUrl, path) {
     card.appendChild(pathLabel);
   }
 
+  return card;
+}
+
+function hasRenderedGeneratedImage(container, dataUrl, path) {
+  const normalizedPath = path || null;
+  return Array.from(container.querySelectorAll('.generated-image-card')).some((card) => {
+    const img = card.querySelector('.generated-image');
+    const pathLabel = card.querySelector('.generated-image-path');
+    const renderedPath = pathLabel ? pathLabel.textContent : null;
+    return img && img.src === dataUrl && renderedPath === normalizedPath;
+  });
+}
+
+function addGeneratedImage(dataUrl, path) {
+  const container = document.getElementById('chat-messages');
+  if (hasRenderedGeneratedImage(container, dataUrl, path || null)) {
+    return;
+  }
+  const card = createGeneratedImageElement(dataUrl, path);
   container.appendChild(card);
   container.scrollTop = container.scrollHeight;
+}
+
+function rememberGeneratedImage(threadId, dataUrl, path) {
+  if (!threadId || !dataUrl) return;
+  if (!generatedImagesByThread.has(threadId)) {
+    generatedImagesByThread.set(threadId, []);
+  }
+  const images = generatedImagesByThread.get(threadId);
+  if (images.some(img => img.dataUrl === dataUrl && img.path === path)) {
+    return;
+  }
+  images.push({ dataUrl, path: path || null });
+}
+
+function renderGeneratedImagesForCurrentThread() {
+  if (!currentThreadId) return;
+  const images = generatedImagesByThread.get(currentThreadId) || [];
+  for (const image of images) {
+    addGeneratedImage(image.dataUrl, image.path);
+  }
 }
 
 // --- Slash Autocomplete ---
@@ -1788,10 +1828,17 @@ function loadHistory(before) {
         if (turn.tool_calls && turn.tool_calls.length > 0) {
           addToolCallsSummary(turn.tool_calls);
         }
+        if (turn.generated_images && turn.generated_images.length > 0) {
+          for (const image of turn.generated_images) {
+            rememberGeneratedImage(currentThreadId, image.data_url, image.path);
+            addGeneratedImage(image.data_url, image.path);
+          }
+        }
         if (turn.response) {
           addMessage('assistant', turn.response);
         }
       }
+      renderGeneratedImagesForCurrentThread();
       // Show welcome card when history is empty
       if (data.turns.length === 0) {
         showWelcomeCard();
@@ -1816,6 +1863,11 @@ function loadHistory(before) {
         }
         if (turn.tool_calls && turn.tool_calls.length > 0) {
           fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
+        }
+        if (turn.generated_images && turn.generated_images.length > 0) {
+          for (const image of turn.generated_images) {
+            fragment.appendChild(createGeneratedImageElement(image.data_url, image.path));
+          }
         }
         if (turn.response) {
           const assistantDiv = createMessageElement('assistant', turn.response);

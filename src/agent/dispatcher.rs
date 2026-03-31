@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use crate::agent::agentic_loop::{
     AgenticLoopConfig, LoopDelegate, LoopOutcome, LoopSignal, TextAction,
 };
+use crate::generated_images::GeneratedImageSentinel;
 use crate::llm::{ChatMessage, Reasoning, ReasoningContext};
 use crate::tools::redact_params;
 
@@ -869,22 +870,12 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     });
 
                     // Detect image generation sentinel
-                    let is_image_sentinel = if let Ok(ref output) = tool_result
+                    let image_sentinel = if let Ok(ref output) = tool_result
                         && matches!(tc.name.as_str(), "image_generate" | "image_edit")
                     {
-                        if let Ok(sentinel) = serde_json::from_str::<serde_json::Value>(output)
-                            && sentinel.get("type").and_then(|v| v.as_str())
-                                == Some("image_generated")
-                        {
-                            let data_url = sentinel
-                                .get("data")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            let path = sentinel
-                                .get("path")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
+                        if let Some(sentinel) = GeneratedImageSentinel::from_output(output) {
+                            let data_url = sentinel.data_url().unwrap_or_default().to_string();
+                            let path = sentinel.path().map(String::from);
                             if data_url.is_empty() {
                                 tracing::warn!(
                                     "Image generation sentinel has empty data URL, skipping broadcast"
@@ -900,16 +891,16 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                                     )
                                     .await;
                             }
-                            true
+                            Some(sentinel)
                         } else {
-                            false
+                            None
                         }
                     } else {
-                        false
+                        None
                     };
 
                     // Send ToolResult preview
-                    if !is_image_sentinel
+                    if image_sentinel.is_none()
                         && let Ok(ref output) = tool_result
                         && !output.is_empty()
                     {
@@ -966,12 +957,26 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     }
 
                     let is_tool_error = tool_result.is_err();
-                    let (result_content, tool_message) = crate::tools::execute::process_tool_result(
-                        self.agent.safety(),
-                        &tc.name,
-                        &tc.id,
-                        &tool_result,
-                    );
+                    let (record_content, tool_message) = if let (Ok(output), Some(sentinel)) =
+                        (&tool_result, image_sentinel.as_ref())
+                    {
+                        (
+                            output.clone(),
+                            image_generation_summary_tool_message(
+                                self.agent.safety(),
+                                &tc.name,
+                                &tc.id,
+                                sentinel,
+                            ),
+                        )
+                    } else {
+                        crate::tools::execute::process_tool_result(
+                            self.agent.safety(),
+                            &tc.name,
+                            &tc.id,
+                            &tool_result,
+                        )
+                    };
 
                     // Record sanitized result in thread (identity-based matching).
                     {
@@ -980,11 +985,11 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                             && let Some(turn) = thread.last_turn_mut()
                         {
                             if is_tool_error {
-                                turn.record_tool_error_for(&tc.id, result_content.clone());
+                                turn.record_tool_error_for(&tc.id, record_content.clone());
                             } else {
                                 turn.record_tool_result_for(
                                     &tc.id,
-                                    serde_json::json!(result_content),
+                                    serde_json::json!(record_content),
                                 );
                             }
                         }
@@ -1283,6 +1288,35 @@ pub(crate) fn strip_suggestions(text: &str) -> String {
     extract_suggestions(text).0
 }
 
+fn image_generation_summary_tool_message(
+    safety: &crate::safety::SafetyLayer,
+    tool_name: &str,
+    tool_call_id: &str,
+    sentinel: &GeneratedImageSentinel,
+) -> ChatMessage {
+    let media_type = sentinel.media_type().unwrap_or("image");
+    let path = sentinel.path();
+    let summary = if let Some(path) = path {
+        serde_json::json!({
+            "type": "image_generated",
+            "status": "ok",
+            "media_type": media_type,
+            "path": path,
+        })
+        .to_string()
+    } else {
+        serde_json::json!({
+            "type": "image_generated",
+            "status": "ok",
+            "media_type": media_type,
+        })
+        .to_string()
+    };
+    let sanitized = safety.sanitize_tool_output(tool_name, &summary);
+    let content = safety.wrap_for_llm(tool_name, &sanitized.content);
+    ChatMessage::tool_result(tool_call_id, tool_name, content)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1307,6 +1341,7 @@ mod tests {
     use crate::tools::ToolRegistry;
 
     use super::check_auth_required;
+    use crate::generated_images::GeneratedImageSentinel;
 
     /// Minimal LLM provider for unit tests that always returns a static response.
     struct StaticLlmProvider;
@@ -2636,6 +2671,46 @@ mod tests {
             !data_url.is_empty(),
             "Present 'data' field should produce non-empty string"
         );
+    }
+
+    #[test]
+    fn test_image_generation_summary_tool_message_omits_data_url() {
+        let safety = crate::safety::SafetyLayer::new(&crate::config::SafetyConfig {
+            max_output_length: 4000,
+            injection_check_enabled: true,
+        });
+        let sentinel = GeneratedImageSentinel::from_value(&serde_json::json!({
+            "type": "image_generated",
+            "data": "data:image/png;base64,abc123",
+            "media_type": "image/png",
+            "path": "/tmp/example.png"
+        }))
+        .expect("sentinel");
+
+        let message = super::image_generation_summary_tool_message(
+            &safety,
+            "image_generate",
+            "call_1",
+            &sentinel,
+        );
+
+        assert!(!message.content.contains("data:image"));
+        assert!(message.content.contains("\"type\":\"image_generated\""));
+        assert!(message.content.contains("\"media_type\":\"image/png\""));
+    }
+
+    #[test]
+    fn test_parse_image_generated_sentinel_accepts_stringified_json() {
+        let sentinel = serde_json::json!({
+            "type": "image_generated",
+            "data": "data:image/png;base64,abc123",
+            "path": "/tmp/image.png"
+        })
+        .to_string();
+        let wrapped = serde_json::to_string(&sentinel).unwrap();
+
+        let parsed = GeneratedImageSentinel::from_output(&wrapped).expect("should parse");
+        assert_eq!(parsed.data_url(), Some("data:image/png;base64,abc123"));
     }
 
     /// Test the relay channel auto-deny decision logic:

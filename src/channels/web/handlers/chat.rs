@@ -16,7 +16,8 @@ use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
 use crate::channels::web::util::{
-    build_turns_from_db_messages, tool_error_for_display, truncate_preview,
+    build_turns_from_db_messages, collect_generated_images_from_tool_results,
+    tool_error_for_display, tool_result_preview,
 };
 
 pub async fn chat_send_handler(
@@ -392,17 +393,14 @@ pub async fn chat_history_handler(
                             name: tc.name.clone(),
                             has_result: tc.result.is_some(),
                             has_error: tc.error.is_some(),
-                            result_preview: tc.result.as_ref().map(|r| {
-                                let s = match r {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    other => other.to_string(),
-                                };
-                                truncate_preview(&s, 500)
-                            }),
+                            result_preview: tool_result_preview(tc.result.as_ref()),
                             error: tc.error.as_deref().map(tool_error_for_display),
                             rationale: tc.rationale.clone(),
                         })
                         .collect(),
+                    generated_images: collect_generated_images_from_tool_results(
+                        t.tool_calls.iter().map(|tc| tc.result.as_ref()),
+                    ),
                     narrative: t.narrative.clone(),
                 })
                 .collect();

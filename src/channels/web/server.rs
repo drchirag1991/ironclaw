@@ -59,7 +59,9 @@ use crate::channels::web::handlers::skills::{
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
-use crate::channels::web::util::{build_turns_from_db_messages, truncate_preview};
+use crate::channels::web::util::{
+    build_turns_from_db_messages, collect_generated_images_from_tool_results, tool_result_preview,
+};
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -1890,17 +1892,14 @@ async fn chat_history_handler(
                         name: tc.name.clone(),
                         has_result: tc.result.is_some(),
                         has_error: tc.error.is_some(),
-                        result_preview: tc.result.as_ref().map(|r| {
-                            let s = match r {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            truncate_preview(&s, 500)
-                        }),
+                        result_preview: tool_result_preview(tc.result.as_ref()),
                         error: tc.error.clone(),
                         rationale: tc.rationale.clone(),
                     })
                     .collect(),
+                generated_images: collect_generated_images_from_tool_results(
+                    t.tool_calls.iter().map(|tc| tc.result.as_ref()),
+                ),
                 narrative: t.narrative.clone(),
             })
             .collect();

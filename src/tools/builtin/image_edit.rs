@@ -44,6 +44,15 @@ impl ImageEditTool {
         }
     }
 
+    fn endpoint_url(&self, path: &str) -> String {
+        let base = self.api_base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{base}{path}")
+        } else {
+            format!("{base}/v1{path}")
+        }
+    }
+
     /// Read binary image bytes from filesystem.
     ///
     /// Validates the path against the base directory sandbox to prevent
@@ -127,10 +136,7 @@ impl Tool for ImageEditTool {
         let media_type = super::media_type_from_path(image_path);
 
         // Use multipart form for image edit API
-        let url = format!(
-            "{}/v1/images/edits",
-            self.api_base_url.trim_end_matches('/')
-        );
+        let url = self.endpoint_url("/images/edits");
 
         let form = reqwest::multipart::Form::new()
             .text("model", self.model.clone())
@@ -181,11 +187,12 @@ impl Tool for ImageEditTool {
             .ok_or_else(|| {
                 ToolError::ExecutionFailed("No image data in edit response".to_string())
             })?;
+        let generated_media_type = super::image_gen::infer_generated_image_media_type(edited_data);
 
         let sentinel = serde_json::json!({
             "type": "image_generated",
-            "data": format!("data:image/png;base64,{}", edited_data),
-            "media_type": "image/png",
+            "data": format!("data:{generated_media_type};base64,{}", edited_data),
+            "media_type": generated_media_type,
             "prompt": prompt,
             "source_path": image_path
         });
@@ -204,10 +211,7 @@ impl ImageEditTool {
         prompt: &str,
         start: std::time::Instant,
     ) -> Result<ToolOutput, ToolError> {
-        let url = format!(
-            "{}/v1/images/generations",
-            self.api_base_url.trim_end_matches('/')
-        );
+        let url = self.endpoint_url("/images/generations");
 
         let request_body = serde_json::json!({
             "model": &self.model,
@@ -246,11 +250,12 @@ impl ImageEditTool {
             .ok_or_else(|| {
                 ToolError::ExecutionFailed("No image data in fallback response".to_string())
             })?;
+        let generated_media_type = super::image_gen::infer_generated_image_media_type(image_data);
 
         let sentinel = serde_json::json!({
             "type": "image_generated",
-            "data": format!("data:image/png;base64,{}", image_data),
-            "media_type": "image/png",
+            "data": format!("data:{generated_media_type};base64,{}", image_data),
+            "media_type": generated_media_type,
             "prompt": prompt,
             "note": "Generated new image (edit endpoint unavailable — source image was NOT used)"
         });
@@ -314,6 +319,34 @@ mod tests {
             result.is_err(),
             "Should reject absolute path outside sandbox, got: {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn endpoint_url_does_not_duplicate_v1() {
+        let tool = ImageEditTool::new(
+            "https://api.example.com/v1".to_string(),
+            "test-key".to_string(),
+            "flux-1".to_string(),
+            None,
+        );
+        assert_eq!(
+            tool.endpoint_url("/images/edits"),
+            "https://api.example.com/v1/images/edits"
+        );
+    }
+
+    #[test]
+    fn endpoint_url_adds_v1_when_missing() {
+        let tool = ImageEditTool::new(
+            "https://api.example.com".to_string(),
+            "test-key".to_string(),
+            "flux-1".to_string(),
+            None,
+        );
+        assert_eq!(
+            tool.endpoint_url("/images/generations"),
+            "https://api.example.com/v1/images/generations"
         );
     }
 }
