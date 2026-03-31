@@ -1,8 +1,11 @@
 //! Tier 1 executor: embedded Python via Monty.
 //!
 //! Executes LLM-generated Python code using the Monty interpreter. Tool
-//! calls happen as regular function calls in the code — Monty suspends at
-//! each unknown function, and we delegate to the `EffectExecutor`.
+//! calls use **async dispatch**: each tool call returns a Monty `ExternalFuture`
+//! via `resume_pending()`, allowing Python code to use `await` and
+//! `asyncio.gather()` for parallel execution. When all tasks are blocked,
+//! Monty yields `ResolveFutures` and we execute pending tools concurrently
+//! via `JoinSet`.
 //!
 //! Follows the RLM (Recursive Language Model) pattern:
 //! - Thread context injected as Python variables (not LLM attention input)
@@ -11,7 +14,9 @@
 //! - Step 0 orientation preamble for context awareness
 //! - Errors flow back to LLM for self-correction (not step termination)
 //! - Output truncated to configurable limit with variable listing
+//! - `asyncio.gather()` for parallel tool execution (via ResolveFutures)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -357,6 +362,11 @@ pub async fn execute_code_with_skills(
         }
     };
 
+    // Pending async tool executions keyed by Monty call_id.
+    // When a tool FunctionCall comes in, we spawn a tokio task and store
+    // the JoinHandle here. When ResolveFutures yields, we await them.
+    let mut pending_tools: HashMap<u32, PendingTool> = HashMap::new();
+
     // Drive the execution loop
     let mut call_counter = 0u32;
     loop {
@@ -376,54 +386,43 @@ pub async fn execute_code_with_skills(
 
             RunProgress::FunctionCall(call) => {
                 call_counter += 1;
-                let call_id = format!("code_call_{call_counter}");
+                let str_call_id = format!("code_call_{call_counter}");
+                let monty_call_id = call.call_id;
                 let action_name = call.function_name.clone();
                 let params = monty_args_to_json(&call.args, &call.kwargs);
 
-                debug!(action = %action_name, call_id = %call_id, "Monty: function call");
+                debug!(action = %action_name, call_id = %str_call_id, monty_id = monty_call_id, "Monty: function call");
 
-                let ext_result = match action_name.as_str() {
-                    // FINAL(answer) — explicit termination
+                // Builtins that need synchronous results — resume with value.
+                let sync_result = match action_name.as_str() {
                     "FINAL" => {
                         let answer = call.args.first().map(monty_to_string).unwrap_or_default();
                         final_answer = Some(answer);
-                        ExtFunctionResult::Return(MontyObject::None)
+                        Some(ExtFunctionResult::Return(MontyObject::None))
                     }
-
-                    // FINAL_VAR(name) — terminate with variable value
-                    // (the variable's value is whatever the code stored in it;
-                    // we return None and the complete handler reads final_answer)
                     "FINAL_VAR" => {
                         let var_name = call
                             .args
                             .first()
                             .map(monty_to_string)
                             .unwrap_or_else(|| "result".into());
-                        // We can't access the REPL's namespace directly from here,
-                        // so we store the variable name and let the caller handle it.
-                        // For now, FINAL_VAR works the same as FINAL with the var name.
                         final_answer = Some(format!("[FINAL_VAR: {var_name}]"));
-                        ExtFunctionResult::Return(MontyObject::None)
+                        Some(ExtFunctionResult::Return(MontyObject::None))
                     }
-
-                    // llm_query(prompt, context) — recursive sub-call
-                    "llm_query" => {
-                        handle_llm_query(&call.args, &call.kwargs, llm, &mut recursive_tokens).await
-                    }
-
-                    // llm_query_batched(prompts) — parallel sub-calls
-                    "llm_query_batched" => {
+                    "llm_query" => Some(
+                        handle_llm_query(&call.args, &call.kwargs, llm, &mut recursive_tokens)
+                            .await,
+                    ),
+                    "llm_query_batched" => Some(
                         handle_llm_query_batched(
                             &call.args,
                             &call.kwargs,
                             llm,
                             &mut recursive_tokens,
                         )
-                        .await
-                    }
-
-                    // rlm_query(prompt) — full recursive sub-agent with own CodeAct loop
-                    "rlm_query" => {
+                        .await,
+                    ),
+                    "rlm_query" => Some(
                         handle_rlm_query(
                             &call.args,
                             &call.kwargs,
@@ -434,11 +433,8 @@ pub async fn execute_code_with_skills(
                             policy,
                             &mut recursive_tokens,
                         )
-                        .await
-                    }
-
-                    // globals() / locals() — return dict with known names so
-                    // `"tool_name" in globals()` works for capability probing
+                        .await,
+                    ),
                     "globals" | "locals" => {
                         let entries: Vec<(MontyObject, MontyObject)> = known_actions
                             .iter()
@@ -446,81 +442,263 @@ pub async fn execute_code_with_skills(
                                 (MontyObject::String(name.clone()), MontyObject::Bool(true))
                             })
                             .collect();
-                        ExtFunctionResult::Return(MontyObject::Dict(entries.into()))
+                        Some(ExtFunctionResult::Return(MontyObject::Dict(entries.into())))
                     }
+                    _ => None, // tool call — handled async below
+                };
 
-                    // Regular tool dispatch
-                    _ => {
-                        let dispatch = dispatch_action(
-                            &action_name,
-                            &call_id,
-                            params.clone(),
-                            thread,
-                            effects,
-                            leases,
-                            policy,
-                            context,
-                            capability_policies,
-                            &mut action_results,
-                            &mut events,
-                        )
-                        .await;
+                if let Some(ext_result) = sync_result {
+                    // Sync resume for builtins
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        call.resume(ext_result, PrintWriter::Collect(&mut stdout))
+                    })) {
+                        Ok(Ok(p)) => progress = p,
+                        Ok(Err(e)) => {
+                            stdout.push_str(&format!("\nError: {e}"));
+                            had_error = true;
+                            return Ok(CodeExecutionResult {
+                                return_value: serde_json::Value::Null,
+                                stdout,
+                                action_results,
+                                events,
+                                need_approval: None,
+                                recursive_tokens,
+                                final_answer,
+                                had_error,
+                            });
+                        }
+                        Err(_) => {
+                            return Err(EngineError::Effect {
+                                reason: "Monty VM panicked during resume".into(),
+                            });
+                        }
+                    }
+                    continue;
+                }
 
-                        match dispatch {
-                            DispatchResult::Ok(r) => r,
-                            DispatchResult::NeedApproval => {
+                // ── Async tool dispatch ─────────────────────────────
+                // Preflight (lease + policy) is sync. If denied or
+                // needs approval, resume with error immediately.
+                // If approved, spawn tokio task and resume_pending().
+
+                let preflight = preflight_action(
+                    &action_name,
+                    &params,
+                    thread,
+                    effects,
+                    leases,
+                    policy,
+                    context,
+                    capability_policies,
+                    &str_call_id,
+                    &mut events,
+                )
+                .await;
+
+                match preflight {
+                    PreflightResult::Approved(lease) => {
+                        // Spawn async execution
+                        let effects = effects.clone();
+                        let name = action_name.clone();
+                        let params_clone = params.clone();
+                        let lease_clone = lease.clone();
+                        let ctx = context.clone();
+                        let ps = crate::types::event::summarize_params(&name, &params);
+
+                        let handle = tokio::spawn(async move {
+                            effects
+                                .execute_action(&name, params_clone, &lease_clone, &ctx)
+                                .await
+                        });
+
+                        pending_tools.insert(
+                            monty_call_id,
+                            PendingTool {
+                                handle,
+                                action_name,
+                                call_id: str_call_id,
+                                params,
+                                params_summary: ps,
+                            },
+                        );
+
+                        // Resume with pending future — Python gets ExternalFuture
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            call.resume_pending(PrintWriter::Collect(&mut stdout))
+                        })) {
+                            Ok(Ok(p)) => progress = p,
+                            Ok(Err(e)) => {
+                                stdout.push_str(&format!("\nError: {e}"));
+                                had_error = true;
                                 return Ok(CodeExecutionResult {
                                     return_value: serde_json::Value::Null,
                                     stdout,
                                     action_results,
                                     events,
-                                    need_approval: Some(
-                                        crate::runtime::messaging::ThreadOutcome::NeedApproval {
-                                            action_name,
-                                            call_id,
-                                            parameters: params,
-                                        },
-                                    ),
+                                    need_approval: None,
                                     recursive_tokens,
-                                    final_answer: None,
+                                    final_answer,
                                     had_error,
                                 });
                             }
-                            DispatchResult::NeedAuthentication {
-                                credential_name,
-                                action_name,
-                                call_id,
-                                parameters,
-                            } => {
-                                return Ok(CodeExecutionResult {
-                                    return_value: serde_json::Value::Null,
-                                    stdout,
-                                    action_results,
-                                    events,
-                                    need_approval: Some(
-                                        crate::runtime::messaging::ThreadOutcome::NeedAuthentication {
-                                            credential_name,
-                                            action_name,
-                                            call_id,
-                                            parameters,
-                                        },
-                                    ),
-                                    recursive_tokens,
-                                    final_answer: None,
-                                    had_error,
+                            Err(_) => {
+                                return Err(EngineError::Effect {
+                                    reason: "Monty VM panicked during resume_pending".into(),
                                 });
                             }
                         }
                     }
-                };
+                    PreflightResult::Denied(ext_result) => {
+                        // Resume with error — Python sees an exception
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            call.resume(ext_result, PrintWriter::Collect(&mut stdout))
+                        })) {
+                            Ok(Ok(p)) => progress = p,
+                            Ok(Err(e)) => {
+                                stdout.push_str(&format!("\nError: {e}"));
+                                had_error = true;
+                                return Ok(CodeExecutionResult {
+                                    return_value: serde_json::Value::Null,
+                                    stdout,
+                                    action_results,
+                                    events,
+                                    need_approval: None,
+                                    recursive_tokens,
+                                    final_answer,
+                                    had_error,
+                                });
+                            }
+                            Err(_) => {
+                                return Err(EngineError::Effect {
+                                    reason: "Monty VM panicked during resume".into(),
+                                });
+                            }
+                        }
+                    }
+                    PreflightResult::NeedApproval(outcome) => {
+                        return Ok(CodeExecutionResult {
+                            return_value: serde_json::Value::Null,
+                            stdout,
+                            action_results,
+                            events,
+                            need_approval: Some(outcome),
+                            recursive_tokens,
+                            final_answer: None,
+                            had_error,
+                        });
+                    }
+                }
+            }
 
-                // Resume Monty (with error recovery — don't terminate on Monty errors)
+            // ── ResolveFutures: parallel tool execution ─────────
+            RunProgress::ResolveFutures(resolve) => {
+                let pending_ids = resolve.pending_call_ids().to_vec();
+                debug!(pending = ?pending_ids, "Monty: ResolveFutures — resolving pending tools");
+
+                let mut results: Vec<(u32, ExtFunctionResult)> = Vec::with_capacity(pending_ids.len());
+
+                for &mid in &pending_ids {
+                    if let Some(pt) = pending_tools.remove(&mid) {
+                        let exec_result = match pt.handle.await {
+                            Ok(Ok(result)) => {
+                                events.push(EventKind::ActionExecuted {
+                                    step_id: context.step_id,
+                                    action_name: pt.action_name.clone(),
+                                    call_id: pt.call_id.clone(),
+                                    duration_ms: result.duration.as_millis() as u64,
+                                    params_summary: pt.params_summary,
+                                });
+                                let monty_val = json_to_monty(&result.output);
+                                action_results.push(result);
+                                ExtFunctionResult::Return(monty_val)
+                            }
+                            Ok(Err(EngineError::NeedAuthentication {
+                                credential_name,
+                                action_name,
+                                call_id,
+                                parameters: _,
+                            })) => {
+                                events.push(EventKind::ActionFailed {
+                                    step_id: context.step_id,
+                                    action_name: action_name.clone(),
+                                    call_id: call_id.clone(),
+                                    error: format!(
+                                        "authentication required for credential '{credential_name}'"
+                                    ),
+                                    params_summary: pt.params_summary,
+                                });
+                                // Store the interrupt — we'll return it after resolving
+                                // all futures (so other parallel tasks get recorded too).
+                                // For now, return an error to the Python side.
+                                ExtFunctionResult::Error(MontyException::new(
+                                    ExcType::RuntimeError,
+                                    Some(format!(
+                                        "authentication required for credential '{credential_name}'"
+                                    )),
+                                ))
+                            }
+                            Ok(Err(EngineError::NeedApproval {
+                                action_name,
+                                call_id,
+                                ..
+                            })) => {
+                                events.push(EventKind::ApprovalRequested {
+                                    action_name,
+                                    call_id,
+                                });
+                                ExtFunctionResult::Error(MontyException::new(
+                                    ExcType::RuntimeError,
+                                    Some("action requires approval".into()),
+                                ))
+                            }
+                            Ok(Err(e)) => {
+                                events.push(EventKind::ActionFailed {
+                                    step_id: context.step_id,
+                                    action_name: pt.action_name.clone(),
+                                    call_id: pt.call_id.clone(),
+                                    error: e.to_string(),
+                                    params_summary: pt.params_summary,
+                                });
+                                action_results.push(ActionResult {
+                                    call_id: pt.call_id,
+                                    action_name: pt.action_name,
+                                    output: serde_json::json!({"error": e.to_string()}),
+                                    is_error: true,
+                                    duration: Duration::ZERO,
+                                });
+                                ExtFunctionResult::Error(MontyException::new(
+                                    ExcType::RuntimeError,
+                                    Some(e.to_string()),
+                                ))
+                            }
+                            Err(e) => {
+                                // tokio task panicked
+                                warn!("async tool task panicked: {e}");
+                                ExtFunctionResult::Error(MontyException::new(
+                                    ExcType::RuntimeError,
+                                    Some(format!("tool execution panicked: {e}")),
+                                ))
+                            }
+                        };
+                        results.push((mid, exec_result));
+                    } else {
+                        // Unknown call_id — shouldn't happen, but be safe
+                        warn!(call_id = mid, "ResolveFutures: unknown pending call_id");
+                        results.push((
+                            mid,
+                            ExtFunctionResult::Error(MontyException::new(
+                                ExcType::RuntimeError,
+                                Some(format!("unknown pending call_id {mid}")),
+                            )),
+                        ));
+                    }
+                }
+
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    call.resume(ext_result, PrintWriter::Collect(&mut stdout))
+                    resolve.resume(results, PrintWriter::Collect(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
-                        // Runtime error after resume → include in output, mark as error
                         stdout.push_str(&format!("\nError: {e}"));
                         had_error = true;
                         return Ok(CodeExecutionResult {
@@ -536,7 +714,7 @@ pub async fn execute_code_with_skills(
                     }
                     Err(_) => {
                         return Err(EngineError::Effect {
-                            reason: "Monty VM panicked during resume".into(),
+                            reason: "Monty VM panicked during ResolveFutures resume".into(),
                         });
                     }
                 }
@@ -545,9 +723,6 @@ pub async fn execute_code_with_skills(
             RunProgress::NameLookup(lookup) => {
                 let name = lookup.name.clone();
 
-                // If the name matches a known tool, return a callable Function
-                // stub so Monty yields FunctionCall (dispatched to the effect
-                // executor) instead of raising NameError.
                 let result = if known_actions.contains(&name) {
                     debug!(name = %name, "Monty: resolved as tool function");
                     NameLookupResult::Value(MontyObject::Function {
@@ -555,8 +730,6 @@ pub async fn execute_code_with_skills(
                         docstring: None,
                     })
                 } else if name == "globals" || name == "locals" {
-                    // Python builtins for namespace introspection — resolve as
-                    // callable so code like `"tool" in globals()` works.
                     NameLookupResult::Value(MontyObject::Function {
                         name: name.clone(),
                         docstring: None,
@@ -623,24 +796,110 @@ pub async fn execute_code_with_skills(
                     }
                 }
             }
-
-            RunProgress::ResolveFutures(_) => {
-                // Async not supported — return error to LLM
-                stdout.push_str("\nError: async/await is not supported in CodeAct scripts");
-                had_error = true;
-                return Ok(CodeExecutionResult {
-                    return_value: serde_json::Value::Null,
-                    stdout,
-                    action_results,
-                    events,
-                    need_approval: None,
-                    recursive_tokens,
-                    final_answer,
-                    had_error,
-                });
-            }
         }
     }
+}
+
+// ── Pending tool tracking ──────────────────────────────────
+
+/// A tool execution that has been spawned as a tokio task and is pending
+/// resolution via `ResolveFutures`.
+struct PendingTool {
+    handle: tokio::task::JoinHandle<Result<ActionResult, EngineError>>,
+    action_name: String,
+    call_id: String,
+    #[allow(dead_code)]
+    params: serde_json::Value,
+    params_summary: Option<String>,
+}
+
+/// Result of preflight checks (lease + policy) for a tool call.
+enum PreflightResult {
+    /// Tool approved — lease is consumed, ready to execute.
+    Approved(crate::types::capability::CapabilityLease),
+    /// Tool denied — return this error to Monty.
+    Denied(ExtFunctionResult),
+    /// Tool needs approval — interrupt the batch.
+    NeedApproval(crate::runtime::messaging::ThreadOutcome),
+}
+
+/// Run preflight checks for a tool call: find lease, check policy, consume use.
+#[allow(clippy::too_many_arguments)]
+async fn preflight_action(
+    action_name: &str,
+    params: &serde_json::Value,
+    thread: &Thread,
+    effects: &Arc<dyn EffectExecutor>,
+    leases: &LeaseManager,
+    policy: &PolicyEngine,
+    context: &ThreadExecutionContext,
+    capability_policies: &[crate::types::capability::PolicyRule],
+    call_id: &str,
+    events: &mut Vec<EventKind>,
+) -> PreflightResult {
+    let lease = match leases.find_lease_for_action(thread.id, action_name).await {
+        Some(l) => l,
+        None => {
+            events.push(EventKind::ActionFailed {
+                step_id: context.step_id,
+                action_name: action_name.into(),
+                call_id: call_id.into(),
+                error: format!("no lease for action '{action_name}'"),
+                params_summary: None,
+            });
+            return PreflightResult::Denied(ExtFunctionResult::Error(MontyException::new(
+                ExcType::RuntimeError,
+                Some(format!("no lease for action '{action_name}'")),
+            )));
+        }
+    };
+
+    let action_def = effects
+        .available_actions(std::slice::from_ref(&lease))
+        .await
+        .ok()
+        .and_then(|actions| actions.into_iter().find(|a| a.name == action_name));
+
+    if let Some(ref action_def) = action_def {
+        match policy.evaluate(action_def, &lease, capability_policies) {
+            PolicyDecision::Deny { reason } => {
+                events.push(EventKind::ActionFailed {
+                    step_id: context.step_id,
+                    action_name: action_name.into(),
+                    call_id: call_id.into(),
+                    error: reason.clone(),
+                    params_summary: None,
+                });
+                return PreflightResult::Denied(ExtFunctionResult::Error(MontyException::new(
+                    ExcType::RuntimeError,
+                    Some(format!("denied: {reason}")),
+                )));
+            }
+            PolicyDecision::RequireApproval { .. } => {
+                events.push(EventKind::ApprovalRequested {
+                    action_name: action_name.into(),
+                    call_id: call_id.into(),
+                });
+                return PreflightResult::NeedApproval(
+                    crate::runtime::messaging::ThreadOutcome::NeedApproval {
+                        action_name: action_name.into(),
+                        call_id: call_id.into(),
+                        parameters: params.clone(),
+                    },
+                );
+            }
+            PolicyDecision::Allow => {}
+        }
+    }
+
+    if let Err(e) = leases.consume_use(lease.id).await {
+        return PreflightResult::Denied(ExtFunctionResult::Error(MontyException::new(
+            ExcType::RuntimeError,
+            Some(format!("lease exhausted: {e}")),
+        )));
+    }
+
+    PreflightResult::Approved(lease)
 }
 
 // ── llm_query() — recursive subagent (RLM 3.5) ─────────────
@@ -982,152 +1241,6 @@ pub(crate) fn monty_to_string(obj: &MontyObject) -> String {
         MontyObject::Float(f) => f.to_string(),
         other => {
             serde_json::to_string(&monty_to_json(other)).unwrap_or_else(|_| format!("{other:?}"))
-        }
-    }
-}
-
-// ── Dispatch ────────────────────────────────────────────────
-
-enum DispatchResult {
-    Ok(ExtFunctionResult),
-    NeedApproval,
-    NeedAuthentication {
-        credential_name: String,
-        action_name: String,
-        call_id: String,
-        parameters: serde_json::Value,
-    },
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_action(
-    action_name: &str,
-    call_id: &str,
-    params: serde_json::Value,
-    thread: &Thread,
-    effects: &Arc<dyn EffectExecutor>,
-    leases: &LeaseManager,
-    policy: &PolicyEngine,
-    context: &ThreadExecutionContext,
-    capability_policies: &[crate::types::capability::PolicyRule],
-    action_results: &mut Vec<ActionResult>,
-    events: &mut Vec<EventKind>,
-) -> DispatchResult {
-    let lease = match leases.find_lease_for_action(thread.id, action_name).await {
-        Some(l) => l,
-        None => {
-            events.push(EventKind::ActionFailed {
-                step_id: context.step_id,
-                action_name: action_name.into(),
-                call_id: call_id.into(),
-                error: format!("no lease for action '{action_name}'"),
-                params_summary: None,
-            });
-            return DispatchResult::Ok(ExtFunctionResult::NotFound(action_name.into()));
-        }
-    };
-
-    let action_def = effects
-        .available_actions(std::slice::from_ref(&lease))
-        .await
-        .ok()
-        .and_then(|actions| actions.into_iter().find(|a| a.name == action_name));
-
-    if let Some(ref action_def) = action_def {
-        match policy.evaluate(action_def, &lease, capability_policies) {
-            PolicyDecision::Deny { reason } => {
-                events.push(EventKind::ActionFailed {
-                    step_id: context.step_id,
-                    action_name: action_name.into(),
-                    call_id: call_id.into(),
-                    error: reason.clone(),
-                    params_summary: None,
-                });
-                return DispatchResult::Ok(ExtFunctionResult::Error(MontyException::new(
-                    ExcType::RuntimeError,
-                    Some(format!("denied: {reason}")),
-                )));
-            }
-            PolicyDecision::RequireApproval { .. } => {
-                events.push(EventKind::ApprovalRequested {
-                    action_name: action_name.into(),
-                    call_id: call_id.into(),
-                });
-                return DispatchResult::NeedApproval;
-            }
-            PolicyDecision::Allow => {}
-        }
-    }
-
-    if let Err(e) = leases.consume_use(lease.id).await {
-        return DispatchResult::Ok(ExtFunctionResult::Error(MontyException::new(
-            ExcType::RuntimeError,
-            Some(format!("lease exhausted: {e}")),
-        )));
-    }
-
-    let ps = crate::types::event::summarize_params(action_name, &params);
-    let params_for_auth = params.clone();
-
-    match effects
-        .execute_action(action_name, params, &lease, context)
-        .await
-    {
-        Ok(result) => {
-            events.push(EventKind::ActionExecuted {
-                step_id: context.step_id,
-                action_name: action_name.into(),
-                call_id: call_id.into(),
-                duration_ms: result.duration.as_millis() as u64,
-                params_summary: ps,
-            });
-            let monty_obj = json_to_monty(&result.output);
-            action_results.push(result);
-            DispatchResult::Ok(ExtFunctionResult::Return(monty_obj))
-        }
-        Err(EngineError::NeedApproval { .. }) => {
-            events.push(EventKind::ApprovalRequested {
-                action_name: action_name.into(),
-                call_id: call_id.into(),
-            });
-            DispatchResult::NeedApproval
-        }
-        Err(EngineError::NeedAuthentication {
-            credential_name, ..
-        }) => {
-            events.push(EventKind::ActionFailed {
-                step_id: context.step_id,
-                action_name: action_name.into(),
-                call_id: call_id.into(),
-                error: format!("authentication required for credential '{credential_name}'"),
-                params_summary: ps,
-            });
-            DispatchResult::NeedAuthentication {
-                credential_name,
-                action_name: action_name.into(),
-                call_id: call_id.into(),
-                parameters: params_for_auth,
-            }
-        }
-        Err(e) => {
-            action_results.push(ActionResult {
-                call_id: call_id.into(),
-                action_name: action_name.into(),
-                output: serde_json::json!({"error": e.to_string()}),
-                is_error: true,
-                duration: Duration::ZERO,
-            });
-            events.push(EventKind::ActionFailed {
-                step_id: context.step_id,
-                action_name: action_name.into(),
-                call_id: call_id.into(),
-                error: e.to_string(),
-                params_summary: ps,
-            });
-            DispatchResult::Ok(ExtFunctionResult::Error(MontyException::new(
-                ExcType::RuntimeError,
-                Some(e.to_string()),
-            )))
         }
     }
 }
