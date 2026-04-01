@@ -1,0 +1,382 @@
+//! ChannelPairingStore implementation for LibSqlBackend.
+
+use async_trait::async_trait;
+use libsql::params;
+
+use super::{LibSqlBackend, fmt_ts, get_ts};
+use crate::db::{ChannelPairingStore, DatabaseError, PairingRequestRecord};
+use crate::ownership::{Identity, OwnerId, UserRole};
+
+#[async_trait]
+impl ChannelPairingStore for LibSqlBackend {
+    async fn resolve_channel_identity(
+        &self,
+        channel: &str,
+        external_id: &str,
+    ) -> Result<Option<Identity>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT ci.owner_id, u.role
+                 FROM channel_identities ci
+                 JOIN users u ON u.id = ci.owner_id
+                 WHERE ci.channel = ?1 AND ci.external_id = ?2
+                   AND u.status = 'active'
+                 LIMIT 1",
+                params![channel, external_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        match rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            Some(row) => {
+                let owner_id: String =
+                    row.get(0).map_err(|e| DatabaseError::Query(e.to_string()))?;
+                let role_str: String =
+                    row.get(1).map_err(|e| DatabaseError::Query(e.to_string()))?;
+                let role = if role_str == "admin" {
+                    UserRole::Admin
+                } else {
+                    UserRole::Member
+                };
+                Ok(Some(Identity::new(OwnerId::from(owner_id), role)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn upsert_pairing_request(
+        &self,
+        channel: &str,
+        external_id: &str,
+        _meta: Option<serde_json::Value>,
+    ) -> Result<PairingRequestRecord, DatabaseError> {
+        let conn = self.connect().await?;
+
+        // Return existing valid pending request
+        let mut rows = conn
+            .query(
+                "SELECT id, channel, external_id, code, created_at, expires_at
+                 FROM pairing_requests
+                 WHERE channel = ?1 AND external_id = ?2
+                   AND approved_at IS NULL
+                   AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 ORDER BY created_at DESC LIMIT 1",
+                params![channel, external_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let id_str: String = row.get(0).map_err(|e| DatabaseError::Query(e.to_string()))?;
+            return Ok(PairingRequestRecord {
+                id: uuid::Uuid::parse_str(&id_str)
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?,
+                channel: row.get(1).map_err(|e| DatabaseError::Query(e.to_string()))?,
+                external_id: row.get(2).map_err(|e| DatabaseError::Query(e.to_string()))?,
+                code: row.get(3).map_err(|e| DatabaseError::Query(e.to_string()))?,
+                created_at: get_ts(&row, 4),
+                expires_at: get_ts(&row, 5),
+            });
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let code = crate::db::generate_pairing_code();
+        let now = chrono::Utc::now();
+        let expires_at = now + chrono::Duration::minutes(15);
+        let now_str = fmt_ts(&now);
+        let expires_str = fmt_ts(&expires_at);
+
+        conn.execute(
+            "INSERT INTO pairing_requests (id, channel, external_id, code, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id.as_str(),
+                channel,
+                external_id,
+                code.as_str(),
+                now_str.as_str(),
+                expires_str.as_str()
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(PairingRequestRecord {
+            id: uuid::Uuid::parse_str(&id).map_err(|e| DatabaseError::Query(e.to_string()))?,
+            channel: channel.to_string(),
+            external_id: external_id.to_string(),
+            code,
+            created_at: now,
+            expires_at,
+        })
+    }
+
+    async fn approve_pairing(&self, code: &str, owner_id: &str) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+
+        let mut rows = conn
+            .query(
+                "SELECT id, channel, external_id FROM pairing_requests
+                 WHERE UPPER(code) = UPPER(?1)
+                   AND approved_at IS NULL
+                   AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 LIMIT 1",
+                params![code],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let row = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+            .ok_or_else(|| DatabaseError::NotFound {
+                entity: "pairing_request".to_string(),
+                id: code.to_string(),
+            })?;
+
+        let req_id: String = row.get(0).map_err(|e| DatabaseError::Query(e.to_string()))?;
+        let channel: String = row.get(1).map_err(|e| DatabaseError::Query(e.to_string()))?;
+        let external_id: String = row.get(2).map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let now_str = fmt_ts(&chrono::Utc::now());
+
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        conn.execute(
+            "UPDATE pairing_requests SET owner_id = ?1, approved_at = ?2 WHERE id = ?3",
+            params![owner_id, now_str.as_str(), req_id.as_str()],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let identity_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO channel_identities (id, owner_id, channel, external_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (channel, external_id) DO UPDATE SET owner_id = ?2",
+            params![
+                identity_id.as_str(),
+                owner_id,
+                channel.as_str(),
+                external_id.as_str()
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        conn.execute("COMMIT", ())
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_pending_pairings(
+        &self,
+        channel: &str,
+    ) -> Result<Vec<PairingRequestRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT id, channel, external_id, code, created_at, expires_at
+                 FROM pairing_requests
+                 WHERE channel = ?1 AND approved_at IS NULL
+                   AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 ORDER BY created_at ASC",
+                params![channel],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut result = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let id_str: String = row.get(0).map_err(|e| DatabaseError::Query(e.to_string()))?;
+            result.push(PairingRequestRecord {
+                id: uuid::Uuid::parse_str(&id_str)
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?,
+                channel: row.get(1).map_err(|e| DatabaseError::Query(e.to_string()))?,
+                external_id: row.get(2).map_err(|e| DatabaseError::Query(e.to_string()))?,
+                code: row.get(3).map_err(|e| DatabaseError::Query(e.to_string()))?,
+                created_at: get_ts(&row, 4),
+                expires_at: get_ts(&row, 5),
+            });
+        }
+        Ok(result)
+    }
+
+    async fn remove_channel_identity(
+        &self,
+        channel: &str,
+        external_id: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "DELETE FROM channel_identities WHERE channel = ?1 AND external_id = ?2",
+            params![channel, external_id],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::libsql::LibSqlBackend;
+    use crate::db::{ChannelPairingStore, Database, UserRecord, UserStore};
+
+    /// Create a file-backed in-memory-like DB.
+    ///
+    /// `new_memory()` uses an in-memory SQLite connection which does NOT share
+    /// schema across separate `connect()` calls in libsql. We use a temp file so
+    /// all connections within the same test share the migrated schema.
+    async fn setup_db() -> (LibSqlBackend, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pairing_test.db");
+        let db = LibSqlBackend::new_local(&db_path).await.unwrap();
+        db.run_migrations().await.unwrap();
+        (db, dir)
+    }
+
+    async fn setup_db_with_user(user_id: &str) -> (LibSqlBackend, tempfile::TempDir) {
+        let (db, dir) = setup_db().await;
+        db.get_or_create_user(UserRecord {
+            id: user_id.to_string(),
+            role: "member".to_string(),
+            display_name: user_id.to_string(),
+            status: "active".to_string(),
+            email: None,
+            last_login_at: None,
+            created_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            metadata: serde_json::Value::Null,
+        })
+        .await
+        .unwrap();
+        (db, dir)
+    }
+
+    #[tokio::test]
+    async fn test_resolve_identity_unknown_sender() {
+        let (db, _dir) = setup_db().await;
+        let result = db
+            .resolve_channel_identity("telegram", "unknown123")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_upsert_and_approve_pairing() {
+        let (db, _dir) = setup_db_with_user("alice").await;
+
+        let req = db
+            .upsert_pairing_request("telegram", "tg-alice-123", None)
+            .await
+            .unwrap();
+        assert_eq!(req.channel, "telegram");
+        assert_eq!(req.external_id, "tg-alice-123");
+        assert_eq!(req.code.len(), 8);
+
+        // Before approval: still unknown
+        assert!(db
+            .resolve_channel_identity("telegram", "tg-alice-123")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Approve
+        db.approve_pairing(&req.code, "alice").await.unwrap();
+
+        // After approval: resolves to alice
+        let identity = db
+            .resolve_channel_identity("telegram", "tg-alice-123")
+            .await
+            .unwrap();
+        assert!(identity.is_some());
+        assert_eq!(identity.unwrap().owner_id.as_str(), "alice");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_returns_existing_pending_request() {
+        let (db, _dir) = setup_db().await;
+
+        let r1 = db
+            .upsert_pairing_request("telegram", "user123", None)
+            .await
+            .unwrap();
+        let r2 = db
+            .upsert_pairing_request("telegram", "user123", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            r1.code, r2.code,
+            "Should return existing request, not create new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_approve_invalid_code_returns_error() {
+        let (db, _dir) = setup_db().await;
+        let err = db.approve_pairing("BADCODE1", "alice").await;
+        assert!(err.is_err(), "Invalid code should return error");
+    }
+
+    #[tokio::test]
+    async fn test_remove_channel_identity() {
+        let (db, _dir) = setup_db_with_user("alice").await;
+        let req = db
+            .upsert_pairing_request("telegram", "tg-remove-test", None)
+            .await
+            .unwrap();
+        db.approve_pairing(&req.code, "alice").await.unwrap();
+        assert!(db
+            .resolve_channel_identity("telegram", "tg-remove-test")
+            .await
+            .unwrap()
+            .is_some());
+
+        db.remove_channel_identity("telegram", "tg-remove-test")
+            .await
+            .unwrap();
+        assert!(db
+            .resolve_channel_identity("telegram", "tg-remove-test")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_pending_pairings() {
+        let (db, _dir) = setup_db().await;
+
+        let pending_before = db.list_pending_pairings("telegram").await.unwrap();
+        assert!(pending_before.is_empty());
+
+        db.upsert_pairing_request("telegram", "user_a", None)
+            .await
+            .unwrap();
+        db.upsert_pairing_request("telegram", "user_b", None)
+            .await
+            .unwrap();
+
+        let pending = db.list_pending_pairings("telegram").await.unwrap();
+        assert_eq!(pending.len(), 2);
+    }
+}

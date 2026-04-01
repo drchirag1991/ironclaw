@@ -925,6 +925,72 @@ pub struct UserSummaryStats {
     pub last_active_at: Option<DateTime<Utc>>,
 }
 
+/// A pending pairing request.
+#[derive(Debug, Clone)]
+pub struct PairingRequestRecord {
+    pub id: uuid::Uuid,
+    pub channel: String,
+    pub external_id: String,
+    pub code: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Pairing and channel identity operations.
+/// Named `ChannelPairingStore` to avoid collision with the application-level
+/// `PairingStore` struct in `src/pairing/store.rs`.
+#[async_trait]
+pub trait ChannelPairingStore: Send + Sync {
+    /// Returns the `Identity` for `(channel, external_id)` if the sender has been paired.
+    /// Joins `channel_identities` with `users` to get OwnerId + UserRole in one query.
+    async fn resolve_channel_identity(
+        &self,
+        channel: &str,
+        external_id: &str,
+    ) -> Result<Option<crate::ownership::Identity>, DatabaseError>;
+
+    /// Create or refresh a pending pairing request for `(channel, external_id)`.
+    /// Returns existing non-expired pending request if one exists; creates new one otherwise.
+    async fn upsert_pairing_request(
+        &self,
+        channel: &str,
+        external_id: &str,
+        meta: Option<serde_json::Value>,
+    ) -> Result<PairingRequestRecord, DatabaseError>;
+
+    /// Approve the pairing `code`, mapping `(channel, external_id)` → `owner_id`.
+    /// Sets owner_id on the pairing_requests row + creates channel_identities row — one transaction.
+    /// Returns `Err` if code is invalid, expired, or already approved.
+    async fn approve_pairing(
+        &self,
+        code: &str,
+        owner_id: &str,
+    ) -> Result<(), DatabaseError>;
+
+    /// List pending (unapproved, non-expired) pairing requests for a channel.
+    async fn list_pending_pairings(
+        &self,
+        channel: &str,
+    ) -> Result<Vec<PairingRequestRecord>, DatabaseError>;
+
+    /// Remove a channel identity (unlink a channel from a user).
+    async fn remove_channel_identity(
+        &self,
+        channel: &str,
+        external_id: &str,
+    ) -> Result<(), DatabaseError>;
+}
+
+/// Generates an 8-character pairing code from an unambiguous alphabet.
+pub fn generate_pairing_code() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::rngs::OsRng;
+    (0..8)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers
@@ -939,6 +1005,7 @@ pub trait Database:
     + SettingsStore
     + WorkspaceStore
     + UserStore
+    + ChannelPairingStore
     + Send
     + Sync
 {

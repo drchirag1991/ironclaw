@@ -8,6 +8,7 @@
 
 mod conversations;
 mod jobs;
+mod pairing;
 mod routines;
 mod sandbox;
 mod settings;
