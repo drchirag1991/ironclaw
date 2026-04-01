@@ -29,7 +29,7 @@ impl OwnershipCache {
         let key = (channel.to_string(), external_id.to_string());
         self.identities
             .read()
-            .expect("OwnershipCache read lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .get(&key)
             .cloned()
     }
@@ -39,7 +39,7 @@ impl OwnershipCache {
         let key = (channel.to_string(), external_id.to_string());
         self.identities
             .write()
-            .expect("OwnershipCache write lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .insert(key, identity);
     }
 
@@ -48,7 +48,7 @@ impl OwnershipCache {
         let key = (channel.to_string(), external_id.to_string());
         self.identities
             .write()
-            .expect("OwnershipCache write lock poisoned")
+            .unwrap_or_else(|p| p.into_inner())
             .remove(&key);
     }
 }
