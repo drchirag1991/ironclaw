@@ -104,6 +104,16 @@ impl PolicyEngine {
             );
         }
 
+        // Log denials for audit trail / incident investigation
+        if let PolicyDecision::Deny { ref reason } = decision {
+            tracing::debug!(
+                action = %action.name,
+                capability = %lease.capability_name,
+                reason,
+                "policy denied action"
+            );
+        }
+
         decision
     }
 
@@ -219,6 +229,7 @@ mod tests {
             max_uses: None,
             uses_remaining: None,
             revoked: false,
+            revoked_reason: None,
         }
     }
 

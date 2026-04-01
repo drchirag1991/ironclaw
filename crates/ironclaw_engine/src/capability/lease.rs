@@ -45,6 +45,7 @@ impl LeaseManager {
             max_uses,
             uses_remaining: max_uses,
             revoked: false,
+            revoked_reason: None,
         };
         self.active.write().await.insert(lease.id, lease.clone());
         lease
@@ -87,11 +88,18 @@ impl LeaseManager {
         Ok(())
     }
 
-    /// Revoke a lease by ID.
-    pub async fn revoke(&self, lease_id: LeaseId, _reason: &str) {
+    /// Revoke a lease by ID with a reason for audit trail.
+    pub async fn revoke(&self, lease_id: LeaseId, reason: &str) {
         let mut leases = self.active.write().await;
         if let Some(lease) = leases.get_mut(&lease_id) {
             lease.revoked = true;
+            lease.revoked_reason = Some(reason.to_string());
+            tracing::debug!(
+                lease_id = ?lease_id,
+                capability = %lease.capability_name,
+                reason,
+                "lease revoked"
+            );
         }
     }
 

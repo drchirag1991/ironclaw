@@ -133,6 +133,9 @@ pub struct CapabilityLease {
     pub uses_remaining: Option<u32>,
     /// Whether the lease has been explicitly revoked.
     pub revoked: bool,
+    /// Why the lease was revoked (for audit trail).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_reason: Option<String>,
 }
 
 impl CapabilityLease {
@@ -186,6 +189,7 @@ mod tests {
             max_uses: None,
             uses_remaining: None,
             revoked: false,
+            revoked_reason: None,
         }
     }
 

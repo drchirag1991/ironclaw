@@ -83,17 +83,17 @@ pub fn compact_output_metadata(stdout: &str, return_value: &serde_json::Value) -
     let mut parts = Vec::new();
 
     if !stdout.is_empty() {
-        if stdout.chars().count() > OUTPUT_TRUNCATE_LEN {
+        let char_count = stdout.chars().count();
+        if char_count > OUTPUT_TRUNCATE_LEN {
             let truncated: String = stdout
                 .chars()
-                .skip(stdout.chars().count() - OUTPUT_TRUNCATE_LEN)
+                .skip(char_count - OUTPUT_TRUNCATE_LEN)
                 .collect();
             parts.push(format!(
-                "[TRUNCATED: last {OUTPUT_TRUNCATE_LEN} of {} chars shown]\n{truncated}",
-                stdout.len()
+                "[TRUNCATED: last {OUTPUT_TRUNCATE_LEN} of {char_count} chars shown]\n{truncated}",
             ));
         } else {
-            parts.push(format!("[FULL OUTPUT: {} chars]\n{stdout}", stdout.len()));
+            parts.push(format!("[FULL OUTPUT: {char_count} chars]\n{stdout}"));
         }
     }
 
