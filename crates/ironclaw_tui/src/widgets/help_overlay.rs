@@ -69,9 +69,7 @@ impl TuiWidget for HelpOverlayWidget {
             .border_style(self.theme.accent_style())
             .title(Span::styled(
                 " Keyboard Shortcuts ",
-                self.theme
-                    .accent_style()
-                    .add_modifier(Modifier::BOLD),
+                self.theme.accent_style().add_modifier(Modifier::BOLD),
             ));
 
         let inner = block.inner(area);
@@ -92,9 +90,7 @@ impl TuiWidget for HelpOverlayWidget {
             lines.push(Line::from(vec![
                 Span::styled(
                     padded_key,
-                    self.theme
-                        .accent_style()
-                        .add_modifier(Modifier::BOLD),
+                    self.theme.accent_style().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(*desc, Style::default().fg(self.theme.fg.to_color())),
             ]));

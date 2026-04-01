@@ -657,10 +657,9 @@ impl Agent {
                     let daily_spend = self.cost_guard().daily_spend().await;
                     let budget_cents = self.cost_guard().budget_limit_cents();
                     let limit_reached = self.cost_guard().is_budget_exceeded();
-                    let daily_spend_f64 =
-                        daily_spend.to_string().parse::<f64>().unwrap_or(0.0);
-                    let session_budget_usd = budget_cents
-                        .map(|c| format!("${:.2}", c as f64 / 100.0));
+                    let daily_spend_f64 = daily_spend.to_string().parse::<f64>().unwrap_or(0.0);
+                    let session_budget_usd =
+                        budget_cents.map(|c| format!("${:.2}", c as f64 / 100.0));
                     let remaining_usd = budget_cents.map(|c| {
                         let remaining = (c as f64 / 100.0) - daily_spend_f64;
                         format!("${:.2}", remaining.max(0.0))

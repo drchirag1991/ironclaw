@@ -173,7 +173,7 @@ fn main() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("failed to build tokio runtime");
+            .expect("failed to build tokio runtime"); // safety: example binary, not library code
 
         rt.block_on(async move {
             // Simulate initial status events after a short delay
@@ -269,5 +269,5 @@ fn main() {
     });
 
     // Block main thread until TUI exits
-    handle.join_handle.join().expect("TUI thread panicked");
+    handle.join_handle.join().expect("TUI thread panicked"); // safety: example binary, not library code
 }

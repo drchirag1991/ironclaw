@@ -137,9 +137,7 @@ pub fn render_markdown(text: &str, max_width: usize, theme: &Theme) -> Vec<Line<
                     if !lang_str.is_empty() {
                         ctx.lines.push(Line::from(Span::styled(
                             format!("[{lang_str}]"),
-                            theme
-                                .accent_style()
-                                .add_modifier(Modifier::BOLD),
+                            theme.accent_style().add_modifier(Modifier::BOLD),
                         )));
                     }
                 }
@@ -284,8 +282,7 @@ const CODE_KEYWORDS: &[&str] = &[
     "else", "match", "return", "self", "Self", "async", "await", "const", "static", "type",
     "where", "mod", "crate", "super", "true", "false", "None", "Some", "Ok", "Err",
     // Python
-    "def", "class", "import", "from", "print",
-    // JS/TS
+    "def", "class", "import", "from", "print", // JS/TS
     "var", "function", "export", "default", "require",
 ];
 
@@ -565,10 +562,7 @@ pub fn truncate(s: &str, max: usize) -> String {
 /// Replaces newlines with spaces and collapses consecutive whitespace,
 /// then truncates to `max` characters.
 pub fn collapse_preview(s: &str, max: usize) -> String {
-    let collapsed: String = s
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate(&collapsed, max)
 }
 
@@ -1027,7 +1021,13 @@ That's all!";
         let line = highlight_code_line("def hello():", &theme);
         let def_span = line.spans.iter().find(|s| s.content.as_ref() == "def");
         assert!(def_span.is_some());
-        assert!(def_span.unwrap().style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            def_span
+                .unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -1043,6 +1043,9 @@ That's all!";
                     && s.style.fg == Some(theme.accent.to_color())
             })
         });
-        assert!(has_bold_accent, "expected 'fn' to be highlighted as keyword");
+        assert!(
+            has_bold_accent,
+            "expected 'fn' to be highlighted as keyword"
+        );
     }
 }

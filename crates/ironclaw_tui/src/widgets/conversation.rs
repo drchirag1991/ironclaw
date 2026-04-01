@@ -9,7 +9,9 @@ use ratatui::widgets::Widget;
 use crate::layout::TuiSlot;
 use unicode_width::UnicodeWidthStr;
 
-use crate::render::{collapse_preview, format_tokens, format_tool_duration, render_markdown, truncate, wrap_text};
+use crate::render::{
+    collapse_preview, format_tokens, format_tool_duration, render_markdown, truncate, wrap_text,
+};
 use crate::theme::Theme;
 
 use super::{AppState, MessageRole, ToolActivity, ToolStatus, TuiWidget};
@@ -52,7 +54,6 @@ impl TuiWidget for ConversationWidget {
 
         let usable_width = (area.width as usize).saturating_sub(4);
         let mut all_lines: Vec<Line<'_>> = Vec::new();
-
 
         // Welcome block when the conversation is empty
         if state.messages.is_empty() {
@@ -117,8 +118,7 @@ impl TuiWidget for ConversationWidget {
                         format_tokens(cost.output_tokens),
                         cost.cost_usd,
                     );
-                    all_lines
-                        .push(Line::from(Span::styled(cost_line, self.theme.dim_style())));
+                    all_lines.push(Line::from(Span::styled(cost_line, self.theme.dim_style())));
                 }
 
                 all_lines.push(Line::from(""));
@@ -195,7 +195,10 @@ impl TuiWidget for ConversationWidget {
         }
 
         // Show thinking indicator if active
-        const SPINNER: &[&str] = &["\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280F}"];
+        const SPINNER: &[&str] = &[
+            "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}",
+            "\u{2827}", "\u{2807}", "\u{280F}",
+        ];
 
         if !state.status_text.is_empty() && !state.is_streaming {
             let frame = SPINNER[state.spinner_frame % SPINNER.len()];
@@ -272,10 +275,7 @@ impl TuiWidget for ConversationWidget {
                                     ));
                                     remaining = &remaining[match_end..];
                                 } else {
-                                    new_spans.push(Span::styled(
-                                        remaining.to_string(),
-                                        span.style,
-                                    ));
+                                    new_spans.push(Span::styled(remaining.to_string(), span.style));
                                     break;
                                 }
                             }
@@ -419,8 +419,7 @@ impl ConversationWidget {
         let prefix = format!("  \u{250A} {icon} ");
         let prefix_width = UnicodeWidthStr::width(prefix.as_str());
         let duration_width = UnicodeWidthStr::width(duration_text.as_str());
-        let available_for_cmd =
-            usable_width.saturating_sub(prefix_width + duration_width + 2); // 2 for gap
+        let available_for_cmd = usable_width.saturating_sub(prefix_width + duration_width + 2); // 2 for gap
 
         let cmd_truncated = truncate(&cmd_text, available_for_cmd);
         let cmd_width = UnicodeWidthStr::width(cmd_truncated.as_str());
@@ -433,17 +432,16 @@ impl ConversationWidget {
 
         // Split cmd_truncated into the category icon part and the rest
         // so we can apply the category style to just the icon.
-        let (styled_icon_part, rest_part) = if cmd_truncated.len() >= cat_icon.len()
-            && cmd_truncated.starts_with(cat_icon)
-        {
-            (
-                cmd_truncated[..cat_icon.len()].to_string(),
-                cmd_truncated[cat_icon.len()..].to_string(),
-            )
-        } else {
-            // Truncation cut into the icon; just dim everything
-            (String::new(), cmd_truncated)
-        };
+        let (styled_icon_part, rest_part) =
+            if cmd_truncated.len() >= cat_icon.len() && cmd_truncated.starts_with(cat_icon) {
+                (
+                    cmd_truncated[..cat_icon.len()].to_string(),
+                    cmd_truncated[cat_icon.len()..].to_string(),
+                )
+            } else {
+                // Truncation cut into the icon; just dim everything
+                (String::new(), cmd_truncated)
+            };
 
         Line::from(vec![
             Span::styled("  \u{250A} ".to_string(), self.theme.dim_style()),
@@ -518,20 +516,14 @@ impl ConversationWidget {
         }
 
         // Context window
-        let ctx_label = format!(
-            "{}K context",
-            state.context_window / 1000
-        );
+        let ctx_label = format!("{}K context", state.context_window / 1000);
         left_lines.push(Line::from(vec![
             Span::styled("  ".to_string(), Style::default()),
             Span::styled(ctx_label, self.theme.dim_style()),
         ]));
 
         // Session ID
-        let session_id = state
-            .session_start
-            .format("%Y%m%d_%H%M%S")
-            .to_string();
+        let session_id = state.session_start.format("%Y%m%d_%H%M%S").to_string();
         left_lines.push(Line::from(vec![
             Span::styled("  Session: ".to_string(), self.theme.dim_style()),
             Span::styled(session_id, self.theme.dim_style()),
@@ -574,8 +566,12 @@ impl ConversationWidget {
             let max_display = 12;
             let tool_count = state.welcome_tools.len();
             for cat in state.welcome_tools.iter().take(max_display) {
-                right_lines
-                    .push(Self::format_category_line(&cat.name, &cat.tools, &self.theme, true));
+                right_lines.push(Self::format_category_line(
+                    &cat.name,
+                    &cat.tools,
+                    &self.theme,
+                    true,
+                ));
             }
             if tool_count > max_display {
                 right_lines.push(Line::from(Span::styled(
@@ -620,25 +616,28 @@ impl ConversationWidget {
         let total_skills: usize = state.welcome_skills.iter().map(|c| c.skills.len()).sum();
         right_lines.push(Line::from(""));
         let mut footer_spans = vec![
-            Span::styled(
-                format!("{total_tools} tools"),
-                self.theme.accent_style(),
-            ),
+            Span::styled(format!("{total_tools} tools"), self.theme.accent_style()),
             Span::styled("  \u{00B7}  ".to_string(), self.theme.dim_style()),
-            Span::styled(
-                format!("{total_skills} skills"),
-                self.theme.accent_style(),
-            ),
+            Span::styled(format!("{total_skills} skills"), self.theme.accent_style()),
         ];
         if state.memory_count > 0 {
-            footer_spans.push(Span::styled("  \u{00B7}  ".to_string(), self.theme.dim_style()));
+            footer_spans.push(Span::styled(
+                "  \u{00B7}  ".to_string(),
+                self.theme.dim_style(),
+            ));
             footer_spans.push(Span::styled(
                 format!("{} memories", state.memory_count),
                 self.theme.accent_style(),
             ));
         }
-        footer_spans.push(Span::styled("  \u{00B7}  ".to_string(), self.theme.dim_style()));
-        footer_spans.push(Span::styled("/help for commands".to_string(), self.theme.dim_style()));
+        footer_spans.push(Span::styled(
+            "  \u{00B7}  ".to_string(),
+            self.theme.dim_style(),
+        ));
+        footer_spans.push(Span::styled(
+            "/help for commands".to_string(),
+            self.theme.dim_style(),
+        ));
         right_lines.push(Line::from(footer_spans));
 
         // Compose two columns side-by-side

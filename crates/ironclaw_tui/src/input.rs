@@ -102,9 +102,7 @@ pub fn map_key(
     }
 
     // Log level filter keys only in logs tab
-    if logs_active
-        && let Some(action) = map_log_filter_key(key)
-    {
+    if logs_active && let Some(action) = map_log_filter_key(key) {
         return action;
     }
 

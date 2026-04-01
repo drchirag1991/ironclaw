@@ -45,9 +45,7 @@ impl TuiWidget for ToolPanelWidget {
             .border_style(self.theme.border_style())
             .title(Span::styled(
                 title,
-                self.theme
-                    .accent_style()
-                    .add_modifier(Modifier::BOLD),
+                self.theme.accent_style().add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         block.render(area, buf);
@@ -73,9 +71,7 @@ impl TuiWidget for ToolPanelWidget {
                 Span::styled(name, self.theme.accent_style()),
                 Span::styled(format!("  {elapsed}ms"), self.theme.dim_style()),
             ]));
-            if show_detail
-                && let Some(ref d) = tool.detail
-            {
+            if show_detail && let Some(ref d) = tool.detail {
                 let detail_max = (inner.width as usize).saturating_sub(4);
                 lines.push(Line::from(Span::styled(
                     format!("   {}", truncate(d, detail_max)),
@@ -89,10 +85,7 @@ impl TuiWidget for ToolPanelWidget {
             .recent_tools
             .iter()
             .rev()
-            .take(
-                (inner.height as usize)
-                    .saturating_sub(lines.len()),
-            )
+            .take((inner.height as usize).saturating_sub(lines.len()))
             .enumerate()
         {
             let name = truncate(&tool.name, max_name_len);

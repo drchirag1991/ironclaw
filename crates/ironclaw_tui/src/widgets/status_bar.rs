@@ -100,10 +100,7 @@ impl TuiWidget for StatusBarWidget {
             sep.clone(),
             Span::styled(state.model.to_string(), self.theme.accent_style()),
             sep.clone(),
-            Span::styled(
-                format!("v{}", state.version),
-                self.theme.dim_style(),
-            ),
+            Span::styled(format!("v{}", state.version), self.theme.dim_style()),
         ];
 
         // Fleet/activity summary: active tools and threads

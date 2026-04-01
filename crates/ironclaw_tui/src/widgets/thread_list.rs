@@ -29,10 +29,10 @@ use super::{AppState, JobStatus, ThreadStatus, TuiWidget};
 /// Status icon for each job state.
 fn job_icon(status: JobStatus) -> &'static str {
     match status {
-        JobStatus::Pending => "\u{25CB}",    // ○
-        JobStatus::Running => "\u{25CF}",    // ●
-        JobStatus::Completed => "\u{2713}",  // ✓
-        JobStatus::Failed => "\u{2717}",     // ✗
+        JobStatus::Pending => "\u{25CB}",   // ○
+        JobStatus::Running => "\u{25CF}",   // ●
+        JobStatus::Completed => "\u{2713}", // ✓
+        JobStatus::Failed => "\u{2717}",    // ✗
     }
 }
 
@@ -93,12 +93,7 @@ impl ThreadListWidget {
     }
 
     /// Render a section header: " LABEL (count) ────"
-    fn render_section_header<'a>(
-        &self,
-        label: &str,
-        count: usize,
-        width: usize,
-    ) -> Line<'a> {
+    fn render_section_header<'a>(&self, label: &str, count: usize, width: usize) -> Line<'a> {
         let header_text = format!(" {label} ({count})");
         let rule_len = width.saturating_sub(header_text.len() + 1);
         let rule = if rule_len > 0 {
@@ -133,9 +128,7 @@ impl TuiWidget for ThreadListWidget {
             .border_style(self.theme.border_style())
             .title(Span::styled(
                 " Activity ",
-                self.theme
-                    .accent_style()
-                    .add_modifier(Modifier::BOLD),
+                self.theme.accent_style().add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         block.render(area, buf);
@@ -170,8 +163,8 @@ impl TuiWidget for ThreadListWidget {
         }
 
         // ── SYSTEM section ────────────────────────────────────────────
-        let system_items = state.sandbox_status.is_some() as usize
-            + state.secrets_status.is_some() as usize;
+        let system_items =
+            state.sandbox_status.is_some() as usize + state.secrets_status.is_some() as usize;
         if system_items > 0 {
             lines.push(self.render_section_header("SYSTEM", system_items, width));
 
@@ -182,10 +175,7 @@ impl TuiWidget for ThreadListWidget {
                     ("\u{25CB}", self.theme.dim_style()) // ○
                 };
                 let label = if sandbox.running_containers > 0 {
-                    format!(
-                        "Docker  {} containers",
-                        sandbox.running_containers
-                    )
+                    format!("Docker  {} containers", sandbox.running_containers)
                 } else {
                     format!("Docker  {}", sandbox.status)
                 };
@@ -201,10 +191,7 @@ impl TuiWidget for ThreadListWidget {
                 } else {
                     ("\u{1F512}", self.theme.dim_style()) // 🔒
                 };
-                let label = format!(
-                    "Secrets  {} stored",
-                    secrets.count
-                );
+                let label = format!("Secrets  {} stored", secrets.count);
                 let status = if secrets.vault_unlocked {
                     "unlocked"
                 } else {

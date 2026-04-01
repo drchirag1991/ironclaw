@@ -417,12 +417,7 @@ async fn async_main() -> anyhow::Result<()> {
             let skill_data: Vec<(String, Vec<String>)> = sr_guard
                 .skills()
                 .iter()
-                .map(|s| {
-                    (
-                        s.manifest.name.clone(),
-                        s.manifest.activation.tags.clone(),
-                    )
-                })
+                .map(|s| (s.manifest.name.clone(), s.manifest.activation.tags.clone()))
                 .collect();
             ironclaw::channels::tui::group_skills_by_tag(&skill_data)
         } else {
