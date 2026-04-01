@@ -123,63 +123,80 @@ impl ChannelPairingStore for LibSqlBackend {
     async fn approve_pairing(&self, code: &str, owner_id: &str) -> Result<(), DatabaseError> {
         let conn = self.connect().await?;
 
-        let mut rows = conn
-            .query(
-                "SELECT id, channel, external_id FROM pairing_requests
-                 WHERE UPPER(code) = UPPER(?1)
-                   AND approved_at IS NULL
-                   AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 LIMIT 1",
-                params![code],
+        // BEGIN IMMEDIATE acquires a write lock upfront, preventing concurrent approvals
+        conn.execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        // All operations in a closure so we can rollback on any error
+        let result = async {
+            let mut rows = conn
+                .query(
+                    "SELECT id, channel, external_id FROM pairing_requests
+                     WHERE UPPER(code) = UPPER(?1)
+                       AND approved_at IS NULL
+                       AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     LIMIT 1",
+                    libsql::params![code],
+                )
+                .await
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+            let row = rows
+                .next()
+                .await
+                .ok()
+                .flatten()
+                .ok_or_else(|| DatabaseError::NotFound {
+                    entity: "pairing_request".into(),
+                    id: code.to_string(),
+                })?;
+
+            let req_id: String = row.get(0).map_err(|e| DatabaseError::Query(e.to_string()))?;
+            let channel: String = row.get(1).map_err(|e| DatabaseError::Query(e.to_string()))?;
+            let external_id: String =
+                row.get(2).map_err(|e| DatabaseError::Query(e.to_string()))?;
+            let now_str = fmt_ts(&chrono::Utc::now());
+
+            conn.execute(
+                "UPDATE pairing_requests SET owner_id = ?1, approved_at = ?2 WHERE id = ?3",
+                libsql::params![owner_id, now_str.as_str(), req_id.as_str()],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?
-            .ok_or_else(|| DatabaseError::NotFound {
-                entity: "pairing_request".to_string(),
-                id: code.to_string(),
-            })?;
-
-        let req_id: String = row.get(0).map_err(|e| DatabaseError::Query(e.to_string()))?;
-        let channel: String = row.get(1).map_err(|e| DatabaseError::Query(e.to_string()))?;
-        let external_id: String = row.get(2).map_err(|e| DatabaseError::Query(e.to_string()))?;
-
-        let now_str = fmt_ts(&chrono::Utc::now());
-
-        conn.execute("BEGIN", ())
+            let identity_id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO channel_identities (id, owner_id, channel, external_id)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (channel, external_id) DO UPDATE SET owner_id = ?2",
+                libsql::params![
+                    identity_id.as_str(),
+                    owner_id,
+                    channel.as_str(),
+                    external_id.as_str()
+                ],
+            )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
 
-        conn.execute(
-            "UPDATE pairing_requests SET owner_id = ?1, approved_at = ?2 WHERE id = ?3",
-            params![owner_id, now_str.as_str(), req_id.as_str()],
-        )
-        .await
-        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            Ok::<(), DatabaseError>(())
+        }
+        .await;
 
-        let identity_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO channel_identities (id, owner_id, channel, external_id)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (channel, external_id) DO UPDATE SET owner_id = ?2",
-            params![
-                identity_id.as_str(),
-                owner_id,
-                channel.as_str(),
-                external_id.as_str()
-            ],
-        )
-        .await
-        .map_err(|e| DatabaseError::Query(e.to_string()))?;
-
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
-        Ok(())
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?;
+                Ok(())
+            }
+            Err(e) => {
+                // Best-effort rollback — if rollback fails, log but return original error
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     async fn list_pending_pairings(
@@ -378,5 +395,69 @@ mod tests {
 
         let pending = db.list_pending_pairings("telegram").await.unwrap();
         assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_approve_pairing_case_insensitive() {
+        let (db, _dir) = setup_db_with_user("alice").await;
+        let req = db
+            .upsert_pairing_request("telegram", "user_ci", None)
+            .await
+            .unwrap();
+
+        // Approve with lowercase version of the code
+        let lowercase_code = req.code.to_lowercase();
+        db.approve_pairing(&lowercase_code, "alice").await.unwrap();
+
+        // Identity should resolve
+        let identity = db
+            .resolve_channel_identity("telegram", "user_ci")
+            .await
+            .unwrap();
+        assert!(identity.is_some(), "Lowercase code should work");
+        assert_eq!(identity.unwrap().owner_id.as_str(), "alice");
+    }
+
+    #[tokio::test]
+    async fn test_approve_expired_code_rejected() {
+        let (db, _dir) = setup_db_with_user("alice").await;
+
+        // Insert an expired pairing request directly
+        {
+            let conn = db.connect().await.unwrap();
+            conn.execute(
+                "INSERT INTO pairing_requests (id, channel, external_id, code, created_at, expires_at)
+                 VALUES (?1, 'telegram', 'user_expired', 'EXPIRED1', ?2, ?3)",
+                libsql::params![
+                    uuid::Uuid::new_v4().to_string().as_str(),
+                    crate::db::libsql::fmt_ts(&chrono::Utc::now()).as_str(),
+                    crate::db::libsql::fmt_ts(
+                        &(chrono::Utc::now() - chrono::Duration::hours(1))
+                    )
+                    .as_str(),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+
+        let err = db.approve_pairing("EXPIRED1", "alice").await;
+        assert!(err.is_err(), "Expired code should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_approve_same_code_twice_rejected() {
+        let (db, _dir) = setup_db_with_user("alice").await;
+        let req = db
+            .upsert_pairing_request("telegram", "user_double", None)
+            .await
+            .unwrap();
+
+        // First approval succeeds
+        db.approve_pairing(&req.code, "alice").await.unwrap();
+
+        // Second approval with same code fails
+        let err = db.approve_pairing(&req.code, "alice").await;
+        assert!(err.is_err(), "Approving an already-approved code should fail");
     }
 }
