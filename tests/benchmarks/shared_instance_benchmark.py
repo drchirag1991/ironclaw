@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import deque
 import json
 import os
 import re
@@ -36,6 +37,7 @@ DEFAULT_OWNER_ID = "bench-owner"
 DEFAULT_MOCK_MODEL = "mock-model"
 DEFAULT_RESULTS_DIR = Path(tempfile.gettempdir()) / "ironclaw-benchmarks"
 GATEWAY_CONNECTION_LIMIT = 100
+PROCESS_OUTPUT_TAIL_LINES = 200
 
 
 @dataclass
@@ -43,6 +45,19 @@ class RuntimeSample:
     timestamp: float
     cpu_percent: float
     rss_mb: float
+
+
+@dataclass
+class StreamTail:
+    lines: deque[str] = field(
+        default_factory=lambda: deque(maxlen=PROCESS_OUTPUT_TAIL_LINES)
+    )
+
+    def append(self, text: str) -> None:
+        self.lines.append(text)
+
+    def render(self) -> str:
+        return "".join(self.lines).strip()
 
 
 @dataclass
@@ -363,6 +378,22 @@ async def sample_process(pid: int, interval_secs: float, stop_event: asyncio.Eve
     return samples
 
 
+async def drain_stream(
+    stream: asyncio.StreamReader | None,
+    *,
+    capture: StreamTail | None = None,
+) -> None:
+    if stream is None:
+        return
+
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        if capture is not None:
+            capture.append(line.decode("utf-8", errors="replace"))
+
+
 def percentile(values: list[float], pct: float) -> float | None:
     if not values:
         return None
@@ -391,7 +422,12 @@ def json_default(value: Any) -> Any:
     raise TypeError(f"Unsupported value: {type(value)!r}")
 
 
-async def start_mock_llm(root: Path, *, startup_timeout: float) -> tuple[asyncio.subprocess.Process, str]:
+async def start_mock_llm(
+    root: Path,
+    *,
+    startup_timeout: float,
+    drain_tasks: list[asyncio.Task[None]],
+) -> tuple[asyncio.subprocess.Process, str]:
     script = root / "tests" / "e2e" / "mock_llm.py"
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -401,7 +437,9 @@ async def start_mock_llm(root: Path, *, startup_timeout: float) -> tuple[asyncio
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    drain_tasks.append(asyncio.create_task(drain_stream(process.stderr)))
     port = await wait_for_port_line(process, r"MOCK_LLM_PORT=(\d+)", timeout=startup_timeout)
+    drain_tasks.append(asyncio.create_task(drain_stream(process.stdout)))
     url = f"http://127.0.0.1:{port}"
     await wait_for_ready(f"{url}/v1/models", timeout=startup_timeout)
     return process, url
@@ -485,6 +523,7 @@ async def start_ironclaw(
     args: argparse.Namespace,
     home_dir: str,
     db_path: str,
+    drain_tasks: list[asyncio.Task[None]],
 ) -> tuple[asyncio.subprocess.Process, str, dict[str, Any]]:
     env, public_overrides = benchmark_env(
         home_dir=home_dir,
@@ -502,18 +541,17 @@ async def start_ironclaw(
         stderr=asyncio.subprocess.PIPE,
         env=env,
     )
+    stderr_tail = StreamTail()
+    drain_tasks.append(asyncio.create_task(drain_stream(process.stdout)))
+    drain_tasks.append(
+        asyncio.create_task(drain_stream(process.stderr, capture=stderr_tail))
+    )
     base_url = f"http://127.0.0.1:{gateway_port}"
     try:
         await wait_for_ready(f"{base_url}/api/health", timeout=args.startup_timeout)
     except TimeoutError as exc:
-        stderr_bytes = b""
-        if process.stderr is not None:
-            try:
-                stderr_bytes = await asyncio.wait_for(process.stderr.read(8192), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
         await stop_process(process, timeout=2.0)
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+        stderr_text = stderr_tail.render()
         raise RuntimeError(
             f"IronClaw failed to start within {args.startup_timeout}s.\nstderr:\n{stderr_text}"
         ) from exc
@@ -638,7 +676,8 @@ async def sse_listener(
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(
-                f"{base_url}/api/chat/events?token={user_state.token}",
+                f"{base_url}/api/chat/events",
+                params={"token": user_state.token},
                 headers={"Accept": "text/event-stream"},
             ) as response:
                 if response.status != 200:
@@ -964,11 +1003,14 @@ async def async_main(args: argparse.Namespace) -> int:
     sse_stop_event = asyncio.Event()
     sampler_stop_event = asyncio.Event()
     sse_tasks: list[asyncio.Task[Any]] = []
+    process_drain_tasks: list[asyncio.Task[None]] = []
     sampler_task: asyncio.Task[list[RuntimeSample]] | None = None
 
     try:
         mock_llm_process, mock_llm_url = await start_mock_llm(
-            root, startup_timeout=args.startup_timeout
+            root,
+            startup_timeout=args.startup_timeout,
+            drain_tasks=process_drain_tasks,
         )
         ironclaw_process, base_url, env_overrides = await start_ironclaw(
             root,
@@ -979,6 +1021,7 @@ async def async_main(args: argparse.Namespace) -> int:
             args=args,
             home_dir=str(home_dir),
             db_path=str(db_path),
+            drain_tasks=process_drain_tasks,
         )
 
         async with httpx.AsyncClient() as client:
@@ -1069,6 +1112,8 @@ async def async_main(args: argparse.Namespace) -> int:
             await stop_process(ironclaw_process, sig=signal.SIGINT, timeout=10.0)
         if mock_llm_process is not None:
             await stop_process(mock_llm_process, sig=signal.SIGTERM, timeout=5.0)
+        if process_drain_tasks:
+            await asyncio.gather(*process_drain_tasks, return_exceptions=True)
         if args.keep_artifacts:
             print(f"artifacts_dir: {artifacts_root}")
         if artifacts_tmpdir is not None:

@@ -1,6 +1,5 @@
 //! IronClaw - Main entry point.
 
-use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,7 +67,7 @@ fn parse_bench_runtime_mode(value: Option<&str>) -> anyhow::Result<BenchRuntimeM
 
 #[cfg(feature = "bench-runtime")]
 fn build_runtime_from_env() -> anyhow::Result<tokio::runtime::Runtime> {
-    let value = env::var("IRONCLAW_BENCH_RUNTIME_MODE").ok();
+    let value = std::env::var("IRONCLAW_BENCH_RUNTIME_MODE").ok();
     let mode = parse_bench_runtime_mode(value.as_deref())?;
     let mut builder = match mode {
         BenchRuntimeMode::MultiThread => tokio::runtime::Builder::new_multi_thread(),
