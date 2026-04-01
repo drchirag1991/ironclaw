@@ -1,5 +1,6 @@
 //! IronClaw - Main entry point.
 
+use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,15 +39,40 @@ fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     ironclaw::bootstrap::load_ironclaw_env();
 
-    let result = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(async_main());
+    let runtime = build_runtime_from_env()?;
+    let result = runtime.block_on(async_main());
 
     if let Err(ref e) = result {
         format_top_level_error(e);
     }
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchRuntimeMode {
+    MultiThread,
+    CurrentThread,
+}
+
+fn parse_bench_runtime_mode(value: Option<&str>) -> anyhow::Result<BenchRuntimeMode> {
+    match value.unwrap_or("multi_thread") {
+        "multi_thread" => Ok(BenchRuntimeMode::MultiThread),
+        "current_thread" => Ok(BenchRuntimeMode::CurrentThread),
+        other => anyhow::bail!(
+            "Invalid IRONCLAW_BENCH_RUNTIME_MODE '{other}'. Expected 'multi_thread' or 'current_thread'."
+        ),
+    }
+}
+
+fn build_runtime_from_env() -> anyhow::Result<tokio::runtime::Runtime> {
+    let value = env::var("IRONCLAW_BENCH_RUNTIME_MODE").ok();
+    let mode = parse_bench_runtime_mode(value.as_deref())?;
+    let mut builder = match mode {
+        BenchRuntimeMode::MultiThread => tokio::runtime::Builder::new_multi_thread(),
+        BenchRuntimeMode::CurrentThread => tokio::runtime::Builder::new_current_thread(),
+    };
+    builder.enable_all();
+    builder.build().map_err(Into::into)
 }
 
 /// Format a top-level error with color and recovery hints.
@@ -1214,4 +1240,38 @@ async fn async_main() -> anyhow::Result<()> {
     tracing::debug!("Agent shutdown complete");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BenchRuntimeMode, parse_bench_runtime_mode};
+
+    #[test]
+    fn bench_runtime_mode_defaults_to_multi_thread() {
+        let mode = parse_bench_runtime_mode(None).expect("default mode should parse");
+        assert_eq!(mode, BenchRuntimeMode::MultiThread);
+    }
+
+    #[test]
+    fn bench_runtime_mode_accepts_current_thread() {
+        let mode =
+            parse_bench_runtime_mode(Some("current_thread")).expect("current_thread should parse");
+        assert_eq!(mode, BenchRuntimeMode::CurrentThread);
+    }
+
+    #[test]
+    fn bench_runtime_mode_accepts_multi_thread() {
+        let mode =
+            parse_bench_runtime_mode(Some("multi_thread")).expect("multi_thread should parse");
+        assert_eq!(mode, BenchRuntimeMode::MultiThread);
+    }
+
+    #[test]
+    fn bench_runtime_mode_rejects_invalid_values() {
+        let err = parse_bench_runtime_mode(Some("single_thread")).expect_err("must reject");
+        assert!(
+            err.to_string().contains("IRONCLAW_BENCH_RUNTIME_MODE"),
+            "unexpected error: {err:#}"
+        );
+    }
 }
