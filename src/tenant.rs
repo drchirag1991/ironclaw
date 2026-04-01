@@ -997,7 +997,63 @@ impl TenantCtx {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::ownership::{Identity, OwnerId, UserRole};
+
+    fn alice_identity() -> Identity {
+        Identity::new(OwnerId::from("alice"), UserRole::Member)
+    }
+
+    fn admin_identity() -> Identity {
+        Identity::new(OwnerId::from("admin-user"), UserRole::Admin)
+    }
+
+    async fn test_db() -> Arc<dyn crate::db::Database> {
+        let backend = crate::db::libsql::LibSqlBackend::new_memory().await.unwrap();
+        Arc::new(backend)
+    }
+
+    // ---- TenantScope tests ----
+
+    #[tokio::test]
+    async fn test_tenant_scope_with_identity_carries_owner_id() {
+        let scope = TenantScope::with_identity(alice_identity(), test_db().await);
+        assert_eq!(scope.user_id(), "alice");
+        assert_eq!(scope.identity().owner_id.as_str(), "alice");
+        assert_eq!(scope.identity().role, UserRole::Member);
+    }
+
+    #[tokio::test]
+    async fn test_tenant_scope_new_bridge_creates_member_identity() {
+        let scope = TenantScope::new("alice", test_db().await);
+        assert_eq!(scope.user_id(), "alice");
+        assert_eq!(scope.identity().role, UserRole::Member);
+    }
+
+    // ---- AdminScope tests ----
+
+    #[tokio::test]
+    async fn test_admin_scope_new_returns_some_for_admin() {
+        let scope = AdminScope::new(admin_identity(), test_db().await);
+        assert!(scope.is_some(), "Admin identity should construct AdminScope");
+    }
+
+    #[tokio::test]
+    async fn test_admin_scope_new_returns_none_for_member() {
+        let scope = AdminScope::new(alice_identity(), test_db().await);
+        assert!(scope.is_none(), "Member identity should NOT construct AdminScope");
+    }
+
+    #[tokio::test]
+    async fn test_tenant_scope_identity_accessible_after_with_identity() {
+        let scope = TenantScope::with_identity(admin_identity(), test_db().await);
+        assert_eq!(scope.identity().role, UserRole::Admin);
+        assert_eq!(scope.user_id(), "admin-user");
+    }
+
+    // ---- TenantRateRegistry tests ----
 
     #[tokio::test]
     async fn test_rate_registry_returns_same_state_for_same_user() {
