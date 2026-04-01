@@ -548,6 +548,18 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Collapse a multi-line preview into a single line for inline display.
+///
+/// Replaces newlines with spaces and collapses consecutive whitespace,
+/// then truncates to `max` characters.
+pub fn collapse_preview(s: &str, max: usize) -> String {
+    let collapsed: String = s
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate(&collapsed, max)
+}
+
 /// Format a duration in seconds to a human-readable string (e.g., "2m", "1h 5m").
 pub fn format_duration(secs: u64) -> String {
     if secs < 60 {

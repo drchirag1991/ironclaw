@@ -9,7 +9,7 @@ use ratatui::widgets::Widget;
 use crate::layout::TuiSlot;
 use unicode_width::UnicodeWidthStr;
 
-use crate::render::{format_tokens, format_tool_duration, render_markdown, truncate, wrap_text};
+use crate::render::{collapse_preview, format_tokens, format_tool_duration, render_markdown, truncate, wrap_text};
 use crate::theme::Theme;
 
 use super::{AppState, MessageRole, ToolActivity, ToolStatus, TuiWidget};
@@ -146,36 +146,28 @@ impl TuiWidget for ConversationWidget {
             all_lines.push(Line::from(""));
             for tool in &turn_recent {
                 all_lines.push(self.render_tool_line(tool, usable_width, false));
-                // Tool output preview line
                 if let Some(ref preview) = tool.result_preview {
                     let preview_max = usable_width.saturating_sub(8);
-                    let first_line = preview.lines().next().unwrap_or("");
-                    if !first_line.is_empty() {
+                    let collapsed = collapse_preview(preview, preview_max);
+                    if !collapsed.is_empty() {
                         all_lines.push(Line::from(vec![
                             Span::styled("  \u{250A}   ".to_string(), self.theme.dim_style()),
                             Span::styled("\u{2192} ".to_string(), self.theme.dim_style()),
-                            Span::styled(
-                                truncate(first_line, preview_max),
-                                self.theme.dim_style(),
-                            ),
+                            Span::styled(collapsed, self.theme.dim_style()),
                         ]));
                     }
                 }
             }
             for tool in &state.active_tools {
                 all_lines.push(self.render_tool_line(tool, usable_width, true));
-                // Tool output preview line for active tools
                 if let Some(ref preview) = tool.result_preview {
                     let preview_max = usable_width.saturating_sub(8);
-                    let first_line = preview.lines().next().unwrap_or("");
-                    if !first_line.is_empty() {
+                    let collapsed = collapse_preview(preview, preview_max);
+                    if !collapsed.is_empty() {
                         all_lines.push(Line::from(vec![
                             Span::styled("  \u{250A}   ".to_string(), self.theme.dim_style()),
                             Span::styled("\u{2192} ".to_string(), self.theme.dim_style()),
-                            Span::styled(
-                                truncate(first_line, preview_max),
-                                self.theme.dim_style(),
-                            ),
+                            Span::styled(collapsed, self.theme.dim_style()),
                         ]));
                     }
                 }
