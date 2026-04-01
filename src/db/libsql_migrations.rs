@@ -618,7 +618,7 @@ CREATE TABLE IF NOT EXISTS channel_identities (
     owner_id    TEXT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     channel     TEXT    NOT NULL,
     external_id TEXT    NOT NULL,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (channel, external_id)
 );
 CREATE INDEX IF NOT EXISTS idx_channel_identities_lookup
@@ -632,7 +632,7 @@ CREATE TABLE IF NOT EXISTS pairing_requests (
     external_id TEXT    NOT NULL,
     code        TEXT    NOT NULL UNIQUE,
     owner_id    TEXT    REFERENCES users(id) ON DELETE CASCADE,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     expires_at  TEXT    NOT NULL,
     approved_at TEXT
 );
@@ -645,6 +645,10 @@ CREATE INDEX IF NOT EXISTS idx_pairing_requests_channel ON pairing_requests (cha
 ///
 /// Each entry is `(version, name, sql)`. Migrations are idempotent: the
 /// `_migrations` table tracks which versions have been applied.
+// NOTE: libSQL incremental migration version numbers are independent from
+// PostgreSQL migration version numbers (migrations/VN__*.sql). The libSQL
+// version sequence started before the PostgreSQL V15 era, so they are offset
+// by ~1. Do not assume libSQL version N corresponds to PostgreSQL V(N).
 pub const INCREMENTAL_MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         9,
@@ -852,7 +856,7 @@ CREATE TABLE IF NOT EXISTS channel_identities (
     owner_id    TEXT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     channel     TEXT    NOT NULL,
     external_id TEXT    NOT NULL,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (channel, external_id)
 );
 CREATE INDEX IF NOT EXISTS idx_channel_identities_lookup
@@ -872,7 +876,7 @@ CREATE TABLE IF NOT EXISTS pairing_requests (
     external_id TEXT    NOT NULL,
     code        TEXT    NOT NULL UNIQUE,
     owner_id    TEXT    REFERENCES users(id) ON DELETE CASCADE,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     expires_at  TEXT    NOT NULL,
     approved_at TEXT
 );
