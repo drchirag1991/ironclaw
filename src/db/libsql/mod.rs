@@ -350,6 +350,9 @@ impl Database for LibSqlBackend {
 
     async fn migrate_default_owner(&self, owner_id: &str) -> Result<(), DatabaseError> {
         let conn = self.connect().await?;
+        conn.execute("BEGIN", ())
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
         let tables = [
             "conversations",
             "memory_documents",
@@ -370,6 +373,9 @@ impl Database for LibSqlBackend {
                 DatabaseError::Query(format!("migrate_default_owner {table}: {e}"))
             })?;
         }
+        conn.execute("COMMIT", ())
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 }

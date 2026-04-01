@@ -818,14 +818,12 @@ pub trait UserStore: Send + Sync {
     /// Create a new user record.
     async fn create_user(&self, user: &UserRecord) -> Result<(), DatabaseError>;
 
-    /// Ensure a user record exists, creating it if it does not.
-    /// Idempotent — safe to call on every startup for the owner user.
-    async fn get_or_create_user(&self, user: UserRecord) -> Result<(), DatabaseError> {
-        if self.get_user(&user.id).await?.is_none() {
-            self.create_user(&user).await?;
-        }
-        Ok(())
-    }
+    /// Create the user if they do not already exist. Idempotent.
+    ///
+    /// Each backend must override this with an atomic upsert (PostgreSQL:
+    /// `ON CONFLICT DO NOTHING`; libSQL: `INSERT OR IGNORE`) to avoid the
+    /// TOCTOU race in a SELECT + INSERT sequence.
+    async fn get_or_create_user(&self, user: UserRecord) -> Result<(), DatabaseError>;
     /// Get a user by their string id.
     async fn get_user(&self, id: &str) -> Result<Option<UserRecord>, DatabaseError>;
     /// Get a user by email address.

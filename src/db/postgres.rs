@@ -63,11 +63,15 @@ impl Database for PgBackend {
     }
 
     async fn migrate_default_owner(&self, owner_id: &str) -> Result<(), DatabaseError> {
-        let client = self
+        let mut client = self
             .pool()
             .get()
             .await
             .map_err(|e| DatabaseError::Pool(e.to_string()))?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
         let tables = [
             "conversations",
             "memory_documents",
@@ -79,16 +83,16 @@ impl Database for PgBackend {
             "agent_jobs",
         ];
         for table in &tables {
-            client
-                .execute(
-                    &format!("UPDATE {} SET user_id = $1 WHERE user_id = 'default'", table),
-                    &[&owner_id],
-                )
-                .await
-                .map_err(|e| {
-                    DatabaseError::Query(format!("migrate_default_owner {table}: {e}"))
-                })?;
+            tx.execute(
+                &format!("UPDATE {} SET user_id = $1 WHERE user_id = 'default'", table),
+                &[&owner_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(format!("migrate_default_owner {table}: {e}")))?;
         }
+        tx.commit()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
 }
@@ -843,6 +847,35 @@ impl WorkspaceStore for PgBackend {
 impl UserStore for PgBackend {
     async fn create_user(&self, user: &UserRecord) -> Result<(), DatabaseError> {
         self.store.create_user(user).await
+    }
+
+    async fn get_or_create_user(&self, user: UserRecord) -> Result<(), DatabaseError> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| DatabaseError::Pool(e.to_string()))?;
+        client
+            .execute(
+                "INSERT INTO users (id, email, display_name, status, role, created_at, updated_at, last_login_at, created_by, metadata)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT (id) DO NOTHING",
+                &[
+                    &user.id,
+                    &user.email,
+                    &user.display_name,
+                    &user.status,
+                    &user.role,
+                    &user.created_at,
+                    &user.updated_at,
+                    &user.last_login_at,
+                    &user.created_by,
+                    &user.metadata,
+                ],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(format!("get_or_create_user: {e}")))?;
+        Ok(())
     }
 
     async fn get_user(&self, id: &str) -> Result<Option<UserRecord>, DatabaseError> {

@@ -141,9 +141,9 @@ impl AppBuilder {
         self.handles = Some(handles);
 
         // Post-init: ensure owner user row exists and rewrite 'default' user_id rows.
-        if let Err(e) = bootstrap_ownership(db.as_ref(), &self.config).await {
-            tracing::warn!("bootstrap_ownership failed: {}", e);
-        }
+        bootstrap_ownership(db.as_ref(), &self.config)
+            .await
+            .map_err(|e| anyhow::anyhow!("bootstrap_ownership failed: {e}"))?;
 
         // Post-init: migrate disk config, reload config from DB, attach session, cleanup
         if let Err(e) =
@@ -937,7 +937,35 @@ impl AppBuilder {
     }
 }
 
-/// Runs on every startup after migrations V1–V18, before V19 (FK constraints).
+/// FK constraints applied after bootstrap_ownership rewrites 'default' rows.
+/// NOT applied by the automatic refinery sweep — applied programmatically below.
+///
+/// PostgreSQL uses `ADD CONSTRAINT IF NOT EXISTS` to be idempotent.
+/// libSQL (SQLite) does not support `ADD CONSTRAINT` at all — FK enforcement
+/// there is handled by `PRAGMA foreign_keys = ON` in the schema declarations.
+// TODO(ownership): Apply OWNERSHIP_FK_SQL on PostgreSQL after bootstrap completes.
+// Requires detecting the database backend type from the Database trait object.
+#[allow(dead_code)]
+const OWNERSHIP_FK_SQL: &str = r#"
+ALTER TABLE conversations    ADD CONSTRAINT IF NOT EXISTS fk_conversations_user
+    FOREIGN KEY (user_id) REFERENCES users(id);
+ALTER TABLE memory_documents ADD CONSTRAINT IF NOT EXISTS fk_memory_documents_user
+    FOREIGN KEY (user_id) REFERENCES users(id);
+ALTER TABLE heartbeat_state  ADD CONSTRAINT IF NOT EXISTS fk_heartbeat_user
+    FOREIGN KEY (user_id) REFERENCES users(id);
+ALTER TABLE secrets          ADD CONSTRAINT IF NOT EXISTS fk_secrets_user
+    FOREIGN KEY (user_id) REFERENCES users(id);
+ALTER TABLE wasm_tools       ADD CONSTRAINT IF NOT EXISTS fk_wasm_tools_user
+    FOREIGN KEY (user_id) REFERENCES users(id);
+ALTER TABLE routines         ADD CONSTRAINT IF NOT EXISTS fk_routines_user
+    FOREIGN KEY (user_id) REFERENCES users(id);
+ALTER TABLE settings         ADD CONSTRAINT IF NOT EXISTS fk_settings_user
+    FOREIGN KEY (user_id) REFERENCES users(id);
+ALTER TABLE agent_jobs       ADD CONSTRAINT IF NOT EXISTS fk_agent_jobs_user
+    FOREIGN KEY (user_id) REFERENCES users(id);
+"#;
+
+/// Runs on every startup after migrations V1–V18.
 /// Idempotent — safe to call multiple times.
 ///
 /// 1. Ensures the owner user row exists in `users`.

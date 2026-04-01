@@ -95,9 +95,9 @@ pub enum McpCommand {
         /// Server name to authenticate
         name: String,
 
-        /// User ID for storing the token (default: "default")
-        #[arg(short, long, default_value = "default")]
-        user: String,
+        /// User ID to authenticate as (defaults to configured owner)
+        #[arg(short, long)]
+        user: Option<String>,
     },
 
     /// Test connection to an MCP server
@@ -105,9 +105,9 @@ pub enum McpCommand {
         /// Server name to test
         name: String,
 
-        /// User ID for authentication (default: "default")
-        #[arg(short, long, default_value = "default")]
-        user: String,
+        /// User ID to authenticate as (defaults to configured owner)
+        #[arg(short, long)]
+        user: Option<String>,
     },
 
     /// Enable or disable an MCP server
@@ -145,8 +145,16 @@ pub async fn run_mcp_command(cmd: McpCommand) -> anyhow::Result<()> {
         McpCommand::Add(args) => add_server(*args).await,
         McpCommand::Remove { name } => remove_server(name).await,
         McpCommand::List { verbose } => list_servers(verbose).await,
-        McpCommand::Auth { name, user } => auth_server(name, user).await,
-        McpCommand::Test { name, user } => test_server(name, user).await,
+        McpCommand::Auth { name, user } => {
+            let (_, owner_id) = connect_db().await;
+            let user_id = user.unwrap_or_else(|| owner_id.clone());
+            auth_server(name, user_id).await
+        }
+        McpCommand::Test { name, user } => {
+            let (_, owner_id) = connect_db().await;
+            let user_id = user.unwrap_or_else(|| owner_id.clone());
+            test_server(name, user_id).await
+        }
         McpCommand::Toggle {
             name,
             enable,
