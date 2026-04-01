@@ -817,6 +817,15 @@ pub trait UserStore: Send + Sync {
 
     /// Create a new user record.
     async fn create_user(&self, user: &UserRecord) -> Result<(), DatabaseError>;
+
+    /// Ensure a user record exists, creating it if it does not.
+    /// Idempotent — safe to call on every startup for the owner user.
+    async fn get_or_create_user(&self, user: UserRecord) -> Result<(), DatabaseError> {
+        if self.get_user(&user.id).await?.is_none() {
+            self.create_user(&user).await?;
+        }
+        Ok(())
+    }
     /// Get a user by their string id.
     async fn get_user(&self, id: &str) -> Result<Option<UserRecord>, DatabaseError>;
     /// Get a user by email address.
@@ -937,6 +946,10 @@ pub trait Database:
 {
     /// Run schema migrations for this backend.
     async fn run_migrations(&self) -> Result<(), DatabaseError>;
+
+    /// Rewrite all rows where user_id = 'default' to owner_id across all
+    /// affected tables. Idempotent — safe to call on every startup.
+    async fn migrate_default_owner(&self, owner_id: &str) -> Result<(), DatabaseError>;
 }
 
 #[cfg(test)]

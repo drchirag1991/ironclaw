@@ -72,6 +72,8 @@ impl SessionManager {
             token: RwLock::new(None),
             renewal_lock: Mutex::new(()),
             store: RwLock::new(None),
+            // Placeholder; overwritten by attach_store() with the real owner_id at startup.
+            // TODO(ownership): thread owner_id through SessionManager constructors
             user_id: RwLock::new("default".to_string()),
         };
 
@@ -103,6 +105,8 @@ impl SessionManager {
             token: RwLock::new(None),
             renewal_lock: Mutex::new(()),
             store: RwLock::new(None),
+            // Placeholder; overwritten by attach_store() with the real owner_id at startup.
+            // TODO(ownership): thread owner_id through SessionManager constructors
             user_id: RwLock::new("default".to_string()),
         };
 

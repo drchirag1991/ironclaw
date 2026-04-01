@@ -81,6 +81,8 @@ impl McpClient {
             tools_cache: RwLock::new(None),
             session_manager: None,
             secrets: None,
+            // TODO(ownership): unauthenticated constructor; user_id set properly via
+            // create_client_from_config() for production paths
             user_id: "default".to_string(),
             server_config: None,
             custom_headers: HashMap::new(),
@@ -104,6 +106,8 @@ impl McpClient {
             tools_cache: RwLock::new(None),
             session_manager: None,
             secrets: None,
+            // TODO(ownership): unauthenticated constructor; user_id set properly via
+            // create_client_from_config() for production paths
             user_id: "default".to_string(),
             server_config: None,
             custom_headers: HashMap::new(),
@@ -145,6 +149,8 @@ impl McpClient {
             tools_cache: RwLock::new(None),
             session_manager: None,
             secrets: None,
+            // TODO(ownership): unauthenticated constructor; user_id set properly via
+            // create_client_from_config() for production paths
             user_id: "default".to_string(),
             custom_headers: config.headers.clone(),
             initialized: tokio::sync::OnceCell::new(),

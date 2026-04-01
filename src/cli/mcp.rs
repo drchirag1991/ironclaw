@@ -243,10 +243,10 @@ async fn add_server(args: McpAddArgs) -> anyhow::Result<()> {
     config.validate()?;
 
     // Save (DB if available, else disk)
-    let db = connect_db().await;
-    let mut servers = load_servers(db.as_deref()).await?;
+    let (db, owner_id) = connect_db().await;
+    let mut servers = load_servers(db.as_deref(), &owner_id).await?;
     servers.upsert(config);
-    save_servers(db.as_deref(), &servers).await?;
+    save_servers(db.as_deref(), &owner_id, &servers).await?;
 
     println!();
     println!("  ✓ Added MCP server '{}'", name);
@@ -281,12 +281,12 @@ async fn add_server(args: McpAddArgs) -> anyhow::Result<()> {
 
 /// Remove an MCP server.
 async fn remove_server(name: String) -> anyhow::Result<()> {
-    let db = connect_db().await;
-    let mut servers = load_servers(db.as_deref()).await?;
+    let (db, owner_id) = connect_db().await;
+    let mut servers = load_servers(db.as_deref(), &owner_id).await?;
     if !servers.remove(&name) {
         anyhow::bail!("Server '{}' not found", name);
     }
-    save_servers(db.as_deref(), &servers).await?;
+    save_servers(db.as_deref(), &owner_id, &servers).await?;
 
     println!();
     println!("  ✓ Removed MCP server '{}'", name);
@@ -297,8 +297,8 @@ async fn remove_server(name: String) -> anyhow::Result<()> {
 
 /// List configured MCP servers.
 async fn list_servers(verbose: bool) -> anyhow::Result<()> {
-    let db = connect_db().await;
-    let servers = load_servers(db.as_deref()).await?;
+    let (db, owner_id) = connect_db().await;
+    let servers = load_servers(db.as_deref(), &owner_id).await?;
 
     if servers.servers.is_empty() {
         println!();
@@ -403,8 +403,8 @@ async fn list_servers(verbose: bool) -> anyhow::Result<()> {
 /// Authenticate with an MCP server.
 async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
     // Get server config
-    let db = connect_db().await;
-    let servers = load_servers(db.as_deref()).await?;
+    let (db, owner_id) = connect_db().await;
+    let servers = load_servers(db.as_deref(), &owner_id).await?;
     let server = servers
         .get(&name)
         .cloned()
@@ -476,8 +476,8 @@ async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
 /// Test connection to an MCP server.
 async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
     // Get server config
-    let db = connect_db().await;
-    let servers = load_servers(db.as_deref()).await?;
+    let (db, owner_id) = connect_db().await;
+    let servers = load_servers(db.as_deref(), &owner_id).await?;
     let server = servers
         .get(&name)
         .cloned()
@@ -513,7 +513,7 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
             &session_manager,
             &process_manager,
             None,
-            "default",
+            &owner_id,
         )
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))?
@@ -581,8 +581,8 @@ async fn test_server(name: String, user_id: String) -> anyhow::Result<()> {
 
 /// Toggle server enabled/disabled state.
 async fn toggle_server(name: String, enable: bool, disable: bool) -> anyhow::Result<()> {
-    let db = connect_db().await;
-    let mut servers = load_servers(db.as_deref()).await?;
+    let (db, owner_id) = connect_db().await;
+    let mut servers = load_servers(db.as_deref(), &owner_id).await?;
 
     let server = servers
         .get_mut(&name)
@@ -597,7 +597,7 @@ async fn toggle_server(name: String, enable: bool, disable: bool) -> anyhow::Res
     };
 
     server.enabled = new_state;
-    save_servers(db.as_deref(), &servers).await?;
+    save_servers(db.as_deref(), &owner_id, &servers).await?;
 
     let status = if new_state { "enabled" } else { "disabled" };
     println!();
@@ -607,18 +607,24 @@ async fn toggle_server(name: String, enable: bool, disable: bool) -> anyhow::Res
     Ok(())
 }
 
-const DEFAULT_USER_ID: &str = "default";
-
 /// Try to connect to the database (backend-agnostic).
-async fn connect_db() -> Option<Arc<dyn Database>> {
-    let config = Config::from_env().await.ok()?;
-    crate::db::connect_from_config(&config.database).await.ok()
+/// Returns both the optional database handle and the resolved owner_id.
+async fn connect_db() -> (Option<Arc<dyn Database>>, String) {
+    let Ok(config) = Config::from_env().await else {
+        return (None, "default".to_string());
+    };
+    let owner_id = config.owner_id.clone();
+    let db = crate::db::connect_from_config(&config.database).await.ok();
+    (db, owner_id)
 }
 
 /// Load MCP servers (DB if available, else disk).
-async fn load_servers(db: Option<&dyn Database>) -> Result<McpServersFile, config::ConfigError> {
+async fn load_servers(
+    db: Option<&dyn Database>,
+    owner_id: &str,
+) -> Result<McpServersFile, config::ConfigError> {
     if let Some(db) = db {
-        config::load_mcp_servers_from_db(db, DEFAULT_USER_ID).await
+        config::load_mcp_servers_from_db(db, owner_id).await
     } else {
         config::load_mcp_servers().await
     }
@@ -627,10 +633,11 @@ async fn load_servers(db: Option<&dyn Database>) -> Result<McpServersFile, confi
 /// Save MCP servers (DB if available, else disk).
 async fn save_servers(
     db: Option<&dyn Database>,
+    owner_id: &str,
     servers: &McpServersFile,
 ) -> Result<(), config::ConfigError> {
     if let Some(db) = db {
-        config::save_mcp_servers_to_db(db, DEFAULT_USER_ID, servers).await
+        config::save_mcp_servers_to_db(db, owner_id, servers).await
     } else {
         config::save_mcp_servers(servers).await
     }

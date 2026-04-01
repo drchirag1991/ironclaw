@@ -347,6 +347,31 @@ impl Database for LibSqlBackend {
 
         Ok(())
     }
+
+    async fn migrate_default_owner(&self, owner_id: &str) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        let tables = [
+            "conversations",
+            "memory_documents",
+            "heartbeat_state",
+            "secrets",
+            "wasm_tools",
+            "routines",
+            "settings",
+            "agent_jobs",
+        ];
+        for table in &tables {
+            conn.execute(
+                &format!("UPDATE {} SET user_id = ?1 WHERE user_id = 'default'", table),
+                libsql::params![owner_id],
+            )
+            .await
+            .map_err(|e| {
+                DatabaseError::Query(format!("migrate_default_owner {table}: {e}"))
+            })?;
+        }
+        Ok(())
+    }
 }
 
 // ==================== Row conversion helpers ====================

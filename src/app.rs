@@ -140,6 +140,11 @@ impl AppBuilder {
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         self.handles = Some(handles);
 
+        // Post-init: ensure owner user row exists and rewrite 'default' user_id rows.
+        if let Err(e) = bootstrap_ownership(db.as_ref(), &self.config).await {
+            tracing::warn!("bootstrap_ownership failed: {}", e);
+        }
+
         // Post-init: migrate disk config, reload config from DB, attach session, cleanup
         if let Err(e) =
             crate::bootstrap::migrate_disk_to_db(db.as_ref(), &self.config.owner_id).await
@@ -930,6 +935,42 @@ impl AppBuilder {
             builder,
         })
     }
+}
+
+/// Runs on every startup after migrations V1–V18, before V19 (FK constraints).
+/// Idempotent — safe to call multiple times.
+///
+/// 1. Ensures the owner user row exists in `users`.
+/// 2. Rewrites all `user_id = 'default'` rows to the real owner_id.
+pub async fn bootstrap_ownership(
+    db: &dyn crate::db::Database,
+    config: &crate::config::Config,
+) -> Result<(), anyhow::Error> {
+    let owner_id = &config.owner_id;
+
+    // 1. Ensure owner user exists
+    db.get_or_create_user(crate::db::UserRecord {
+        id: owner_id.clone(),
+        role: "admin".to_string(),
+        display_name: "Owner".to_string(),
+        status: "active".to_string(),
+        email: None,
+        last_login_at: None,
+        created_by: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        metadata: serde_json::Value::Object(Default::default()),
+    })
+    .await?;
+
+    // 2. Rewrite 'default' rows to the real owner_id
+    db.migrate_default_owner(owner_id).await?;
+
+    tracing::info!(
+        owner_id = %owner_id,
+        "bootstrap_ownership: owner user ensured, default rows migrated"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

@@ -61,6 +61,36 @@ impl Database for PgBackend {
     async fn run_migrations(&self) -> Result<(), DatabaseError> {
         self.store.run_migrations().await
     }
+
+    async fn migrate_default_owner(&self, owner_id: &str) -> Result<(), DatabaseError> {
+        let client = self
+            .pool()
+            .get()
+            .await
+            .map_err(|e| DatabaseError::Pool(e.to_string()))?;
+        let tables = [
+            "conversations",
+            "memory_documents",
+            "heartbeat_state",
+            "secrets",
+            "wasm_tools",
+            "routines",
+            "settings",
+            "agent_jobs",
+        ];
+        for table in &tables {
+            client
+                .execute(
+                    &format!("UPDATE {} SET user_id = $1 WHERE user_id = 'default'", table),
+                    &[&owner_id],
+                )
+                .await
+                .map_err(|e| {
+                    DatabaseError::Query(format!("migrate_default_owner {table}: {e}"))
+                })?;
+        }
+        Ok(())
+    }
 }
 
 // ==================== ConversationStore ====================
