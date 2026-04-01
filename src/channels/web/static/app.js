@@ -80,6 +80,7 @@ let currentTab = 'chat';
 let currentThreadId = null;
 let currentThreadIsReadOnly = false;
 let assistantThreadId = null;
+let currentThreadPlanMode = false;
 let hasMore = false;
 let oldestTimestamp = null;
 let loadingOlder = false;
@@ -129,6 +130,9 @@ const SLASH_COMMANDS = [
   { cmd: '/skills',     desc: 'List installed skills' },
   { cmd: '/model',      desc: 'Show or switch the LLM model' },
   { cmd: '/thread new', desc: 'Create a new conversation thread' },
+  { cmd: '/plan enter', desc: 'Enter read-first plan mode for this thread' },
+  { cmd: '/plan exit',  desc: 'Leave plan mode and allow execution again' },
+  { cmd: '/plan-mode status', desc: 'Show whether plan mode is active' },
 ];
 
 let _slashSelected = -1;
@@ -626,6 +630,19 @@ function connectSSE() {
     if (currentTab === 'settings') refreshCurrentSettingsTab();
   });
 
+  eventSource.addEventListener('plan_exit_needed', (e) => {
+    const data = JSON.parse(e.data);
+    const hasThread = !!data.thread_id;
+    const forCurrentThread = !hasThread || isCurrentThread(data.thread_id);
+
+    if (forCurrentThread) {
+      showPlanExitReview(data);
+    } else if (data.thread_id) {
+      unreadThreads.set(data.thread_id, (unreadThreads.get(data.thread_id) || 0) + 1);
+      debouncedLoadThreads();
+    }
+  });
+
   eventSource.addEventListener('auth_required', (e) => {
     handleAuthRequired(JSON.parse(e.data));
   });
@@ -837,6 +854,9 @@ function enableChatInput() {
   const btn = document.getElementById('send-btn');
   if (input) {
     input.disabled = false;
+    input.placeholder = currentThreadPlanMode
+      ? 'Plan mode active: inspect and plan, but no execution'
+      : 'Type a message...';
   }
   if (btn) btn.disabled = false;
 }
@@ -1043,6 +1063,47 @@ function sendApprovalAction(requestId, action) {
     // Remove the card after showing the confirmation briefly
     setTimeout(() => { card.remove(); }, 1500);
   }
+}
+
+function sendPlanExitAction(requestId, action, threadId) {
+  const owningThreadId = threadId || currentThreadId;
+  const card = document.querySelector('.plan-exit-card[data-request-id="' + CSS.escape(requestId) + '"]');
+  const actions = card ? card.querySelector('.approval-actions') : null;
+  if (actions) {
+    const buttons = actions.querySelectorAll('button');
+    buttons.forEach((btn) => {
+      btn.disabled = true;
+    });
+  }
+
+  apiFetch('/api/chat/plan-exit-action', {
+    method: 'POST',
+    body: { request_id: requestId, action: action, thread_id: owningThreadId },
+  }).then(() => {
+    if (!card || !actions) return;
+    if (currentThreadId === owningThreadId) {
+      currentThreadPlanMode = action !== 'approve';
+      enableChatInput();
+    }
+    const label = document.createElement('span');
+    label.className = 'approval-resolved';
+    const labelText = action === 'approve'
+      ? 'Plan approved'
+      : action === 'revise'
+        ? 'Plan revision requested'
+        : 'Stayed in plan mode';
+    label.textContent = labelText;
+    actions.appendChild(label);
+    setTimeout(() => { card.remove(); }, 1500);
+  }).catch((err) => {
+    addMessage('system', 'Failed to send plan exit action: ' + err.message);
+    if (actions) {
+      const buttons = actions.querySelectorAll('button');
+      buttons.forEach((btn) => {
+        btn.disabled = false;
+      });
+    }
+  });
 }
 
 function renderMarkdown(text) {
@@ -1496,6 +1557,86 @@ function showApproval(data) {
   container.scrollTop = container.scrollHeight;
 }
 
+function showPlanExitReview(data) {
+  const requestId = data.request_id;
+  const selector = '.plan-exit-card[data-request-id="' + CSS.escape(requestId) + '"]';
+  const existing = document.querySelector(selector);
+  if (existing) return;
+
+  // Keep only the latest plan-exit review card in view.
+  document.querySelectorAll('.plan-exit-card').forEach((card) => card.remove());
+
+  const container = document.getElementById('chat-messages');
+  const card = document.createElement('div');
+  card.className = 'approval-card plan-exit-card';
+  card.setAttribute('data-request-id', requestId);
+  if (data.thread_id) {
+    card.setAttribute('data-thread-id', data.thread_id);
+  }
+
+  const header = document.createElement('div');
+  header.className = 'approval-header';
+  header.textContent = 'Plan exit review';
+  card.appendChild(header);
+
+  const title = document.createElement('div');
+  title.className = 'approval-tool-name';
+  title.textContent = data.title || 'Review this plan';
+  card.appendChild(title);
+
+  if (data.path) {
+    const path = document.createElement('div');
+    path.className = 'approval-description';
+    path.textContent = data.path;
+    card.appendChild(path);
+  }
+
+  if (data.markdown) {
+    const body = document.createElement('div');
+    body.className = 'plan-exit-markdown';
+    body.innerHTML = renderMarkdown(data.markdown);
+    card.appendChild(body);
+  }
+
+  if (data.suggested_actions && data.suggested_actions.length > 0) {
+    const suggestions = document.createElement('div');
+    suggestions.className = 'plan-exit-suggestions';
+    data.suggested_actions.slice(0, 4).forEach((text) => {
+      const chip = document.createElement('span');
+      chip.className = 'suggestion-chip plan-exit-suggestion';
+      chip.textContent = text;
+      suggestions.appendChild(chip);
+    });
+    card.appendChild(suggestions);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'approval-actions';
+
+  const approveBtn = document.createElement('button');
+  approveBtn.className = 'approve';
+  approveBtn.textContent = 'Approve';
+  approveBtn.addEventListener('click', () => sendPlanExitAction(requestId, 'approve', data.thread_id));
+
+  const reviseBtn = document.createElement('button');
+  reviseBtn.className = 'always';
+  reviseBtn.textContent = 'Revise';
+  reviseBtn.addEventListener('click', () => sendPlanExitAction(requestId, 'revise', data.thread_id));
+
+  const stayBtn = document.createElement('button');
+  stayBtn.className = 'deny';
+  stayBtn.textContent = 'Stay';
+  stayBtn.addEventListener('click', () => sendPlanExitAction(requestId, 'stay', data.thread_id));
+
+  actions.appendChild(approveBtn);
+  actions.appendChild(reviseBtn);
+  actions.appendChild(stayBtn);
+  card.appendChild(actions);
+
+  container.appendChild(card);
+  container.scrollTop = container.scrollHeight;
+}
+
 // --- Plan Checklist ---
 
 function renderPlanChecklist(data) {
@@ -1895,6 +2036,7 @@ function loadHistory(before) {
 
   apiFetch(historyUrl).then((data) => {
     const container = document.getElementById('chat-messages');
+    currentThreadPlanMode = !!data.plan_mode;
 
     if (!isPaginating) {
       // Fresh load: clear and render
@@ -1923,6 +2065,12 @@ function loadHistory(before) {
       if (data.pending_approval) {
         showApproval(data.pending_approval);
       }
+      if (data.pending_plan_exit) {
+        showPlanExitReview({
+          ...data.pending_plan_exit,
+          thread_id: data.thread_id,
+        });
+      }
       // Re-show auth card if auth flow is pending (survives SSE reconnect)
       if (data.pending_auth) {
         handleAuthRequired({
@@ -1933,6 +2081,9 @@ function loadHistory(before) {
       } else {
         // No pending auth — ensure stale auth UI is cleaned up
         setAuthFlowPending(false);
+      }
+      if (!currentThreadIsReadOnly && !authFlowPending) {
+        enableChatInput();
       }
     } else {
       // Pagination: prepend older messages
@@ -2127,7 +2278,10 @@ function loadThreads() {
         labelEl.textContent = 'Assistant';
       }
       const meta = document.getElementById('assistant-meta');
-      meta.textContent = relativeTime(data.assistant_thread.updated_at);
+      const assistantMeta = [];
+      if (data.assistant_thread.plan_mode) assistantMeta.push('plan');
+      assistantMeta.push(relativeTime(data.assistant_thread.updated_at));
+      meta.textContent = assistantMeta.filter(Boolean).join(' · ');
     }
 
     // Regular threads
@@ -2156,7 +2310,10 @@ function loadThreads() {
 
       const meta = document.createElement('span');
       meta.className = 'thread-meta';
-      meta.textContent = relativeTime(thread.updated_at);
+      const metaParts = [];
+      if (thread.plan_mode) metaParts.push('plan');
+      metaParts.push(relativeTime(thread.updated_at));
+      meta.textContent = metaParts.filter(Boolean).join(' · ');
       item.appendChild(meta);
 
       // Unread dot
@@ -2181,6 +2338,7 @@ function loadThreads() {
     if (currentThreadId) {
       const currentThread = threads.find(t => t.id === currentThreadId);
       const ch = currentThread ? currentThread.channel : 'gateway';
+      currentThreadPlanMode = !!(currentThread && currentThread.plan_mode);
       currentThreadIsReadOnly = isReadOnlyChannel(ch);
       if (currentThreadIsReadOnly) {
         disableChatInputReadOnly();
@@ -2206,6 +2364,7 @@ function switchToAssistant() {
   finalizeActivityGroup();
   currentThreadId = assistantThreadId;
   currentThreadIsReadOnly = false;
+  currentThreadPlanMode = false;
   unreadThreads.delete(assistantThreadId);
   hasMore = false;
   oldestTimestamp = null;
@@ -2222,6 +2381,7 @@ function switchThread(threadId) {
   clearSuggestionChips();
   finalizeActivityGroup();
   currentThreadId = threadId;
+  currentThreadPlanMode = false;
   unreadThreads.delete(threadId);
   hasMore = false;
   oldestTimestamp = null;
@@ -2238,6 +2398,7 @@ function createNewThread() {
   apiFetch('/api/chat/thread/new', { method: 'POST' }).then((data) => {
     currentThreadId = data.id || null;
     currentThreadIsReadOnly = false;
+    currentThreadPlanMode = !!data.plan_mode;
     document.getElementById('chat-messages').innerHTML = '';
     showWelcomeCard();
     enableChatInput();

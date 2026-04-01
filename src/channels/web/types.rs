@@ -34,6 +34,7 @@ pub struct SendMessageResponse {
 pub struct ThreadInfo {
     pub id: Uuid,
     pub state: String,
+    pub plan_mode: bool,
     pub turn_count: usize,
     pub created_at: String,
     pub updated_at: String,
@@ -85,6 +86,7 @@ pub struct ToolCallInfo {
 #[derive(Debug, Serialize)]
 pub struct HistoryResponse {
     pub thread_id: Uuid,
+    pub plan_mode: bool,
     pub turns: Vec<TurnInfo>,
     /// Whether there are older messages available.
     #[serde(default)]
@@ -105,6 +107,9 @@ pub struct HistoryResponse {
     /// and the user is stuck with a blocked chat input.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_auth: Option<PendingAuthInfo>,
+    /// Pending plan-exit review that needs user action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_plan_exit: Option<PendingPlanExitInfo>,
 }
 
 /// Lightweight DTO for pending auth state (credential name + instructions).
@@ -123,6 +128,18 @@ pub struct PendingApprovalInfo {
     pub parameters: String,
 }
 
+/// Review card for exiting plan mode.
+#[derive(Debug, Serialize)]
+pub struct PendingPlanExitInfo {
+    pub request_id: String,
+    pub title: String,
+    pub markdown: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_actions: Vec<String>,
+}
+
 // --- Approval ---
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +148,14 @@ pub struct ApprovalRequest {
     /// "approve", "always", or "deny"
     pub action: String,
     /// Thread that owns the pending approval (so the agent loop finds the right session).
+    pub thread_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlanExitActionRequest {
+    pub request_id: String,
+    /// "approve", "revise", or "stay"
+    pub action: String,
     pub thread_id: Option<String>,
 }
 
@@ -1232,6 +1257,7 @@ mod tests {
         let info = ThreadInfo {
             id: Uuid::nil(),
             state: "Idle".to_string(),
+            plan_mode: true,
             turn_count: 0,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1249,6 +1275,7 @@ mod tests {
         let info = ThreadInfo {
             id: Uuid::nil(),
             state: "Idle".to_string(),
+            plan_mode: false,
             turn_count: 0,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

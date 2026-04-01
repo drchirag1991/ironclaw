@@ -148,6 +148,36 @@ pub async fn chat_history_handler(
         }
     }
 
+    let persisted_metadata = if let Some(ref store) = state.store {
+        store
+            .get_conversation_metadata(thread_id)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let persisted_plan_mode = persisted_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("plan_mode").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let persisted_pending_plan_exit = persisted_metadata.as_ref().and_then(|metadata| {
+        crate::agent::session::PlanArtifact::from_metadata(metadata, thread_id).and_then(
+            |artifact| {
+                metadata
+                    .get("plan_exit_request_id")
+                    .and_then(|v| v.as_str())
+                    .map(|request_id| PendingPlanExitInfo {
+                        request_id: request_id.to_string(),
+                        title: artifact.title,
+                        markdown: artifact.markdown,
+                        path: Some(artifact.path),
+                        suggested_actions: artifact.suggested_actions,
+                    })
+            },
+        )
+    });
+
     // For paginated requests (before cursor set), always go to DB
     if before_cursor.is_some()
         && let Some(ref store) = state.store
@@ -161,11 +191,13 @@ pub async fn chat_history_handler(
         let turns = build_turns_from_db_messages(&messages);
         return Ok(Json(HistoryResponse {
             thread_id,
+            plan_mode: persisted_plan_mode,
             turns,
             has_more,
             oldest_timestamp,
             pending_approval: None,
             pending_auth: None,
+            pending_plan_exit: persisted_pending_plan_exit,
         }));
     }
 
@@ -217,14 +249,27 @@ pub async fn chat_history_handler(
                     description: pa.description.clone(),
                     parameters: serde_json::to_string_pretty(&pa.parameters).unwrap_or_default(),
                 });
+            let pending_plan_exit =
+                thread
+                    .pending_plan_exit
+                    .as_ref()
+                    .map(|pending| PendingPlanExitInfo {
+                        request_id: pending.request_id.to_string(),
+                        title: pending.artifact.title.clone(),
+                        markdown: pending.artifact.markdown.clone(),
+                        path: Some(pending.artifact.path.clone()),
+                        suggested_actions: pending.artifact.suggested_actions.clone(),
+                    });
 
             return Ok(Json(HistoryResponse {
                 thread_id,
+                plan_mode: thread.plan_mode,
                 turns,
                 has_more: false,
                 oldest_timestamp: None,
                 pending_approval,
                 pending_auth: None,
+                pending_plan_exit,
             }));
         }
     }
@@ -241,11 +286,13 @@ pub async fn chat_history_handler(
             let turns = build_turns_from_db_messages(&messages);
             return Ok(Json(HistoryResponse {
                 thread_id,
+                plan_mode: persisted_plan_mode,
                 turns,
                 has_more,
                 oldest_timestamp,
                 pending_approval: None,
                 pending_auth: None,
+                pending_plan_exit: persisted_pending_plan_exit,
             }));
         }
     }
@@ -253,11 +300,13 @@ pub async fn chat_history_handler(
     // Empty thread (just created, no messages yet)
     Ok(Json(HistoryResponse {
         thread_id,
+        plan_mode: persisted_plan_mode,
         turns: Vec::new(),
         has_more: false,
         oldest_timestamp: None,
         pending_approval: None,
         pending_auth: None,
+        pending_plan_exit: persisted_pending_plan_exit,
     }))
 }
 
@@ -293,6 +342,13 @@ pub async fn chat_threads_handler(
                 let info = ThreadInfo {
                     id: s.id,
                     state: "Idle".to_string(),
+                    plan_mode: {
+                        let sess = session.lock().await;
+                        sess.threads
+                            .get(&s.id)
+                            .map(|t| t.plan_mode)
+                            .unwrap_or(s.plan_mode)
+                    },
                     turn_count: s.message_count.max(0) as usize,
                     created_at: s.started_at.to_rfc3339(),
                     updated_at: s.last_activity.to_rfc3339(),
@@ -313,6 +369,13 @@ pub async fn chat_threads_handler(
                 assistant_thread = Some(ThreadInfo {
                     id: assistant_id,
                     state: "Idle".to_string(),
+                    plan_mode: {
+                        let sess = session.lock().await;
+                        sess.threads
+                            .get(&assistant_id)
+                            .map(|t| t.plan_mode)
+                            .unwrap_or(false)
+                    },
                     turn_count: 0,
                     created_at: chrono::Utc::now().to_rfc3339(),
                     updated_at: chrono::Utc::now().to_rfc3339(),
@@ -345,6 +408,7 @@ pub async fn chat_threads_handler(
         .map(|t| ThreadInfo {
             id: t.id,
             state: format!("{:?}", t.state),
+            plan_mode: t.plan_mode,
             turn_count: t.turns.len(),
             created_at: t.created_at.to_rfc3339(),
             updated_at: t.updated_at.to_rfc3339(),
@@ -383,6 +447,7 @@ pub async fn chat_new_thread_handler(
         let info = ThreadInfo {
             id: thread.id,
             state: format!("{:?}", thread.state),
+            plan_mode: thread.plan_mode,
             turn_count: thread.turns.len(),
             created_at: thread.created_at.to_rfc3339(),
             updated_at: thread.updated_at.to_rfc3339(),
