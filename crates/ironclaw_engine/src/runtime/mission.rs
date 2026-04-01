@@ -17,6 +17,7 @@ use crate::types::error::EngineError;
 use crate::types::memory::MemoryDoc;
 use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
 use crate::types::project::ProjectId;
+use crate::types::shared_owner_id;
 use crate::types::thread::{ThreadConfig, ThreadId, ThreadType};
 
 /// Manages mission lifecycle and thread spawning.
@@ -71,12 +72,13 @@ impl MissionManager {
 
     /// Pause an active mission. No new threads will be spawned.
     ///
-    /// For system missions (`user_id="system"`), the caller (web handler) must
+    /// For shared missions, the caller (web handler) must
     /// verify admin role before calling this. The engine only checks ownership.
     pub async fn pause_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
-        // Validate ownership. System missions require admin role (checked by caller).
+        // Validate ownership. Shared missions require admin role (checked by caller).
         if let Some(mission) = self.store.load_mission(id).await?
-            && mission.user_id != user_id
+            && !mission.is_owned_by(user_id)
+            && !mission.owner_id().is_shared()
         {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
@@ -93,12 +95,13 @@ impl MissionManager {
 
     /// Resume a paused mission.
     ///
-    /// For system missions (`user_id="system"`), the caller (web handler) must
+    /// For shared missions, the caller (web handler) must
     /// verify admin role before calling this. The engine only checks ownership.
     pub async fn resume_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
-        // Validate ownership. System missions require admin role (checked by caller).
+        // Validate ownership. Shared missions require admin role (checked by caller).
         if let Some(mission) = self.store.load_mission(id).await?
-            && mission.user_id != user_id
+            && !mission.is_owned_by(user_id)
+            && !mission.owner_id().is_shared()
         {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
@@ -147,9 +150,9 @@ impl MissionManager {
         };
 
         // Tenant isolation: verify the requesting user owns this mission.
-        // System missions (user_id="system") can be fired by any user — the spawned
+        // Shared missions can be fired by any user — the spawned
         // thread inherits the requesting user's identity, keeping artifacts user-scoped.
-        if mission.user_id != "system" && mission.user_id != user_id {
+        if !mission.owner_id().is_shared() && !mission.is_owned_by(user_id) {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
                 entity: format!("mission {id}"),
@@ -258,7 +261,7 @@ impl MissionManager {
     }
 
     /// List all missions in a project for a given user.
-    /// List missions visible to a user (own + system shared).
+    /// List missions visible to a user (own + shared).
     pub async fn list_missions(
         &self,
         project_id: ProjectId,
@@ -295,8 +298,8 @@ impl MissionManager {
             };
 
             // Only fire missions owned by this user (per-user learning missions)
-            // or system-wide shared missions.
-            if mission.user_id != user_id && mission.user_id != "system" {
+            // or globally shared missions.
+            if !mission.is_owned_by(user_id) && !mission.owner_id().is_shared() {
                 continue;
             }
 
@@ -587,7 +590,7 @@ impl MissionManager {
         self.active.write().await.push(id);
 
         // Seed the fix pattern database if it doesn't exist
-        let docs = self.store.list_memory_docs(project_id, "system").await?;
+        let docs = self.store.list_shared_memory_docs(project_id).await?;
         let has_patterns = docs.iter().any(|d| {
             d.title == FIX_PATTERN_DB_TITLE && d.tags.contains(&FIX_PATTERN_DB_TAG.to_string())
         });
@@ -595,7 +598,7 @@ impl MissionManager {
             use crate::types::memory::{DocType, MemoryDoc};
             let pattern_doc = MemoryDoc::new(
                 project_id,
-                "system",
+                shared_owner_id(),
                 DocType::Note,
                 FIX_PATTERN_DB_TITLE,
                 SEED_FIX_PATTERNS,
@@ -689,7 +692,7 @@ impl MissionManager {
         };
         use crate::types::memory::{DocType, MemoryDoc};
 
-        let docs = self.store.list_memory_docs(project_id, "system").await?;
+        let docs = self.store.list_shared_memory_docs(project_id).await?;
         let existing_v0 = docs.iter().find(|d| {
             d.title == ORCHESTRATOR_TITLE
                 && d.tags.contains(&ORCHESTRATOR_TAG.to_string())
@@ -715,7 +718,7 @@ impl MissionManager {
         // Create v0 doc
         let mut doc = MemoryDoc::new(
             project_id,
-            "system",
+            shared_owner_id(),
             DocType::Note,
             ORCHESTRATOR_TITLE,
             DEFAULT_ORCHESTRATOR,
@@ -1039,7 +1042,7 @@ async fn process_self_improvement_output(
 
         if !new_rules.is_empty() {
             // Load or create the prompt overlay doc
-            let docs = store.list_memory_docs(project_id, "system").await?;
+            let docs = store.list_shared_memory_docs(project_id).await?;
             let existing = docs.iter().find(|d| {
                 d.title == PREAMBLE_OVERLAY_TITLE
                     && d.tags.contains(&PROMPT_OVERLAY_TAG.to_string())
@@ -1050,7 +1053,7 @@ async fn process_self_improvement_output(
             } else {
                 MemoryDoc::new(
                     project_id,
-                    "system",
+                    shared_owner_id(),
                     DocType::Note,
                     PREAMBLE_OVERLAY_TITLE,
                     "",
@@ -1079,7 +1082,7 @@ async fn process_self_improvement_output(
     if let Some(patterns) = json_val.get("fix_patterns").and_then(|v| v.as_array())
         && !patterns.is_empty()
     {
-        let docs = store.list_memory_docs(project_id, "system").await?;
+        let docs = store.list_shared_memory_docs(project_id).await?;
         let existing = docs.iter().find(|d| {
             d.title == FIX_PATTERN_DB_TITLE && d.tags.contains(&FIX_PATTERN_DB_TAG.to_string())
         });
@@ -1089,7 +1092,7 @@ async fn process_self_improvement_output(
         } else {
             MemoryDoc::new(
                 project_id,
-                "system",
+                shared_owner_id(),
                 DocType::Note,
                 FIX_PATTERN_DB_TITLE,
                 SEED_FIX_PATTERNS,

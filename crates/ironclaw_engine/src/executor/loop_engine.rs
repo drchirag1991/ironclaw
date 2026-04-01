@@ -194,16 +194,13 @@ impl ExecutionLoop {
             self.thread.transition_to(ThreadState::Running, None)?;
         }
 
-        // Pre-fetch system memory docs once — used by both prompt overlay and
+        // Pre-fetch shared memory docs once — used by both prompt overlay and
         // orchestrator loading, avoiding a duplicate Store query.
         let system_docs = if let Some(store) = self.store.as_ref() {
-            match store
-                .list_memory_docs(self.thread.project_id, "system")
-                .await
-            {
+            match store.list_shared_memory_docs(self.thread.project_id).await {
                 Ok(docs) => docs,
                 Err(e) => {
-                    debug!("failed to load system docs for orchestrator: {e}");
+                    debug!("failed to load shared docs for orchestrator: {e}");
                     Vec::new()
                 }
             }
@@ -298,28 +295,6 @@ impl ExecutionLoop {
                     .await;
                 }
                 let _ = &orch_result.tokens_used;
-
-                // Safety net: if the orchestrator returned NeedApproval,
-                // NeedAuthentication, or GatePaused but didn't transition to
-                // Waiting, do it now so resume_thread works.
-                if matches!(
-                    orch_result.outcome,
-                    ThreadOutcome::NeedApproval { .. }
-                        | ThreadOutcome::NeedAuthentication { .. }
-                        | ThreadOutcome::GatePaused { .. }
-                ) && self.thread.state != ThreadState::Waiting
-                {
-                    debug!(
-                        thread_id = %self.thread.id,
-                        state = ?self.thread.state,
-                        outcome = ?std::mem::discriminant(&orch_result.outcome),
-                        "orchestrator returned pause outcome without transitioning to Waiting"
-                    );
-                    let _ = self.thread.transition_to(
-                        ThreadState::Waiting,
-                        Some("waiting for credentials".into()),
-                    );
-                }
 
                 self.clear_runtime_checkpoint();
                 self.persist_runtime_state(None, &mut persisted_event_count)

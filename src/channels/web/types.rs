@@ -110,6 +110,8 @@ pub struct HistoryResponse {
 /// Lightweight DTO for pending auth state (credential name + instructions).
 #[derive(Debug, Serialize)]
 pub struct PendingAuthInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub extension_name: String,
     pub instructions: Option<String>,
 }
@@ -580,12 +582,16 @@ pub struct SkillInstallRequest {
 pub struct AuthTokenRequest {
     pub extension_name: String,
     pub token: String,
+    pub request_id: Option<String>,
+    pub thread_id: Option<String>,
 }
 
 /// Request to cancel an in-progress auth flow.
 #[derive(Debug, Deserialize)]
 pub struct AuthCancelRequest {
     pub extension_name: String,
+    pub request_id: Option<String>,
+    pub thread_id: Option<String>,
 }
 
 // --- WebSocket ---
@@ -1117,6 +1123,7 @@ mod tests {
             instructions: Some("Get your token from...".to_string()),
             auth_url: None,
             setup_url: Some("https://notion.so/integrations".to_string()),
+            thread_id: Some("thread-1".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1125,6 +1132,7 @@ mod tests {
         assert_eq!(parsed["instructions"], "Get your token from...");
         assert!(parsed.get("auth_url").is_none());
         assert_eq!(parsed["setup_url"], "https://notion.so/integrations");
+        assert_eq!(parsed["thread_id"], "thread-1");
     }
 
     #[test]
@@ -1133,12 +1141,14 @@ mod tests {
             extension_name: "notion".to_string(),
             success: true,
             message: "notion authenticated (3 tools loaded)".to_string(),
+            thread_id: Some("thread-1".to_string()),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "auth_completed");
         assert_eq!(parsed["extension_name"], "notion");
         assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["thread_id"], "thread-1");
     }
 
     #[test]
@@ -1148,6 +1158,7 @@ mod tests {
             instructions: Some("Enter API key".to_string()),
             auth_url: None,
             setup_url: None,
+            thread_id: None,
         };
         let ws = WsServerMessage::from_app_event(&event);
         match ws {
@@ -1165,6 +1176,7 @@ mod tests {
             extension_name: "slack".to_string(),
             success: false,
             message: "Invalid token".to_string(),
+            thread_id: None,
         };
         let ws = WsServerMessage::from_app_event(&event);
         match ws {

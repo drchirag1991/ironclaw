@@ -193,6 +193,45 @@ impl PendingGateStore {
             .map(PendingGateView::from)
     }
 
+    /// List all non-expired gates for a user.
+    pub async fn list_for_user(&self, user_id: &str) -> Vec<PendingGate> {
+        let inner = self.inner.lock().await;
+        inner
+            .by_key
+            .values()
+            .filter(|gate| gate.user_id == user_id && !gate.is_expired())
+            .cloned()
+            .collect()
+    }
+
+    /// List all non-expired gates.
+    pub async fn list_all(&self) -> Vec<PendingGate> {
+        let inner = self.inner.lock().await;
+        inner
+            .by_key
+            .values()
+            .filter(|gate| !gate.is_expired())
+            .cloned()
+            .collect()
+    }
+
+    /// Remove a gate by key without verification.
+    ///
+    /// Used for cleanup paths like conversation clears or explicit cancel flows.
+    pub async fn discard(&self, key: &PendingGateKey) -> Result<(), GateStoreError> {
+        let removed = {
+            let mut inner = self.inner.lock().await;
+            let gate = inner.by_key.remove(key).ok_or(GateStoreError::NotFound)?;
+            inner.by_request_id.remove(&gate.request_id);
+            gate
+        };
+        if let Some(ref persistence) = self.persistence {
+            persistence.remove(key).await?;
+        }
+        let _ = removed;
+        Ok(())
+    }
+
     /// Restore pending gates from persistent storage on startup.
     /// Returns the number of non-expired gates restored.
     pub async fn restore_from_persistence(&self) -> Result<usize, GateStoreError> {
@@ -275,6 +314,7 @@ mod tests {
             resume_kind: ResumeKind::Approval { allow_always: true },
             created_at: Utc::now(),
             expires_at: Utc::now() + Duration::seconds(expires_in_secs),
+            original_message: None,
         }
     }
 
@@ -346,6 +386,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(taken.action_name, "shell");
+    }
+
+    #[tokio::test]
+    async fn test_list_for_user_filters_expired_and_other_users() {
+        let store = PendingGateStore::in_memory();
+        let live = sample_gate_with("alice", ThreadId::new(), "web", 300);
+        let expired = sample_gate_with("alice", ThreadId::new(), "web", -1);
+        let other = sample_gate_with("bob", ThreadId::new(), "web", 300);
+
+        store.insert(live.clone()).await.unwrap();
+        store.insert(expired).await.unwrap();
+        store.insert(other).await.unwrap();
+
+        let listed = store.list_for_user("alice").await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].request_id, live.request_id);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_filters_expired() {
+        let store = PendingGateStore::in_memory();
+        store
+            .insert(sample_gate_with("alice", ThreadId::new(), "web", 300))
+            .await
+            .unwrap();
+        store
+            .insert(sample_gate_with("alice", ThreadId::new(), "web", -1))
+            .await
+            .unwrap();
+
+        assert_eq!(store.list_all().await.len(), 1);
     }
 
     // ── Channel verification ─────────────────────────────────

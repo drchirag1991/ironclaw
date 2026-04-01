@@ -3739,6 +3739,7 @@ impl ExtensionManager {
                         extension_name: ext_name,
                         success,
                         message,
+                        thread_id: None,
                     });
                 }
             });

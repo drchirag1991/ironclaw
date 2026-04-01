@@ -117,12 +117,16 @@ pub enum AppEvent {
         auth_url: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         setup_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
     },
     #[serde(rename = "auth_completed")]
     AuthCompleted {
         extension_name: String,
         success: bool,
         message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
     },
     #[serde(rename = "error")]
     Error {
@@ -373,11 +377,13 @@ mod tests {
                 instructions: None,
                 auth_url: None,
                 setup_url: None,
+                thread_id: None,
             },
             AppEvent::AuthCompleted {
                 extension_name: String::new(),
                 success: true,
                 message: String::new(),
+                thread_id: None,
             },
             AppEvent::Error {
                 message: String::new(),

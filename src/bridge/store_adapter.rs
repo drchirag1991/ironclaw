@@ -976,6 +976,10 @@ impl Store for HybridStore {
             .collect())
     }
 
+    async fn list_all_projects(&self) -> Result<Vec<Project>, EngineError> {
+        Ok(self.projects.read().await.values().cloned().collect())
+    }
+
     async fn save_conversation(
         &self,
         conversation: &ConversationSurface,

@@ -987,6 +987,7 @@ async fn oauth_callback_handler(
                     extension_name: flow.extension_name.clone(),
                     success: false,
                     message: "OAuth flow expired. Please try again.".to_string(),
+                    thread_id: None,
                 },
             );
         }
@@ -1164,6 +1165,7 @@ async fn oauth_callback_handler(
                 extension_name: flow.extension_name,
                 success,
                 message: final_message.clone(),
+                thread_id: None,
             },
         );
     }
@@ -1427,6 +1429,7 @@ async fn slack_relay_oauth_callback_handler(
         extension_name: DEFAULT_RELAY_NAME.to_string(),
         success,
         message: message.clone(),
+        thread_id: None,
     });
 
     if success {
@@ -1667,6 +1670,16 @@ async fn chat_auth_token_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<AuthTokenRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    if let Some(ref thread_id) = req.thread_id
+        && crate::bridge::get_engine_pending_auth(&user.user_id, Some(thread_id))
+            .await
+            .is_some()
+    {
+        dispatch_engine_auth_resolution(&state, &user.user_id, thread_id, req.token.clone())
+            .await?;
+        return Ok(Json(ActionResponse::ok("Credential submitted.")));
+    }
+
     let ext_mgr = state.extension_manager.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Extension manager not available".to_string(),
@@ -1695,6 +1708,7 @@ async fn chat_auth_token_handler(
                         instructions: Some(result.message),
                         auth_url: None,
                         setup_url: None,
+                        thread_id: req.thread_id.clone(),
                     },
                 );
             } else if result.activated {
@@ -1707,6 +1721,7 @@ async fn chat_auth_token_handler(
                         extension_name: req.extension_name.clone(),
                         success: true,
                         message: result.message,
+                        thread_id: req.thread_id.clone(),
                     },
                 );
             } else {
@@ -1716,6 +1731,7 @@ async fn chat_auth_token_handler(
                         extension_name: req.extension_name.clone(),
                         success: false,
                         message: result.message,
+                        thread_id: req.thread_id.clone(),
                     },
                 );
             }
@@ -1758,6 +1774,7 @@ async fn chat_auth_token_handler(
                                         "Credential '{}' stored successfully.",
                                         req.extension_name
                                     ),
+                                    thread_id: req.thread_id.clone(),
                                 },
                             );
                             return Ok(Json(ActionResponse::ok(format!(
@@ -1788,6 +1805,7 @@ async fn chat_auth_token_handler(
                         instructions: Some(msg.clone()),
                         auth_url: None,
                         setup_url: None,
+                        thread_id: req.thread_id.clone(),
                     },
                 );
             }
@@ -1800,8 +1818,17 @@ async fn chat_auth_token_handler(
 async fn chat_auth_cancel_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
-    Json(_req): Json<AuthCancelRequest>,
+    Json(req): Json<AuthCancelRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    if let Some(ref thread_id) = req.thread_id
+        && crate::bridge::get_engine_pending_auth(&user.user_id, Some(thread_id))
+            .await
+            .is_some()
+    {
+        dispatch_engine_auth_resolution(&state, &user.user_id, thread_id, "cancel".into()).await?;
+        return Ok(Json(ActionResponse::ok("Auth cancelled")));
+    }
+
     clear_auth_mode(&state, &user.user_id).await;
     // Also clear engine v2 pending auth so the next message isn't consumed as a token.
     crate::bridge::clear_engine_pending_auth(&user.user_id).await;
@@ -1897,11 +1924,60 @@ struct HistoryQuery {
 }
 
 /// Check engine v2 pending auth state and return a PendingAuthInfo if active.
-async fn engine_pending_auth_info(user_id: &str) -> Option<PendingAuthInfo> {
-    let (cred_name, instructions) = crate::bridge::get_engine_pending_auth(user_id).await?;
+async fn engine_pending_auth_info(
+    user_id: &str,
+    thread_id: Option<&str>,
+) -> Option<PendingAuthInfo> {
+    let (request_id, cred_name, instructions) =
+        crate::bridge::get_engine_pending_auth(user_id, thread_id).await?;
     Some(PendingAuthInfo {
+        request_id,
         extension_name: cred_name,
         instructions,
+    })
+}
+
+async fn engine_pending_approval_info(
+    user_id: &str,
+    thread_id: Option<&str>,
+) -> Option<PendingApprovalInfo> {
+    let pending = crate::bridge::pending_approval_for_user_thread(user_id, thread_id)
+        .await
+        .ok()??;
+    Some(PendingApprovalInfo {
+        request_id: pending.request_id,
+        tool_name: pending.tool_name,
+        description: pending.description,
+        parameters: pending.parameters,
+    })
+}
+
+async fn dispatch_engine_auth_resolution(
+    state: &GatewayState,
+    user_id: &str,
+    thread_id: &str,
+    content: String,
+) -> Result<(), (StatusCode, String)> {
+    let tx = {
+        let tx_guard = state.msg_tx.read().await;
+        tx_guard
+            .as_ref()
+            .ok_or((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Channel not started".to_string(),
+            ))?
+            .clone()
+    };
+
+    let msg = IncomingMessage::new("gateway", user_id, content)
+        .with_thread(thread_id.to_string())
+        .into_internal();
+
+    tx.send(msg).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Channel closed".to_string(),
+        )
     })
 }
 
@@ -1942,6 +2018,8 @@ async fn chat_history_handler(
         sess.active_thread
             .ok_or((StatusCode::NOT_FOUND, "No active thread".to_string()))?
     };
+    let thread_id_str = thread_id.to_string();
+    let thread_scope = Some(thread_id_str.as_str());
 
     // Verify the thread belongs to the authenticated user before returning any data.
     // In-memory threads are already scoped by user via session_manager, but DB
@@ -1977,8 +2055,8 @@ async fn chat_history_handler(
             turns,
             has_more,
             oldest_timestamp,
-            pending_approval: None,
-            pending_auth: engine_pending_auth_info(&user.user_id).await,
+            pending_approval: engine_pending_approval_info(&user.user_id, thread_scope).await,
+            pending_auth: engine_pending_auth_info(&user.user_id, thread_scope).await,
         }));
     }
 
@@ -2018,14 +2096,19 @@ async fn chat_history_handler(
             })
             .collect();
 
-        let pending_approval = thread
-            .pending_approval
-            .as_ref()
-            .map(|pa| PendingApprovalInfo {
-                request_id: pa.request_id.to_string(),
-                tool_name: pa.tool_name.clone(),
-                description: pa.description.clone(),
-                parameters: serde_json::to_string_pretty(&pa.parameters).unwrap_or_default(),
+        let pending_approval = engine_pending_approval_info(&user.user_id, thread_scope)
+            .await
+            .or_else(|| {
+                thread
+                    .pending_approval
+                    .as_ref()
+                    .map(|pa| PendingApprovalInfo {
+                        request_id: pa.request_id.to_string(),
+                        tool_name: pa.tool_name.clone(),
+                        description: pa.description.clone(),
+                        parameters: serde_json::to_string_pretty(&pa.parameters)
+                            .unwrap_or_default(),
+                    })
             });
 
         return Ok(Json(HistoryResponse {
@@ -2034,7 +2117,7 @@ async fn chat_history_handler(
             has_more: false,
             oldest_timestamp: None,
             pending_approval,
-            pending_auth: engine_pending_auth_info(&user.user_id).await,
+            pending_auth: engine_pending_auth_info(&user.user_id, thread_scope).await,
         }));
     }
 
@@ -2053,8 +2136,8 @@ async fn chat_history_handler(
                 turns,
                 has_more,
                 oldest_timestamp,
-                pending_approval: None,
-                pending_auth: engine_pending_auth_info(&user.user_id).await,
+                pending_approval: engine_pending_approval_info(&user.user_id, thread_scope).await,
+                pending_auth: engine_pending_auth_info(&user.user_id, thread_scope).await,
             }));
         }
     }
@@ -2065,8 +2148,8 @@ async fn chat_history_handler(
         turns: Vec::new(),
         has_more: false,
         oldest_timestamp: None,
-        pending_approval: None,
-        pending_auth: engine_pending_auth_info(&user.user_id).await,
+        pending_approval: engine_pending_approval_info(&user.user_id, thread_scope).await,
+        pending_auth: engine_pending_auth_info(&user.user_id, thread_scope).await,
     }))
 }
 
@@ -2784,6 +2867,7 @@ async fn extensions_setup_submit_handler(
                         extension_name: name.clone(),
                         success: result.activated,
                         message: resp.message.clone(),
+                        thread_id: None,
                     },
                 );
             }
@@ -3795,6 +3879,7 @@ mod tests {
                 extension_name,
                 success,
                 message,
+                ..
             } => {
                 assert_eq!(extension_name, "test_tool");
                 assert!(!success, "expired OAuth flow should broadcast failure");

@@ -15,7 +15,7 @@ use crate::types::event::{EventKind, ThreadEvent};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
 
-use super::default_user_id;
+use super::{OwnerId, default_user_id};
 
 /// Strongly-typed thread identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -230,6 +230,14 @@ impl Thread {
     pub fn with_parent(mut self, parent_id: ThreadId) -> Self {
         self.parent_id = Some(parent_id);
         self
+    }
+
+    pub fn owner_id(&self) -> OwnerId<'_> {
+        OwnerId::from_user_id(&self.user_id)
+    }
+
+    pub fn is_owned_by(&self, user_id: &str) -> bool {
+        self.owner_id().matches_user(user_id)
     }
 
     /// Transition to a new state, recording an event.

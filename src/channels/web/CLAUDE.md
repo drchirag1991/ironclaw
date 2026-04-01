@@ -227,9 +227,9 @@ All responses include:
 
 **Request body limit:** 10 MB (`DefaultBodyLimit::max(10 * 1024 * 1024)`), sized for image uploads (#725). Larger payloads return 413.
 
-## Pending Approvals
+## Pending Gates
 
-Classic agent approvals are in-memory, but engine v2 approvals are mirrored into durable engine metadata. `HistoryResponse.pending_approval` should rehydrate from live session state first and then from engine metadata so approval cards survive thread switches and restart recovery.
+Classic agent approvals are in-memory, but engine v2 approval/auth pauses now live in the unified pending-gate store with file-backed recovery under `~/.ironclaw/pending-gates.json`. `HistoryResponse.pending_approval` and `pending_auth` should rehydrate from that store so cards survive thread switches, SSE reconnects, and process restarts. Auth/approval UI must remain thread-scoped: stale cards from another thread should not be rendered or resolved in the current thread.
 
 ## Adding a New API Endpoint
 

@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::types::project::ProjectId;
 use crate::types::thread::ThreadId;
 
-use super::default_user_id;
+use super::{OwnerId, default_user_id};
 
 /// Strongly-typed mission identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -151,6 +151,14 @@ impl Mission {
     pub fn with_success_criteria(mut self, criteria: impl Into<String>) -> Self {
         self.success_criteria = Some(criteria.into());
         self
+    }
+
+    pub fn owner_id(&self) -> OwnerId<'_> {
+        OwnerId::from_user_id(&self.user_id)
+    }
+
+    pub fn is_owned_by(&self, user_id: &str) -> bool {
+        self.owner_id().matches_user(user_id)
     }
 
     /// Record that a thread was spawned for this mission.

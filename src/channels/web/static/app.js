@@ -1634,6 +1634,11 @@ function showJobCard(data) {
 // --- Auth card ---
 
 function handleAuthRequired(data) {
+  if (data.thread_id && !isCurrentThread(data.thread_id)) {
+    unreadThreads.set(data.thread_id, (unreadThreads.get(data.thread_id) || 0) + 1);
+    debouncedLoadThreads();
+    return;
+  }
   setAuthFlowPending(true, data.instructions);
   if (data.auth_url || data.instructions) {
     // Token paste flow (with optional OAuth button): show the global auth
@@ -1649,6 +1654,10 @@ function handleAuthRequired(data) {
 }
 
 function handleAuthCompleted(data) {
+  if (data.thread_id && !isCurrentThread(data.thread_id)) {
+    debouncedLoadThreads();
+    return;
+  }
   showToast(data.message, data.success ? 'success' : 'error');
   // Dismiss only the matching extension's UI so stale prompts are cleared.
   removeAuthCard(data.extension_name);
@@ -1696,6 +1705,7 @@ function getConfigureOverlay(extensionName) {
 }
 
 function showAuthCard(data) {
+  if (data.thread_id && !isCurrentThread(data.thread_id)) return;
   // Keep a single global auth prompt so the experience is consistent across tabs.
   const existing = getAuthOverlay();
   if (existing) existing.remove();
@@ -1710,6 +1720,12 @@ function showAuthCard(data) {
   const card = document.createElement('div');
   card.className = 'auth-card auth-modal';
   card.setAttribute('data-extension-name', data.extension_name);
+  if (data.thread_id) {
+    card.setAttribute('data-thread-id', data.thread_id);
+  }
+  if (data.request_id) {
+    card.setAttribute('data-request-id', data.request_id);
+  }
 
   const header = document.createElement('div');
   header.className = 'auth-header';
@@ -1811,6 +1827,7 @@ function submitAuthToken(extensionName, tokenValue) {
 
   // Disable submit button while in flight
   const card = getAuthCard(extensionName);
+  const threadId = card ? card.getAttribute('data-thread-id') : null;
   if (card) {
     const btns = card.querySelectorAll('button');
     btns.forEach((b) => { b.disabled = true; });
@@ -1818,7 +1835,12 @@ function submitAuthToken(extensionName, tokenValue) {
 
   apiFetch('/api/chat/auth-token', {
     method: 'POST',
-    body: { extension_name: extensionName, token: tokenValue.trim() },
+    body: {
+      extension_name: extensionName,
+      token: tokenValue.trim(),
+      request_id: card ? card.getAttribute('data-request-id') : null,
+      thread_id: threadId || currentThreadId || undefined,
+    },
   }).then((result) => {
     if (result.success) {
       // Close immediately for responsiveness; the authoritative success UX
@@ -1834,9 +1856,15 @@ function submitAuthToken(extensionName, tokenValue) {
 }
 
 function cancelAuth(extensionName) {
+  const card = getAuthCard(extensionName);
+  const threadId = card ? card.getAttribute('data-thread-id') : null;
   apiFetch('/api/chat/auth-cancel', {
     method: 'POST',
-    body: { extension_name: extensionName },
+    body: {
+      extension_name: extensionName,
+      request_id: card ? card.getAttribute('data-request-id') : null,
+      thread_id: threadId || currentThreadId || undefined,
+    },
   }).catch(() => {});
   removeAuthCard(extensionName);
   setAuthFlowPending(false);
@@ -1929,9 +1957,15 @@ function loadHistory(before) {
           extension_name: data.pending_auth.extension_name,
           instructions: data.pending_auth.instructions,
           auth_url: null,
+          thread_id: currentThreadId,
         });
       } else {
         // No pending auth — ensure stale auth UI is cleaned up
+        const overlay = getAuthOverlay();
+        if (overlay && overlay.getAttribute('data-thread-id') && overlay.getAttribute('data-thread-id') !== currentThreadId) {
+          overlay.remove();
+        }
+        removeAuthCard();
         setAuthFlowPending(false);
       }
     } else {

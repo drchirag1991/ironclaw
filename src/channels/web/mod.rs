@@ -460,6 +460,7 @@ impl Channel for GatewayChannel {
                 instructions,
                 auth_url,
                 setup_url,
+                thread_id: None,
             },
             StatusUpdate::AuthCompleted {
                 extension_name,
@@ -469,6 +470,7 @@ impl Channel for GatewayChannel {
                 extension_name,
                 success,
                 message,
+                thread_id: None,
             },
             StatusUpdate::ImageGenerated { data_url, path } => AppEvent::ImageGenerated {
                 data_url,

@@ -184,7 +184,7 @@ impl ThreadManager {
 
         // Tenant isolation: verify the requesting user owns this thread.
         let uid: String = user_id.into();
-        if thread.user_id != uid {
+        if !thread.is_owned_by(&uid) {
             return Err(EngineError::AccessDenied {
                 user_id: uid,
                 entity: format!("thread {thread_id}"),
@@ -325,7 +325,7 @@ impl ThreadManager {
     pub async fn stop_thread(&self, thread_id: ThreadId, user_id: &str) -> Result<(), EngineError> {
         // Validate ownership before allowing stop.
         if let Some(thread) = self.store.load_thread(thread_id).await?
-            && thread.user_id != user_id
+            && !thread.is_owned_by(user_id)
         {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
@@ -361,7 +361,7 @@ impl ThreadManager {
     ) -> Result<(), EngineError> {
         // Validate ownership before allowing injection.
         if let Some(thread) = self.store.load_thread(thread_id).await?
-            && thread.user_id != user_id
+            && !thread.is_owned_by(user_id)
         {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),

@@ -398,6 +398,7 @@ fn sample_pending_gate(
         resume_kind,
         created_at: Utc::now(),
         expires_at: Utc::now() + chrono::Duration::minutes(30),
+        original_message: None,
     }
 }
 
@@ -533,6 +534,82 @@ async fn gate_paused_authentication_carries_credential_name() {
         }
         other => panic!("Expected GatePaused, got: {other:?}"),
     }
+}
+
+/// A paused thread remains resumable and completes after approval.
+#[tokio::test]
+async fn gate_paused_thread_resumes_to_completion() {
+    let project_id = ProjectId::new();
+    let effects = GateMockEffects::new(vec!["http".into()], vec![]);
+
+    let llm = ScriptedLlm::new(vec![
+        LlmOutput {
+            response: LlmResponse::ActionCalls {
+                calls: vec![ironclaw_engine::ActionCall {
+                    id: "call_1".into(),
+                    action_name: "http".into(),
+                    parameters: serde_json::json!({"url": "https://example.com"}),
+                }],
+                content: None,
+            },
+            usage: TokenUsage::default(),
+        },
+        LlmOutput {
+            response: LlmResponse::Text("done".into()),
+            usage: TokenUsage::default(),
+        },
+    ]);
+
+    let store = TestStore::new();
+    let mgr = ThreadManager::new(
+        llm,
+        effects.clone(),
+        store.clone() as Arc<dyn Store>,
+        Arc::new(make_caps(false)),
+        Arc::new(LeaseManager::new()),
+        Arc::new(PolicyEngine::new()),
+    );
+
+    let tid = mgr
+        .spawn_thread(
+            "make an http post",
+            ThreadType::Foreground,
+            project_id,
+            ThreadConfig::default(),
+            None,
+            "test-user",
+        )
+        .await
+        .expect("spawn_thread");
+
+    let first = mgr.join_thread(tid).await.expect("first join");
+    assert!(matches!(first, ThreadOutcome::GatePaused { .. }));
+    assert_eq!(
+        store.load_thread(tid).await.unwrap().unwrap().state,
+        ThreadState::Waiting
+    );
+
+    effects.mark_approved("http").await;
+    mgr.resume_thread(
+        tid,
+        "test-user",
+        Some(ThreadMessage::user("approved")),
+        Some(("call_gate_1".into(), true)),
+    )
+    .await
+    .expect("resume_thread");
+
+    let resumed = mgr.join_thread(tid).await.expect("second join");
+    assert!(matches!(resumed, ThreadOutcome::Completed { .. }));
+    let saved = store.load_thread(tid).await.unwrap().unwrap();
+    assert_eq!(saved.state, ThreadState::Done);
+    assert!(
+        saved.events.iter().any(|event| matches!(
+            event.kind,
+            ironclaw_engine::types::event::EventKind::ApprovalReceived { .. }
+        )),
+        "resume should record ApprovalReceived"
+    );
 }
 
 // ── Tests: PendingGateStore full lifecycle ────────────────────

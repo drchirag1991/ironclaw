@@ -52,6 +52,10 @@ pub struct PendingGate {
     pub created_at: DateTime<Utc>,
     /// When this pending state expires (fail-closed after expiry).
     pub expires_at: DateTime<Utc>,
+    /// Original user message to retry when the gate came from a fallback path
+    /// that completed instead of pausing the thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_message: Option<String>,
 }
 
 impl PendingGate {
@@ -113,6 +117,7 @@ mod tests {
             resume_kind: ResumeKind::Approval { allow_always: true },
             created_at: Utc::now(),
             expires_at: Utc::now() + Duration::seconds(expires_in_secs),
+            original_message: None,
         }
     }
 

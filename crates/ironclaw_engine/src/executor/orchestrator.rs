@@ -40,8 +40,9 @@ use crate::types::error::EngineError;
 use crate::types::event::{EventKind, ThreadEvent, summarize_params};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
+use crate::types::shared_owner_id;
 use crate::types::step::{StepId, TokenUsage};
-use crate::types::thread::Thread;
+use crate::types::thread::{Thread, ThreadState};
 
 use super::scripting::{execute_code, json_to_monty, monty_to_json, monty_to_string};
 
@@ -60,6 +61,25 @@ pub struct OrchestratorResult {
     pub outcome: ThreadOutcome,
     /// Total tokens used by LLM calls within the orchestrator.
     pub tokens_used: TokenUsage,
+}
+
+fn normalize_pause_outcome(
+    thread: &mut Thread,
+    outcome: &ThreadOutcome,
+) -> Result<(), EngineError> {
+    if matches!(
+        outcome,
+        ThreadOutcome::NeedApproval { .. }
+            | ThreadOutcome::NeedAuthentication { .. }
+            | ThreadOutcome::GatePaused { .. }
+    ) && thread.state != ThreadState::Waiting
+    {
+        thread.transition_to(
+            ThreadState::Waiting,
+            Some("waiting on external gate resolution".into()),
+        )?;
+    }
+    Ok(())
 }
 
 /// Resource limits for the orchestrator VM.
@@ -99,7 +119,7 @@ pub async fn load_orchestrator(
         return (DEFAULT_ORCHESTRATOR.to_string(), 0);
     };
 
-    let docs = match store.list_memory_docs(project_id, "system").await {
+    let docs = match store.list_shared_memory_docs(project_id).await {
         Ok(d) => d,
         Err(_) => {
             debug!("using compiled-in default orchestrator (v0, store error)");
@@ -192,7 +212,7 @@ pub async fn record_orchestrator_failure(
 ) {
     use crate::types::memory::{DocType, MemoryDoc};
 
-    let docs = match store.list_memory_docs(project_id, "system").await {
+    let docs = match store.list_shared_memory_docs(project_id).await {
         Ok(docs) => docs,
         Err(e) => {
             debug!("failed to list memory docs for failure tracker: {e}");
@@ -206,7 +226,7 @@ pub async fn record_orchestrator_failure(
     } else {
         MemoryDoc::new(
             project_id,
-            "system",
+            shared_owner_id(),
             DocType::Note,
             FAILURE_TRACKER_TITLE,
             "",
@@ -243,7 +263,7 @@ pub async fn record_orchestrator_failure(
 /// Reset the failure counter (called after successful execution).
 pub async fn reset_orchestrator_failures(store: &Arc<dyn Store>, project_id: ProjectId) {
     let docs = store
-        .list_memory_docs(project_id, "system")
+        .list_shared_memory_docs(project_id)
         .await
         .unwrap_or_default();
     let existing = docs.iter().find(|d| d.title == FAILURE_TRACKER_TITLE);
@@ -341,8 +361,10 @@ pub async fn execute_orchestrator(
                 } else {
                     monty_to_json(&obj)
                 };
+                let outcome = parse_outcome(&result);
+                normalize_pause_outcome(thread, &outcome)?;
                 return Ok(OrchestratorResult {
-                    outcome: parse_outcome(&result),
+                    outcome,
                     tokens_used: total_tokens,
                 });
             }
@@ -2388,9 +2410,29 @@ mod tests {
         // Switch to version 2 — count should reset to 1
         record_orchestrator_failure(&store, project_id, 2).await;
 
-        let docs = store.list_memory_docs(project_id, "system").await.unwrap();
+        let docs = store.list_shared_memory_docs(project_id).await.unwrap();
         let count = load_failure_count(&docs);
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn normalize_pause_outcome_transitions_thread_to_waiting() {
+        let mut thread = Thread::new(
+            "goal",
+            crate::types::thread::ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            crate::types::thread::ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+
+        let outcome = ThreadOutcome::NeedApproval {
+            action_name: "shell".into(),
+            call_id: "call-1".into(),
+            parameters: serde_json::json!({"cmd":"ls"}),
+        };
+        normalize_pause_outcome(&mut thread, &outcome).unwrap();
+        assert_eq!(thread.state, ThreadState::Waiting);
     }
 
     #[test]
