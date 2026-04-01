@@ -607,7 +607,7 @@ pub fn spawn_multi_user_heartbeat(
                 let hyg = hygiene_config.clone();
                 let llm_clone = llm.clone();
                 let tx = response_tx.clone();
-                let admin = store.clone();
+                let system_store = store.clone();
 
                 join_set.spawn(async move {
                     // Run memory hygiene per user (same as single-user heartbeat)
@@ -626,7 +626,7 @@ pub fn spawn_multi_user_heartbeat(
                     if let Some(tx) = tx {
                         runner = runner.with_response_channel(tx);
                     }
-                    runner = runner.with_store(admin);
+                    runner = runner.with_store(system_store);
 
                     let result = runner.check_heartbeat().await;
                     if let HeartbeatResult::NeedsAttention(msg) = &result {
