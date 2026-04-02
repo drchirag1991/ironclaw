@@ -2408,7 +2408,6 @@ mod tests {
                 secret_name: "google_oauth_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["www.googleapis.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
 
@@ -2455,7 +2454,6 @@ mod tests {
                 secret_name: "google_oauth_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["www.googleapis.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
 
@@ -2503,7 +2501,6 @@ mod tests {
                 secret_name: "google_oauth_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["www.googleapis.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
 
@@ -2541,7 +2538,6 @@ mod tests {
                 secret_name: "missing_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["api.example.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
 
@@ -2585,7 +2581,6 @@ mod tests {
                 secret_name: "google_oauth_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["www.googleapis.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
 
@@ -2644,7 +2639,6 @@ mod tests {
                 secret_name: "my_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["api.example.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
 
@@ -2687,7 +2681,6 @@ mod tests {
                 secret_name: "google_oauth_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["www.googleapis.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
 
@@ -2754,7 +2747,6 @@ mod tests {
                 secret_name: "google_oauth_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["www.googleapis.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
 
@@ -2864,7 +2856,6 @@ mod tests {
                 secret_name: "google_oauth_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["www.googleapis.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
 
@@ -2932,7 +2923,6 @@ mod tests {
                 secret_name: "google_oauth_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["www.googleapis.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
 
@@ -3163,7 +3153,6 @@ mod tests {
                 secret_name: "google_oauth_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["sheets.googleapis.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
         let caps = Capabilities {
@@ -3197,7 +3186,6 @@ mod tests {
                 secret_name: "google_oauth_token".to_string(),
                 location: CredentialLocation::AuthorizationBearer,
                 host_patterns: vec!["sheets.googleapis.com".to_string()],
-                path_patterns: Vec::new(),
             },
         );
         Capabilities {

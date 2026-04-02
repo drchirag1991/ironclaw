@@ -271,7 +271,6 @@ mod tests {
             secret_name: "EXAMPLE_KEY".to_string(),
             location: CredentialLocation::AuthorizationBearer,
             host_patterns: vec!["*.example.com".to_string()],
-            path_patterns: Vec::new(),
         }];
         let decider = DefaultPolicyDecider::new(allowlist, credentials);
 
