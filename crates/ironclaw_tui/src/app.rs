@@ -609,6 +609,18 @@ async fn handle_event(
                         } else if state.search.current_match >= state.search.match_count {
                             state.search.current_match = state.search.match_count - 1;
                         }
+                    } else if key.code == KeyCode::Backspace
+                        && widgets.input_box.is_empty()
+                        && !state.pending_attachments.is_empty()
+                    {
+                        let removed = state.pending_attachments.pop();
+                        if let Some(att) = removed {
+                            state.toasts.push(Toast {
+                                message: format!("Removed: {}", att.label),
+                                kind: ToastKind::Info,
+                                created_at: chrono::Utc::now(),
+                            });
+                        }
                     } else {
                         widgets.input_box.handle_key(key, state);
                         // Update command palette visibility based on input content

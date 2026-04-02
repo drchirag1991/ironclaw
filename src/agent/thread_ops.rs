@@ -458,6 +458,33 @@ impl Agent {
             None => (content, Vec::new()),
         };
 
+        // Warn if images are attached but the model likely doesn't support vision
+        if !image_parts.is_empty() {
+            let model_name = self.llm().model_name();
+            tracing::debug!(
+                model = %model_name,
+                image_count = image_parts.len(),
+                "Sending image content parts to LLM"
+            );
+            if !crate::llm::vision_models::is_vision_model(model_name) {
+                tracing::warn!(
+                    model = %model_name,
+                    "Image attachments sent to a model that may not support vision"
+                );
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::Status(format!(
+                            "Warning: model '{}' may not support image analysis",
+                            model_name
+                        )),
+                        &message.metadata,
+                    )
+                    .await;
+            }
+        }
+
         // Start the turn and get messages
         let turn_messages = {
             let mut sess = session.lock().await;
