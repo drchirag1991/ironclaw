@@ -6,8 +6,8 @@
 use tokio::sync::RwLock;
 
 use crate::extensions::{
-    naming::canonicalize_extension_name,
     AuthHint, ExtensionKind, ExtensionSource, RegistryEntry, ResultSource, SearchResult,
+    naming::canonicalize_extension_name,
 };
 
 /// Curated extension registry with fuzzy search.

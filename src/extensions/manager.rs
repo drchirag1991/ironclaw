@@ -18,10 +18,10 @@ use crate::channels::{ChannelManager, OutgoingResponse};
 use crate::extensions::discovery::OnlineDiscovery;
 use crate::extensions::registry::ExtensionRegistry;
 use crate::extensions::{
-    naming::{canonicalize_extension_name, legacy_extension_alias},
     ActivateResult, AuthResult, ConfigureResult, ExtensionError, ExtensionKind, ExtensionSource,
     InstallResult, InstalledExtension, RegistryEntry, ResultSource, SearchResult, ToolAuthState,
     UpgradeOutcome, UpgradeResult, VerificationChallenge,
+    naming::{canonicalize_extension_name, legacy_extension_alias},
 };
 use crate::hooks::HookRegistry;
 use crate::pairing::PairingStore;
@@ -1701,8 +1701,8 @@ impl ExtensionManager {
                     .unregister_hook_prefix(&format!("plugin.tool:{}::", name))
                     .await
                     + self
-                    .unregister_hook_prefix(&format!("plugin.dev_tool:{}::", name))
-                    .await;
+                        .unregister_hook_prefix(&format!("plugin.dev_tool:{}::", name))
+                        .await;
                 if removed_hooks > 0 {
                     tracing::info!(
                         extension = name,
@@ -5074,7 +5074,11 @@ impl ExtensionManager {
             return Ok(ExtensionKind::ChannelRelay);
         }
         if let Some(ref legacy_name) = legacy_name
-            && self.installed_relay_extensions.read().await.contains(legacy_name)
+            && self
+                .installed_relay_extensions
+                .read()
+                .await
+                .contains(legacy_name)
         {
             return Ok(ExtensionKind::ChannelRelay);
         }

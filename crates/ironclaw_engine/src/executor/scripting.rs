@@ -1246,6 +1246,7 @@ async fn handle_llm_query_batched_standalone(
 // ── Future resolution helpers ───────────────────────────────
 
 /// Resolve a pending tool execution future.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_tool_future(
     handle: tokio::task::JoinHandle<Result<ActionResult, EngineError>>,
     action_name: &str,
