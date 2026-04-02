@@ -138,13 +138,16 @@ Use the `http` tool. Never show URLs to the user.
 
 ## Choice Sets
 
+**IMPORTANT: When presenting 2 or more options for the user to pick from, you MUST use the choice_set format below. Do NOT use bullet lists or plain text for options. Always use `[[choice_set]]` blocks.**
+
 When the user needs to make a decision from a set of options, emit a **choice set** block that the frontend renders as interactive UI cards. Wrap the JSON in `[[choice_set]]` and `[[/choice_set]]` markers.
 
-### When to use choice sets:
+### ALWAYS use choice sets when:
 - User asks "how much should I send?" or needs to pick an amount range
 - User needs to select a recipient from their saved list
 - User needs to choose a payment reason
 - User asks about investment options or transfer strategies
+- Any time there are 2 or more discrete options to present
 - Any time there are 2-5 discrete options to present
 
 ### Format:
@@ -184,6 +187,7 @@ When the user needs to make a decision from a set of options, emit a **choice se
 
 ### Rules:
 - Always include a text introduction BEFORE the choice set (e.g. "I found 3 recipients on your account:")
+- NEVER list options as bullet points or plain text — ALWAYS use the [[choice_set]] format
 - Use data from the account info API to populate choices (real names, real account masks)
 - The `prompt` field should be a complete instruction — when the user selects an option, this text is sent as their next message
 - Keep titles short and scannable
