@@ -522,11 +522,12 @@ fn handle_message_event(event_data: &serde_json::Value) {
             channel_host::workspace_read(DM_POLICY_PATH).unwrap_or_else(|| "pairing".to_string());
 
         if dm_policy == "pairing" {
-            let sender_name = sender_id.to_string();
-            match channel_host::pairing_is_allowed("feishu", sender_id, Some(&sender_name)) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // Upsert a pairing request.
+            match channel_host::pairing_resolve_identity("feishu", sender_id) {
+                Ok(Some(_owner_id)) => {
+                    // Sender is paired; proceed with the message.
+                }
+                Ok(None) => {
+                    // Unknown sender — upsert a pairing request.
                     let meta = serde_json::json!({
                         "sender_id": sender_id,
                         "chat_id": msg_event.message.chat_id,

@@ -284,13 +284,14 @@ fn instantiate_channel_component(
         })
         .map_err(|e| format!("stub 'pairing-upsert-request': {e}"))?;
 
-        host.func_new("pairing-is-allowed", |_ctx, _args, results| {
-            results[0] = wasmtime::component::Val::Result(Err(Some(Box::new(
-                wasmtime::component::Val::String("stub".into()),
+        host.func_new("pairing-resolve-identity", |_ctx, _args, results| {
+            // Test stub: unknown sender — returns Ok(None).
+            results[0] = wasmtime::component::Val::Result(Ok(Some(Box::new(
+                wasmtime::component::Val::Option(None),
             ))));
             Ok(())
         })
-        .map_err(|e| format!("stub 'pairing-is-allowed': {e}"))?;
+        .map_err(|e| format!("stub 'pairing-resolve-identity': {e}"))?;
 
         host.func_new("pairing-read-allow-from", |_ctx, _args, results| {
             results[0] = wasmtime::component::Val::Result(Err(Some(Box::new(

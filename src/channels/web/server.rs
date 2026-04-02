@@ -402,6 +402,8 @@ pub struct GatewayState {
     pub secrets_store: Option<Arc<dyn crate::secrets::SecretsStore + Send + Sync>>,
     /// DB auth cache for invalidation on security-critical actions.
     pub db_auth: Option<Arc<crate::channels::web::auth::DbAuthenticator>>,
+    /// Shared pairing store (one instance per server, not per request).
+    pub pairing_store: Option<Arc<crate::pairing::PairingStore>>,
 }
 
 /// Start the gateway HTTP server.
@@ -2681,12 +2683,10 @@ async fn pairing_list_handler(
     State(state): State<Arc<GatewayState>>,
     Path(channel): Path<String>,
 ) -> Result<Json<PairingListResponse>, (StatusCode, String)> {
-    let db = state.store.as_ref().ok_or((
+    let store = state.pairing_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
+        "Pairing store not available".to_string(),
     ))?;
-    let cache = Arc::new(crate::ownership::OwnershipCache::new());
-    let store = crate::pairing::PairingStore::new(Arc::clone(db), cache);
     let requests: Vec<crate::db::PairingRequestRecord> = store
         .list_pending(&channel)
         .await
@@ -2714,12 +2714,10 @@ async fn pairing_approve_handler(
     Path(_channel): Path<String>,
     Json(req): Json<PairingApproveRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let db = state.store.as_ref().ok_or((
+    let store = state.pairing_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
-        "Database not available".to_string(),
+        "Pairing store not available".to_string(),
     ))?;
-    let cache = Arc::new(crate::ownership::OwnershipCache::new());
-    let store = crate::pairing::PairingStore::new(Arc::clone(db), cache);
     let owner_id = crate::ownership::OwnerId::from(user.user_id.clone());
     match store.approve(&req.code, &owner_id).await {
         Ok(()) => Ok(Json(ActionResponse::ok("Pairing approved.".to_string()))),
@@ -3055,6 +3053,7 @@ mod tests {
             active_config: ActiveConfigSnapshot::default(),
             secrets_store: None,
             db_auth: None,
+            pairing_store: None,
         })
     }
 
