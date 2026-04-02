@@ -354,30 +354,45 @@ impl Database for LibSqlBackend {
         conn.execute("BEGIN", ())
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
-        let tables = [
-            "conversations",
-            "memory_documents",
-            "heartbeat_state",
-            "secrets",
-            "wasm_tools",
-            "routines",
-            "settings",
-            "agent_jobs",
-        ];
-        for table in &tables {
-            conn.execute(
-                &format!("UPDATE {} SET user_id = ?1 WHERE user_id = 'default'", table),
-                libsql::params![owner_id],
-            )
-            .await
-            .map_err(|e| {
-                DatabaseError::Query(format!("migrate_default_owner {table}: {e}"))
-            })?;
+
+        let result = async {
+            let tables = [
+                "conversations",
+                "memory_documents",
+                "heartbeat_state",
+                "secrets",
+                "wasm_tools",
+                "dynamic_tools",
+                "routines",
+                "settings",
+                "agent_jobs",
+            ];
+            for table in &tables {
+                conn.execute(
+                    &format!("UPDATE {} SET user_id = ?1 WHERE user_id = 'default'", table),
+                    libsql::params![owner_id],
+                )
+                .await
+                .map_err(|e| {
+                    DatabaseError::Query(format!("migrate_default_owner {table}: {e}"))
+                })?;
+            }
+            Ok::<(), DatabaseError>(())
         }
-        conn.execute("COMMIT", ())
-            .await
-            .map_err(|e| DatabaseError::Query(e.to_string()))?;
-        Ok(())
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ())
+                    .await
+                    .map_err(|e| DatabaseError::Query(e.to_string()))?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 }
 

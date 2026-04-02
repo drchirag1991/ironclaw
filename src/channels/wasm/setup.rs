@@ -35,6 +35,7 @@ pub async fn setup_wasm_channels(
     extension_manager: Option<&Arc<ExtensionManager>>,
     database: Option<&Arc<dyn Database>>,
     registered_channel_names: &[String],
+    ownership_cache: Arc<crate::ownership::OwnershipCache>,
 ) -> Option<WasmChannelSetup> {
     let runtime = match WasmChannelRuntime::new(WasmChannelRuntimeConfig::default()) {
         Ok(r) => Arc::new(r),
@@ -45,7 +46,6 @@ pub async fn setup_wasm_channels(
     };
 
     let pairing_store = if let Some(db) = database {
-        let ownership_cache = Arc::new(crate::ownership::OwnershipCache::new());
         Arc::new(PairingStore::new(Arc::clone(db), ownership_cache))
     } else {
         tracing::warn!("No database available for WASM channels; DM pairing will not persist");

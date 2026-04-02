@@ -1,8 +1,10 @@
 //! DB-backed pairing store.
 //!
 //! Replaces the file-based `~/.ironclaw/{channel}-pairing.json` store.
-//! Delegates to the `ChannelPairingStore` DB sub-trait and writes through
-//! to `OwnershipCache` on approval.
+//! Delegates to the `ChannelPairingStore` DB sub-trait. `insert` and `remove`
+//! update `OwnershipCache` immediately (write-through); `approve` populates the
+//! cache lazily on the next `resolve_identity` call because the channel and
+//! external_id are not available at approval time.
 //!
 //! When no database is available (the `db` field is `None`), all mutation
 //! operations are no-ops and reads return empty/not-found. This preserves the
@@ -18,6 +20,8 @@ use crate::ownership::{Identity, OwnerId, OwnershipCache};
 /// Pairing operations: create pending requests, approve them, resolve identities.
 ///
 /// Wraps `ChannelPairingStore` (DB operations) with `OwnershipCache` (warm-path reads).
+/// Write-through: `insert` and `remove` update the cache immediately.
+/// `approve` populates lazily on next `resolve_identity` call.
 /// When `db` is `None`, all operations degrade gracefully (no-ops / empty results).
 #[derive(Clone)]
 pub struct PairingStore {

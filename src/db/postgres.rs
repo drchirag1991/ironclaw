@@ -79,6 +79,7 @@ impl Database for PgBackend {
             "heartbeat_state",
             "secrets",
             "wasm_tools",
+            "dynamic_tools",
             "routines",
             "settings",
             "agent_jobs",
