@@ -258,6 +258,44 @@ except Exception as e:
 print()
 
 # -----------------------------------------------------------
+# 6. Choice set: payment reason
+# -----------------------------------------------------------
+print("--- 6. Choice set: payment reason ---")
+try:
+    response = client.responses.create(
+        model="default",
+        input="I want to send $500 to India. What payment reasons can I choose from?",
+    )
+    check("status completed", response.status == "completed", f"status={response.status}")
+
+    agent_text = extract_agent_text(response)
+    print(f"  Agent response ({len(agent_text)} chars): {agent_text[:400]}")
+
+    has_choice_set = "[[choice_set]]" in agent_text and "[[/choice_set]]" in agent_text
+    check("contains choice_set markers", has_choice_set,
+          "no [[choice_set]]...[[/choice_set]] block found")
+
+    if has_choice_set:
+        import json as json_mod
+        start = agent_text.index("[[choice_set]]") + len("[[choice_set]]")
+        end = agent_text.index("[[/choice_set]]")
+        raw = agent_text[start:end].strip()
+        try:
+            cs = json_mod.loads(raw)
+            check("valid JSON", True)
+            check("has type", cs.get("type") == "choice_set")
+            check("has items", len(cs.get("items", [])) >= 2,
+                  f"items: {len(cs.get('items', []))}")
+            for item in cs.get("items", []):
+                check(f"item '{item.get('id','')}' has prompt",
+                      bool(item.get("prompt")))
+        except Exception as e:
+            check("valid JSON", False, str(e))
+except Exception as e:
+    check("request succeeded", False, str(e))
+print()
+
+# -----------------------------------------------------------
 # Summary
 # -----------------------------------------------------------
 print(f"=== Results: {passed} passed, {failed} failed ===")
