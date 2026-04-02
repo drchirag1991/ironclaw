@@ -6,10 +6,10 @@
 //! cache lazily on the next `resolve_identity` call because the channel and
 //! external_id are not available at approval time.
 //!
-//! When no database is available (the `db` field is `None`), all mutation
-//! operations are no-ops and reads return empty/not-found. This preserves the
-//! ability to run WASM channels without a persistent DB while clearly logging
-//! that pairing is unavailable.
+//! When no database is available (the `db` field is `None`), the store operates
+//! in noop mode: writes silently succeed (returning dummy records where needed)
+//! and reads return empty/not-found. This preserves the ability to run WASM
+//! channels without a persistent DB.
 
 use std::sync::Arc;
 
@@ -68,6 +68,7 @@ impl PairingStore {
     }
 
     /// Create or refresh a pending pairing request for an unknown sender.
+    /// In noop mode, returns a dummy record with a generated code.
     pub async fn upsert_request(
         &self,
         channel: &str,
@@ -75,23 +76,32 @@ impl PairingStore {
         meta: Option<serde_json::Value>,
     ) -> Result<PairingRequestRecord, DatabaseError> {
         let Some(ref db) = self.db else {
-            return Err(DatabaseError::Query(
-                "pairing unavailable: no database configured".to_string(),
-            ));
+            return Ok(PairingRequestRecord {
+                id: uuid::Uuid::new_v4(),
+                channel: channel.to_string(),
+                external_id: external_id.to_string(),
+                code: crate::db::generate_pairing_code(),
+                created: true,
+                created_at: chrono::Utc::now(),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(15),
+            });
         };
         db.upsert_pairing_request(channel, external_id, meta).await
     }
 
     /// Approve a pairing code, mapping `(channel, external_id)` → `owner_id`.
-    /// Updates DB atomically. Cache is populated on next `resolve_identity` call
-    /// (we don't know channel/external_id here, so lazy cache population is correct).
-    pub async fn approve(&self, code: &str, owner_id: &OwnerId) -> Result<(), DatabaseError> {
+    /// Updates DB atomically. Cache is populated on next `resolve_identity` call.
+    /// In noop mode, silently succeeds.
+    pub async fn approve(
+        &self,
+        channel: &str,
+        code: &str,
+        owner_id: &OwnerId,
+    ) -> Result<(), DatabaseError> {
         let Some(ref db) = self.db else {
-            return Err(DatabaseError::Query(
-                "pairing unavailable: no database configured".to_string(),
-            ));
+            return Ok(());
         };
-        db.approve_pairing(code, owner_id.as_str()).await
+        db.approve_pairing(channel, code, owner_id.as_str()).await
     }
 
     /// List pending pairing requests (for CLI and web UI display).

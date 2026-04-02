@@ -83,7 +83,7 @@ mod tests {
         );
 
         // 4. Approve via code
-        store.approve(&r1.code, &owner_id).await.unwrap();
+        store.approve(channel, &r1.code, &owner_id).await.unwrap();
 
         // 5. User identity now resolves
         let identity = store.resolve_identity(channel, "user_12345").await.unwrap();
@@ -137,7 +137,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = store.approve("INVALID1", &owner_id).await;
+        let result = store.approve("telegram", "INVALID1", &owner_id).await;
         assert!(result.is_err());
 
         let result = run_pairing_command_with_store(
@@ -169,7 +169,10 @@ mod tests {
         assert_eq!(store.list_pending("slack").await.unwrap().len(), 1);
 
         // Approve in one channel doesn't affect the other
-        store.approve(&r_telegram.code, &owner_id).await.unwrap();
+        store
+            .approve("telegram", &r_telegram.code, &owner_id)
+            .await
+            .unwrap();
         assert!(
             store
                 .resolve_identity("telegram", "user_a")
@@ -185,7 +188,10 @@ mod tests {
                 .is_none()
         );
 
-        store.approve(&r_slack.code, &owner_id).await.unwrap();
+        store
+            .approve("slack", &r_slack.code, &owner_id)
+            .await
+            .unwrap();
         assert!(
             store
                 .resolve_identity("slack", "user_b")

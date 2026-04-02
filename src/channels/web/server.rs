@@ -2711,7 +2711,7 @@ async fn pairing_list_handler(
 async fn pairing_approve_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
-    Path(_channel): Path<String>,
+    Path(channel): Path<String>,
     Json(req): Json<PairingApproveRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
     let store = state.pairing_store.as_ref().ok_or((
@@ -2719,7 +2719,7 @@ async fn pairing_approve_handler(
         "Pairing store not available".to_string(),
     ))?;
     let owner_id = crate::ownership::OwnerId::from(user.user_id.clone());
-    match store.approve(&req.code, &owner_id).await {
+    match store.approve(&channel, &req.code, &owner_id).await {
         Ok(()) => Ok(Json(ActionResponse::ok("Pairing approved.".to_string()))),
         Err(e) => Ok(Json(ActionResponse::fail(e.to_string()))),
     }

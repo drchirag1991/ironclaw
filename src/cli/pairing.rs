@@ -40,6 +40,23 @@ pub async fn run_pairing_command(cmd: PairingCommand) -> Result<(), anyhow::Erro
         .await
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
+    // Ensure owner user row exists before approval (FK on channel_identities.owner_id).
+    // Best-effort: don't block CLI if the upsert fails (e.g. read-only replica).
+    db.get_or_create_user(crate::db::UserRecord {
+        id: config.owner_id.clone(),
+        role: "admin".to_string(),
+        display_name: "Owner".to_string(),
+        status: "active".to_string(),
+        email: None,
+        last_login_at: None,
+        created_by: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        metadata: serde_json::Value::Object(Default::default()),
+    })
+    .await
+    .ok();
+
     let cache = std::sync::Arc::new(crate::ownership::OwnershipCache::new());
     let store = crate::pairing::PairingStore::new(db, cache);
     let owner_id = crate::ownership::OwnerId::from(config.owner_id.clone());
@@ -107,12 +124,12 @@ async fn run_list(
 
 async fn run_approve(
     store: &crate::pairing::PairingStore,
-    _channel: &str,
+    channel: &str,
     code: &str,
     owner_id: &crate::ownership::OwnerId,
 ) -> Result<(), anyhow::Error> {
     let _: () = store
-        .approve(code, owner_id)
+        .approve(channel, code, owner_id)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to approve pairing: {}", e))?;
     println!("Pairing approved.");

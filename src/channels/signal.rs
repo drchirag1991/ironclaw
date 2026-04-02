@@ -199,8 +199,8 @@ impl SignalChannel {
         let store = Arc::clone(&self.pairing_store);
         let sender_owned = sender.to_string();
         let result: Result<Option<crate::ownership::Identity>, crate::error::DatabaseError> =
-            // SAFETY: block_in_place requires a multi-thread Tokio runtime. WASM channel
-            // callbacks are always invoked from a multi-thread runtime worker thread.
+            // SAFETY: block_in_place requires a multi-thread Tokio runtime.
+            // Signal channel message processing runs on a multi-thread runtime worker thread.
             // Do NOT use this pattern in #[tokio::test] (which uses current_thread by default).
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
@@ -223,8 +223,8 @@ impl SignalChannel {
         let meta_clone = meta.clone();
 
         let result: Result<crate::db::PairingRequestRecord, crate::error::DatabaseError> =
-            // SAFETY: block_in_place requires a multi-thread Tokio runtime. WASM channel
-            // callbacks are always invoked from a multi-thread runtime worker thread.
+            // SAFETY: block_in_place requires a multi-thread Tokio runtime.
+            // Signal channel message processing runs on a multi-thread runtime worker thread.
             // Do NOT use this pattern in #[tokio::test] (which uses current_thread by default).
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async move {
@@ -239,12 +239,7 @@ impl SignalChannel {
                     code = %req.code,
                     "Signal: pairing request upserted"
                 );
-                // Send pairing reply if this is a fresh request (created_at is recent).
-                let is_new = chrono::Utc::now()
-                    .signed_duration_since(req.created_at)
-                    .num_seconds()
-                    .unsigned_abs()
-                    < 2;
+                let is_new = req.created;
                 if is_new {
                     let message = format!(
                         "To pair with this bot, run: `ironclaw pairing approve signal {}`",
