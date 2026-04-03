@@ -33,7 +33,7 @@ use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::IncomingMessage;
 use crate::channels::relay::DEFAULT_RELAY_NAME;
 use crate::channels::web::auth::{
-    AuthenticatedUser, CombinedAuthState, UserIdentity, auth_middleware,
+    AdminUser, AuthenticatedUser, CombinedAuthState, UserIdentity, auth_middleware,
 };
 use crate::channels::web::handlers::jobs::{
     job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
@@ -2766,7 +2766,7 @@ async fn extensions_setup_submit_handler(
 
 async fn pairing_list_handler(
     State(state): State<Arc<GatewayState>>,
-    AuthenticatedUser(_user): AuthenticatedUser,
+    AdminUser(_user): AdminUser,
     Path(channel): Path<String>,
 ) -> Result<Json<PairingListResponse>, (StatusCode, String)> {
     let store = state.pairing_store.as_ref().ok_or((
@@ -2804,12 +2804,21 @@ async fn pairing_approve_handler(
     Path(channel): Path<String>,
     Json(req): Json<PairingApproveRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let flow = crate::pairing::PairingCodeChallenge::new(&channel);
+    let Some(code) =
+        crate::code_challenge::CodeChallengeFlow::normalize_submission(&flow, &req.code)
+    else {
+        return Ok(Json(ActionResponse::fail(
+            "Pairing code is required.".to_string(),
+        )));
+    };
+
     let store = state.pairing_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Pairing store not available".to_string(),
     ))?;
     let owner_id = crate::ownership::OwnerId::from(user.user_id.clone());
-    match store.approve(&channel, &req.code, &owner_id).await {
+    match store.approve(&channel, &code, &owner_id).await {
         Ok(()) => Ok(Json(ActionResponse::ok("Pairing approved.".to_string()))),
         Err(crate::error::DatabaseError::NotFound { .. }) => Ok(Json(ActionResponse::fail(
             "Invalid or expired pairing code.".to_string(),
@@ -3119,8 +3128,13 @@ mod tests {
 
     // --- OAuth callback handler tests ---
 
-    /// Build a minimal `GatewayState` for testing the OAuth callback handler.
-    fn test_gateway_state(ext_mgr: Option<Arc<ExtensionManager>>) -> Arc<GatewayState> {
+    /// Build a minimal `GatewayState` for handler tests.
+    fn test_gateway_state_with_dependencies(
+        ext_mgr: Option<Arc<ExtensionManager>>,
+        store: Option<Arc<dyn Database>>,
+        db_auth: Option<Arc<crate::channels::web::auth::DbAuthenticator>>,
+        pairing_store: Option<Arc<crate::pairing::PairingStore>>,
+    ) -> Arc<GatewayState> {
         Arc::new(GatewayState {
             msg_tx: tokio::sync::RwLock::new(None),
             sse: Arc::new(SseManager::new()),
@@ -3131,7 +3145,7 @@ mod tests {
             log_level_handle: None,
             extension_manager: ext_mgr,
             tool_registry: None,
-            store: None,
+            store,
             job_manager: None,
             prompt_queue: None,
             owner_id: "test".to_string(),
@@ -3150,8 +3164,8 @@ mod tests {
             startup_time: std::time::Instant::now(),
             active_config: ActiveConfigSnapshot::default(),
             secrets_store: None,
-            db_auth: None,
-            pairing_store: None,
+            db_auth,
+            pairing_store,
             oauth_providers: None,
             oauth_state_store: None,
             oauth_base_url: None,
@@ -3163,11 +3177,313 @@ mod tests {
         })
     }
 
+    fn test_gateway_state(ext_mgr: Option<Arc<ExtensionManager>>) -> Arc<GatewayState> {
+        test_gateway_state_with_dependencies(ext_mgr, None, None, None)
+    }
+
     /// Build a test router with just the OAuth callback route.
     fn test_oauth_router(state: Arc<GatewayState>) -> Router {
         Router::new()
             .route("/oauth/callback", get(oauth_callback_handler))
             .with_state(state)
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn insert_test_user(db: &Arc<dyn Database>, id: &str, role: &str) {
+        db.get_or_create_user(crate::db::UserRecord {
+            id: id.to_string(),
+            role: role.to_string(),
+            display_name: id.to_string(),
+            status: "active".to_string(),
+            email: None,
+            last_login_at: None,
+            created_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            metadata: serde_json::Value::Null,
+        })
+        .await
+        .expect("create test user");
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn make_pairing_test_state() -> (
+        Arc<GatewayState>,
+        Arc<dyn Database>,
+        Arc<crate::pairing::PairingStore>,
+        tempfile::TempDir,
+    ) {
+        let (db, tmp) = crate::testing::test_db().await;
+        insert_test_user(&db, "admin-1", "admin").await;
+        insert_test_user(&db, "member-1", "member").await;
+        let pairing_store = Arc::new(crate::pairing::PairingStore::new(
+            Arc::clone(&db),
+            Arc::new(crate::ownership::OwnershipCache::new()),
+        ));
+        let state = test_gateway_state_with_dependencies(
+            None,
+            Some(Arc::clone(&db)),
+            None,
+            Some(Arc::clone(&pairing_store)),
+        );
+        (state, db, pairing_store, tmp)
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_pairing_list_requires_admin_role() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (state, _db, pairing_store, _tmp) = make_pairing_test_state().await;
+        pairing_store
+            .upsert_request("telegram", "tg-user-1", None)
+            .await
+            .expect("create pairing request");
+
+        let app = Router::new()
+            .route("/api/pairing/{channel}", get(pairing_list_handler))
+            .with_state(state);
+
+        let mut member_req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/pairing/telegram")
+            .body(Body::empty())
+            .expect("member request");
+        member_req.extensions_mut().insert(UserIdentity {
+            user_id: "member-1".to_string(),
+            role: "member".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let member_resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app.clone(), member_req)
+            .await
+            .expect("member response");
+        assert_eq!(member_resp.status(), StatusCode::FORBIDDEN);
+
+        let mut admin_req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/pairing/telegram")
+            .body(Body::empty())
+            .expect("admin request");
+        admin_req.extensions_mut().insert(UserIdentity {
+            user_id: "admin-1".to_string(),
+            role: "admin".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let admin_resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, admin_req)
+            .await
+            .expect("admin response");
+        assert_eq!(admin_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(admin_resp.into_body(), 1024 * 64)
+            .await
+            .expect("admin body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("pairing list json");
+        assert_eq!(
+            parsed["channel"],
+            serde_json::Value::String("telegram".to_string())
+        );
+        assert_eq!(parsed["requests"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            parsed["requests"][0]["sender_id"],
+            serde_json::Value::String("tg-user-1".to_string())
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_pairing_approve_claims_code_for_authenticated_user() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (state, _db, pairing_store, _tmp) = make_pairing_test_state().await;
+        let request = pairing_store
+            .upsert_request("telegram", "tg-user-claim", None)
+            .await
+            .expect("create pairing request");
+
+        let app = Router::new()
+            .route(
+                "/api/pairing/{channel}/approve",
+                post(pairing_approve_handler),
+            )
+            .with_state(state);
+
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/pairing/telegram/approve")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "code": request.code.to_ascii_lowercase() }).to_string(),
+            ))
+            .expect("request");
+        req.extensions_mut().insert(UserIdentity {
+            user_id: "member-1".to_string(),
+            role: "member".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(parsed["success"], serde_json::Value::Bool(true));
+
+        let identity = pairing_store
+            .resolve_identity("telegram", "tg-user-claim")
+            .await
+            .expect("resolve identity")
+            .expect("claimed identity");
+        assert_eq!(identity.owner_id.as_str(), "member-1");
+        assert!(
+            pairing_store
+                .list_pending("telegram")
+                .await
+                .expect("pending list")
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_pairing_approve_rejects_blank_code() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (state, _db, _pairing_store, _tmp) = make_pairing_test_state().await;
+        let app = Router::new()
+            .route(
+                "/api/pairing/{channel}/approve",
+                post(pairing_approve_handler),
+            )
+            .with_state(state);
+
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/pairing/telegram/approve")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "code": "   " }).to_string()))
+            .expect("request");
+        req.extensions_mut().insert(UserIdentity {
+            user_id: "member-1".to_string(),
+            role: "member".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 64)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(parsed["success"], serde_json::Value::Bool(false));
+        assert_eq!(
+            parsed["message"],
+            serde_json::Value::String("Pairing code is required.".to_string())
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_delete_user_evicts_auth_and_pairing_caches() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let (db, _tmp) = crate::testing::test_db().await;
+        insert_test_user(&db, "admin-1", "admin").await;
+        insert_test_user(&db, "member-1", "member").await;
+
+        let token = "member-token-123";
+        let hash = crate::channels::web::auth::hash_token(token);
+        db.create_api_token("member-1", "test-token", &hash, &token[..8], None)
+            .await
+            .expect("create api token");
+
+        let db_auth = Arc::new(crate::channels::web::auth::DbAuthenticator::new(
+            Arc::clone(&db),
+        ));
+        let pairing_store = Arc::new(crate::pairing::PairingStore::new(
+            Arc::clone(&db),
+            Arc::new(crate::ownership::OwnershipCache::new()),
+        ));
+
+        let auth_identity = db_auth
+            .authenticate(token)
+            .await
+            .expect("db auth lookup")
+            .expect("db auth identity");
+        assert_eq!(auth_identity.user_id, "member-1");
+
+        let request = pairing_store
+            .upsert_request("telegram", "tg-delete-1", None)
+            .await
+            .expect("create pairing request");
+        pairing_store
+            .approve(
+                "telegram",
+                &request.code,
+                &crate::ownership::OwnerId::from("member-1"),
+            )
+            .await
+            .expect("approve pairing");
+        assert!(
+            pairing_store
+                .resolve_identity("telegram", "tg-delete-1")
+                .await
+                .expect("prime pairing cache")
+                .is_some()
+        );
+
+        let state = test_gateway_state_with_dependencies(
+            None,
+            Some(Arc::clone(&db)),
+            Some(Arc::clone(&db_auth)),
+            Some(Arc::clone(&pairing_store)),
+        );
+        let app = Router::new()
+            .route(
+                "/api/admin/users/{id}",
+                axum::routing::delete(crate::channels::web::handlers::users::users_delete_handler),
+            )
+            .with_state(state);
+
+        let mut req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri("/api/admin/users/member-1")
+            .body(Body::empty())
+            .expect("request");
+        req.extensions_mut().insert(UserIdentity {
+            user_id: "admin-1".to_string(),
+            role: "admin".to_string(),
+            workspace_read_scopes: Vec::new(),
+        });
+
+        let resp = ServiceExt::<axum::http::Request<Body>>::oneshot(app, req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            db_auth
+                .authenticate(token)
+                .await
+                .expect("post-delete auth lookup")
+                .is_none()
+        );
+        assert!(
+            pairing_store
+                .resolve_identity("telegram", "tg-delete-1")
+                .await
+                .expect("post-delete pairing lookup")
+                .is_none()
+        );
     }
 
     #[derive(Clone, Debug)]

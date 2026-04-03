@@ -1004,7 +1004,7 @@ ALTER TABLE agent_jobs       ADD CONSTRAINT IF NOT EXISTS fk_agent_jobs_user
     FOREIGN KEY (user_id) REFERENCES users(id);
 "#;
 
-/// Runs on every startup after migrations V1–V18.
+/// Runs on every startup after migrations V1–V20.
 /// Idempotent — safe to call multiple times.
 ///
 /// 1. Ensures the owner user row exists in `users`.

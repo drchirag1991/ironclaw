@@ -262,10 +262,8 @@ impl SignalChannel {
                 );
                 let is_new = req.created;
                 if is_new {
-                    let message = format!(
-                        "To pair with this bot, run: `ironclaw pairing approve signal {}`",
-                        req.code
-                    );
+                    let message =
+                        crate::pairing::PairingCodeChallenge::new("signal").reply_text(&req.code);
                     let http_url = self.config.http_url.clone();
                     let account = self.config.account.clone();
                     let sender_owned = sender.to_string();

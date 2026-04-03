@@ -414,6 +414,14 @@ pub async fn users_delete_handler(
         return Err((StatusCode::NOT_FOUND, "User not found".to_string()));
     }
 
+    if let Some(ref db_auth) = state.db_auth {
+        db_auth.invalidate_user(&id).await;
+    }
+
+    if let Some(ref ps) = state.pairing_store {
+        ps.evict_user(&id);
+    }
+
     Ok(Json(serde_json::json!({
         "id": id,
         "deleted": true,

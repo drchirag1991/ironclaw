@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::db::{Database, PairingRequestRecord};
 use crate::error::DatabaseError;
 use crate::ownership::{Identity, OwnerId, OwnershipCache};
+use crate::pairing::PairingCodeChallenge;
 
 /// Pairing operations: create pending requests, approve them, resolve identities.
 ///
@@ -90,11 +91,12 @@ impl PairingStore {
                 external_id = %external_id,
                 "PairingStore noop: generated pairing code will never be redeemable (no database configured)"
             );
+            let flow = PairingCodeChallenge::new(channel);
             return Ok(PairingRequestRecord {
                 id: uuid::Uuid::new_v4(),
                 channel: channel.to_string(),
                 external_id: external_id.to_string(),
-                code: crate::db::generate_pairing_code(),
+                code: crate::code_challenge::CodeChallengeFlow::issue_code(&flow),
                 created: true,
                 created_at: chrono::Utc::now(),
                 expires_at: chrono::Utc::now() + chrono::Duration::minutes(15),
@@ -115,7 +117,12 @@ impl PairingStore {
         let Some(ref db) = self.db else {
             return Ok(());
         };
-        db.approve_pairing(channel, code, owner_id.as_str()).await
+        let flow = PairingCodeChallenge::new(channel);
+        let normalized =
+            crate::code_challenge::CodeChallengeFlow::normalize_submission(&flow, code)
+                .unwrap_or_else(|| code.trim().to_string());
+        db.approve_pairing(channel, &normalized, owner_id.as_str())
+            .await
     }
 
     /// Evict all cached entries for a specific owner.
