@@ -1662,7 +1662,7 @@ impl Tool for RoutineFireTool {
 
         let run_id = self
             .engine
-            .fire_manual(routine.id, None)
+            .fire_manual(routine.id, Some(&ctx.user_id))
             .await
             .map_err(|e| {
                 ToolError::ExecutionFailed(format!("failed to fire routine '{}': {e}", name))

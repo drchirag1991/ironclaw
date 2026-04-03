@@ -35,6 +35,10 @@ use crate::channels::relay::DEFAULT_RELAY_NAME;
 use crate::channels::web::auth::{
     AuthenticatedUser, CombinedAuthState, UserIdentity, auth_middleware,
 };
+pub(crate) use crate::channels::web::handlers::chat::clear_auth_mode;
+use crate::channels::web::handlers::chat::{
+    active_auth_workspace_scope, resolve_auth_event_workspace_scope,
+};
 use crate::channels::web::handlers::engine::{
     engine_mission_detail_handler, engine_mission_fire_handler, engine_mission_pause_handler,
     engine_mission_resume_handler, engine_missions_handler, engine_missions_summary_handler,
@@ -2098,45 +2102,6 @@ async fn chat_auth_cancel_handler(
     // Also clear engine v2 pending auth so the next message isn't consumed as a token.
     crate::bridge::clear_engine_pending_auth(&user.user_id, req.thread_id.as_deref()).await;
     Ok(Json(ActionResponse::ok("Auth cancelled")))
-}
-
-/// Clear pending auth mode on the active thread.
-pub async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
-    if let Some(ref sm) = state.session_manager {
-        let session = sm.get_or_create_session(user_id).await;
-        let mut sess = session.lock().await;
-        if let Some(thread_id) = sess.active_thread
-            && let Some(thread) = sess.threads.get_mut(&thread_id)
-        {
-            thread.pending_auth = None;
-        }
-    }
-}
-
-async fn active_auth_workspace_scope(state: &GatewayState, user_id: &str) -> Option<String> {
-    let session_manager = state.session_manager.as_ref()?;
-    let session = session_manager.get_or_create_session(user_id).await;
-    let sess = session.lock().await;
-    let thread_id = sess.active_thread?;
-    sess.threads
-        .get(&thread_id)
-        .and_then(|thread| thread.pending_auth.as_ref())
-        .and_then(|pending| pending.workspace_id.clone())
-}
-
-async fn resolve_auth_event_workspace_scope(
-    state: &GatewayState,
-    user: &UserIdentity,
-    requested_workspace: Option<&str>,
-) -> Result<Option<String>, (StatusCode, String)> {
-    let requested_workspace_id = resolve_requested_workspace_id(state, user, requested_workspace)
-        .await?
-        .map(|id| id.to_string());
-    if requested_workspace_id.is_some() {
-        return Ok(requested_workspace_id);
-    }
-
-    Ok(active_auth_workspace_scope(state, &user.user_id).await)
 }
 
 async fn chat_events_handler(

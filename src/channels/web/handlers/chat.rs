@@ -280,7 +280,7 @@ pub async fn chat_auth_cancel_handler(
 // ── Shared helpers used by server.rs handlers ──────────────────────────
 
 /// Clear pending auth mode on the active thread.
-pub async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
+pub(crate) async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
     if let Some(ref sm) = state.session_manager {
         let session = sm.get_or_create_session(user_id).await;
         let mut sess = session.lock().await;
@@ -292,7 +292,10 @@ pub async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
     }
 }
 
-async fn active_auth_workspace_scope(state: &GatewayState, user_id: &str) -> Option<String> {
+pub(crate) async fn active_auth_workspace_scope(
+    state: &GatewayState,
+    user_id: &str,
+) -> Option<String> {
     let session_manager = state.session_manager.as_ref()?;
     let session = session_manager.get_or_create_session(user_id).await;
     let sess = session.lock().await;
@@ -303,7 +306,7 @@ async fn active_auth_workspace_scope(state: &GatewayState, user_id: &str) -> Opt
         .and_then(|pending| pending.workspace_id.clone())
 }
 
-async fn resolve_auth_event_workspace_scope(
+pub(crate) async fn resolve_auth_event_workspace_scope(
     state: &GatewayState,
     user: &crate::channels::web::auth::UserIdentity,
     requested_workspace: Option<&str>,
