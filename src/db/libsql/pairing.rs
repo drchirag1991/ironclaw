@@ -70,7 +70,7 @@ impl ChannelPairingStore for LibSqlBackend {
                 .query(
                     "SELECT id, channel, external_id, code, created_at, expires_at
                      FROM pairing_requests
-                     WHERE channel = ?1 AND external_id = ?2
+                     WHERE LOWER(channel) = LOWER(?1) AND external_id = ?2
                        AND approved_at IS NULL
                        AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                      ORDER BY created_at DESC LIMIT 1",
@@ -272,7 +272,7 @@ impl ChannelPairingStore for LibSqlBackend {
             .query(
                 "SELECT id, channel, external_id, code, created_at, expires_at
                  FROM pairing_requests
-                 WHERE channel = ?1 AND approved_at IS NULL
+                 WHERE LOWER(channel) = LOWER(?1) AND approved_at IS NULL
                    AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                  ORDER BY created_at ASC",
                 params![channel],
@@ -316,7 +316,7 @@ impl ChannelPairingStore for LibSqlBackend {
     ) -> Result<(), DatabaseError> {
         let conn = self.connect().await?;
         conn.execute(
-            "DELETE FROM channel_identities WHERE channel = ?1 AND external_id = ?2",
+            "DELETE FROM channel_identities WHERE LOWER(channel) = LOWER(?1) AND external_id = ?2",
             params![channel, external_id],
         )
         .await

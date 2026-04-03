@@ -1136,7 +1136,7 @@ impl ChannelPairingStore for PgBackend {
             .query_opt(
                 "SELECT id, channel, external_id, code, created_at, expires_at
                  FROM pairing_requests
-                 WHERE channel = $1 AND external_id = $2
+                 WHERE LOWER(channel) = LOWER($1) AND external_id = $2
                    AND approved_at IS NULL AND expires_at > NOW()
                  ORDER BY created_at DESC LIMIT 1",
                 &[&channel, &external_id],
@@ -1277,7 +1277,7 @@ impl ChannelPairingStore for PgBackend {
             .query(
                 "SELECT id, channel, external_id, code, created_at, expires_at
                  FROM pairing_requests
-                 WHERE channel = $1 AND approved_at IS NULL AND expires_at > NOW()
+                 WHERE LOWER(channel) = LOWER($1) AND approved_at IS NULL AND expires_at > NOW()
                  ORDER BY created_at ASC",
                 &[&channel],
             )
@@ -1310,7 +1310,7 @@ impl ChannelPairingStore for PgBackend {
             .map_err(|e| DatabaseError::Pool(e.to_string()))?;
         client
             .execute(
-                "DELETE FROM channel_identities WHERE channel = $1 AND external_id = $2",
+                "DELETE FROM channel_identities WHERE LOWER(channel) = LOWER($1) AND external_id = $2",
                 &[&channel, &external_id],
             )
             .await
