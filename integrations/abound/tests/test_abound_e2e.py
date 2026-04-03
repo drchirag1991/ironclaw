@@ -117,26 +117,18 @@ check("inject api key", r.status_code == 200, f"got {r.status_code}: {r.text[:20
 
 # AGENTS.md is auto-seeded via AGENTS_SEED_PATH env var on the server
 
-print("\n--- Setup: Verify Massive API key is seeded (global default user) ---")
-r = admin.get(f"{BASE_URL}/api/admin/users/default/secrets")
-if r.status_code == 200:
-    secret_names = [s["name"] for s in r.json().get("secrets", [])]
-    if "massive_api_key" not in secret_names:
-        massive_key = os.environ.get("MASSIVE_API_KEY")
-        if massive_key:
-            r2 = admin.put(
-                f"{BASE_URL}/api/admin/users/default/secrets/massive_api_key",
-                json={"value": massive_key, "provider": "massive"},
-            )
-            check("massive_api_key seeded on default", r2.status_code == 200,
-                  f"got {r2.status_code}: {r2.text[:200]}")
-        else:
-            check("massive_api_key seeded on default", False,
-                  f"not found and MASSIVE_API_KEY env var not set — seed with: curl -X PUT {BASE_URL}/api/admin/users/default/secrets/massive_api_key -d '{{\"value\": \"<key>\"}}'")
-    else:
-        check("massive_api_key seeded on default", True)
+print("\n--- Setup: Inject Massive API key ---")
+massive_key = os.environ.get("MASSIVE_API_KEY")
+if massive_key:
+    r = admin.put(
+        f"{BASE_URL}/api/admin/users/{user_id}/secrets/massive_api_key",
+        json={"value": massive_key, "provider": "massive"},
+    )
+    check("inject massive_api_key", r.status_code == 200,
+          f"got {r.status_code}: {r.text[:200]}")
 else:
-    check("secrets list accessible", False, f"got {r.status_code}: {r.text[:200]}")
+    check("inject massive_api_key", False,
+          "MASSIVE_API_KEY env var not set")
 
 # Wait for workspace bootstrap and auth cache to settle
 print("\n  Waiting 5s for workspace bootstrap...")

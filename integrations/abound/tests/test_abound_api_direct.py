@@ -11,9 +11,17 @@ import requests
 # Credentials — set these env vars before running
 ABOUND_BEARER_TOKEN = os.environ["ABOUND_BEARER_TOKEN"]
 ABOUND_API_KEY = os.environ["ABOUND_API_KEY"]
+ABOUND_WRITE_TOKEN = os.environ.get("ABOUND_WRITE_TOKEN", "")
 
 HEADERS = {
     "Authorization": f"Bearer {ABOUND_BEARER_TOKEN}",
+    "Content-Type": "application/json",
+    "X-API-KEY": ABOUND_API_KEY,
+    "device-type": "WEB",
+}
+
+WRITE_HEADERS = {
+    "Authorization": f"Bearer {ABOUND_WRITE_TOKEN}",
     "Content-Type": "application/json",
     "X-API-KEY": ABOUND_API_KEY,
     "device-type": "WEB",
@@ -112,10 +120,22 @@ print()
 # -----------------------------------------------------------
 # 4. Send Wire (DRY RUN — only validate request shape, don't actually send)
 # -----------------------------------------------------------
-print("--- 4. Send Wire (skipped — real money) ---")
-print("  SKIP: Not executing send-wire against dev to avoid real transfers")
-print("  Endpoint: POST https://devneobank.timesclub.co/times/bank/remittance/agent/send-wire")
-print("  Body: {funding_source_id, beneficiary_ref_id, amount, payment_reason_key}")
+print("--- 4. Send Wire (auth check — $1 test) ---")
+r = requests.post(
+    "https://devneobank.timesclub.co/times/bank/remittance/agent/send-wire",
+    headers=WRITE_HEADERS,
+    json={
+        "funding_source_id": "BEz8mWag3rIKRmkqvdg5sgBQamm41QH4xPrpq",
+        "beneficiary_ref_id": "f8048224-6283-4dd6-b473-53e66c05428d",
+        "amount": 1.00,
+        "payment_reason_key": "IR001",
+    },
+    timeout=15,
+)
+check("authenticated (not 401)", r.status_code != 401, f"got {r.status_code}: {r.text[:300]}")
+if r.status_code != 401:
+    data = r.json()
+    print(f"  Response: {r.status_code} — {str(data)[:200]}")
 print()
 
 # -----------------------------------------------------------
