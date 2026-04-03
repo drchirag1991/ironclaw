@@ -74,6 +74,7 @@ pub async fn routines_summary_handler(
         total,
         enabled,
         disabled,
+        unverified: 0,
         failing,
         runs_today,
     }))
@@ -148,6 +149,8 @@ pub async fn routines_detail_handler(
         next_fire_at: routine.next_fire_at.map(|dt| dt.to_rfc3339()),
         run_count: routine.run_count,
         consecutive_failures: routine.consecutive_failures,
+        status: routine_info.status,
+        verification_status: routine_info.verification_status,
         created_at: routine.created_at.to_rfc3339(),
         conversation_id,
         recent_runs,

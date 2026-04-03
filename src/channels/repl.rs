@@ -885,16 +885,8 @@ impl Channel for ReplChannel {
             StatusUpdate::TurnCost { .. } => {
                 // Cost display is handled by the TUI channel
             }
-            StatusUpdate::JobStatus { .. }
-            | StatusUpdate::JobResult { .. }
-            | StatusUpdate::RoutineUpdate { .. }
-            | StatusUpdate::ContextPressure { .. }
-            | StatusUpdate::SandboxStatus { .. }
-            | StatusUpdate::SecretsStatus { .. }
-            | StatusUpdate::CostGuard { .. }
-            | StatusUpdate::ThreadList { .. }
-            | StatusUpdate::ConversationHistory { .. } => {
-                // Infrastructure status events are only rendered by the TUI
+            StatusUpdate::ThreadList { .. } | StatusUpdate::ConversationHistory { .. } => {
+                // Thread list and history events are only rendered by the TUI
             }
             StatusUpdate::SkillActivated { skill_names } => {
                 if !skill_names.is_empty() {
@@ -904,6 +896,14 @@ impl Channel for ReplChannel {
                     );
                 }
             }
+            // Variants handled by web gateway or TUI only
+            StatusUpdate::JobStatus { .. }
+            | StatusUpdate::JobResult { .. }
+            | StatusUpdate::RoutineUpdate { .. }
+            | StatusUpdate::ContextPressure { .. }
+            | StatusUpdate::SandboxStatus { .. }
+            | StatusUpdate::SecretsStatus { .. }
+            | StatusUpdate::CostGuard { .. } => {}
         }
         Ok(())
     }
