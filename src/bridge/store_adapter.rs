@@ -629,6 +629,25 @@ fn is_protected_orchestrator_doc(doc: &MemoryDoc) -> bool {
     doc.title.starts_with("orchestrator:") || doc.title.starts_with("prompt:")
 }
 
+/// Validate orchestrator content before persisting.
+///
+/// Checks Python syntax so a broken patch doesn't consume failure-budget slots
+/// (3 failures trigger auto-rollback). Runtime sandbox (Monty) handles all
+/// security enforcement — no blocklist here.
+fn validate_orchestrator_content(doc: &MemoryDoc) -> Result<(), EngineError> {
+    if doc.title.starts_with("orchestrator:") && doc.title != ORCHESTRATOR_FAILURES_TITLE {
+        if let Err(reason) = ironclaw_engine::executor::validate_python_syntax(&doc.content) {
+            return Err(EngineError::InvalidInput {
+                reason: format!(
+                    "orchestrator patch '{}' has invalid Python: {reason}",
+                    doc.title
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn project_dir(name: &str, project_id: ProjectId) -> String {
     let slug = slugify(name, &project_id.0.to_string());
     format!("{PROJECTS_PREFIX}/{slug}")
@@ -1156,11 +1175,34 @@ impl Store for HybridStore {
                         ),
                     });
                 }
+            } else {
+                // Self-modification is enabled — validate content before persisting.
+                // Skip validation for system-internal docs (failure tracker, compiled-in seed).
+                let is_system_internal = doc.title == ORCHESTRATOR_FAILURES_TITLE
+                    || doc
+                        .metadata
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s == "compiled_in");
+                if !is_system_internal {
+                    validate_orchestrator_content(doc)?;
+                }
             }
         }
 
-        self.docs.write().await.insert(doc.id, doc.clone());
-        self.persist_doc(doc).await;
+        let mut stamped = doc.clone();
+        // Stamp a content hash for audit trail on all protected docs.
+        if is_protected_orchestrator_doc(doc) {
+            use sha2::{Sha256, Digest};
+            let hash = format!("{:x}", Sha256::digest(doc.content.as_bytes()));
+            stamped
+                .metadata
+                .as_object_mut()
+                .map(|m| m.insert("content_hash".into(), serde_json::Value::String(hash)));
+        }
+
+        self.docs.write().await.insert(stamped.id, stamped.clone());
+        self.persist_doc(&stamped).await;
         Ok(())
     }
 
