@@ -285,7 +285,7 @@ pub(crate) fn validate_base_url(url: &str, field_name: &str) -> Result<(), Confi
                 ),
             });
         }
-    } else {
+    } else if std::env::var("IRONCLAW_SKIP_DNS_VALIDATION").is_err() {
         // Hostname — resolve and check all resulting IPs as defense-in-depth.
         // NOTE: This does NOT fully prevent DNS rebinding attacks (the hostname
         // could resolve to a different IP at request time). Full protection
@@ -603,6 +603,12 @@ mod tests {
 
     #[test]
     fn validate_base_url_rejects_dns_failure() {
+        let _guard = lock_env();
+        // Ensure DNS validation is active for this test.
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("IRONCLAW_SKIP_DNS_VALIDATION");
+        }
         // .invalid TLD is guaranteed to never resolve (RFC 6761)
         let result = validate_base_url("https://ssrf-test.invalid", "TEST");
         assert!(result.is_err());

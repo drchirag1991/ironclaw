@@ -757,6 +757,10 @@ mod tests {
         // SAFETY: Under ENV_MUTEX, no concurrent env access.
         unsafe {
             std::env::set_var("LLM_BACKEND", "anthropic");
+            // Stub NearAI URLs and skip DNS to work in sandboxed environments.
+            std::env::set_var("NEARAI_AUTH_URL", "http://localhost:0");
+            std::env::set_var("NEARAI_BASE_URL", "http://localhost:0");
+            std::env::set_var("IRONCLAW_SKIP_DNS_VALIDATION", "1");
         }
         let _env_guard = EnvGuard("LLM_BACKEND", prev);
 
@@ -877,6 +881,10 @@ mod tests {
         // SAFETY: Under ENV_MUTEX, no concurrent env access.
         unsafe {
             std::env::remove_var("LLM_BACKEND");
+            // Stub NearAI URLs and skip DNS to work in sandboxed environments.
+            std::env::set_var("NEARAI_AUTH_URL", "http://localhost:0");
+            std::env::set_var("NEARAI_BASE_URL", "http://localhost:0");
+            std::env::set_var("IRONCLAW_SKIP_DNS_VALIDATION", "1");
         }
         let settings = Settings::default();
         match check_llm_config(&settings) {

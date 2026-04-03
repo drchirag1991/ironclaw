@@ -4461,6 +4461,14 @@ mod tests {
         let _lock = lock_env();
         // Ensure the real env var is unset so the only source is the overlay.
         let _guard = EnvGuard::clear("NEARAI_API_KEY");
+        // Stub NearAI auth URL and skip DNS to work in sandboxed environments.
+        // Remove NEARAI_BASE_URL so the function auto-selects based on API key.
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("NEARAI_AUTH_URL", "http://localhost:0");
+            std::env::set_var("IRONCLAW_SKIP_DNS_VALIDATION", "1");
+            std::env::remove_var("NEARAI_BASE_URL");
+        }
 
         crate::config::helpers::set_runtime_env("NEARAI_API_KEY", "test-key-from-overlay");
         let config = build_nearai_model_fetch_config();
