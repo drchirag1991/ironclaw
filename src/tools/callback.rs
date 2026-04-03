@@ -94,19 +94,17 @@ impl ToolCallbackRegistry {
             message = message.with_thread(tid);
         }
 
-        inject_tx.send(message).await.map_err(
-            |e: mpsc::error::SendError<IncomingMessage>| {
+        inject_tx
+            .send(message)
+            .await
+            .map_err(|e: mpsc::error::SendError<IncomingMessage>| {
                 CallbackError::InjectionFailed(e.to_string())
-            },
-        )
+            })
     }
 
     /// Remove expired entries and inject timeout messages.
     /// Returns the number of expired entries swept.
-    pub async fn sweep_expired(
-        &self,
-        inject_tx: &mpsc::Sender<IncomingMessage>,
-    ) -> usize {
+    pub async fn sweep_expired(&self, inject_tx: &mpsc::Sender<IncomingMessage>) -> usize {
         let expired: Vec<(String, PendingEntry)> = {
             let mut pending = self.pending.write().await;
             let now = Instant::now();
@@ -128,22 +126,16 @@ impl ToolCallbackRegistry {
                 "Transaction {}: timed out waiting for approval (tool: {})",
                 correlation_id, entry.metadata.tool_name
             );
-            let mut message = IncomingMessage::new(
-                entry.metadata.channel,
-                entry.metadata.user_id,
-                content,
-            )
-            .into_internal();
+            let mut message =
+                IncomingMessage::new(entry.metadata.channel, entry.metadata.user_id, content)
+                    .into_internal();
 
             if let Some(tid) = entry.metadata.thread_id {
                 message = message.with_thread(tid);
             }
 
             if let Err(e) = inject_tx.send(message).await {
-                tracing::warn!(
-                    correlation_id,
-                    "failed to inject timeout message: {}", e
-                );
+                tracing::warn!(correlation_id, "failed to inject timeout message: {}", e);
             }
         }
         count

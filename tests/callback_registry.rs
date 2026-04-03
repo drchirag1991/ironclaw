@@ -57,7 +57,11 @@ async fn test_resolve_injects_incoming_message() {
 
     registry.register("corr-789".into(), meta).await;
     registry
-        .resolve("corr-789", "Transaction confirmed. Tx hash: 0xabc".into(), &tx)
+        .resolve(
+            "corr-789",
+            "Transaction confirmed. Tx hash: 0xabc".into(),
+            &tx,
+        )
         .await
         .unwrap();
 

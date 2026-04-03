@@ -36,10 +36,9 @@ impl WalletConnectSession {
 
     /// Initiate a WalletConnect pairing session. Returns the pairing URI.
     pub async fn initiate_pairing(&self, chain_id: u64) -> Result<String, EthereumError> {
-        let project_id = self
-            .project_id
-            .as_ref()
-            .ok_or_else(|| EthereumError::NotConfigured("WALLETCONNECT_PROJECT_ID not set".into()))?;
+        let project_id = self.project_id.as_ref().ok_or_else(|| {
+            EthereumError::NotConfigured("WALLETCONNECT_PROJECT_ID not set".into())
+        })?;
 
         let metadata = Metadata::from(
             "IronClaw",
@@ -99,9 +98,7 @@ impl WalletConnectSession {
         chain_id: u64,
     ) -> Result<serde_json::Value, EthereumError> {
         let client = self.wc_client.lock().await;
-        let wc = client
-            .as_ref()
-            .ok_or(EthereumError::NotPaired)?;
+        let wc = client.as_ref().ok_or(EthereumError::NotPaired)?;
 
         wc.request(method, params, chain_id)
             .await

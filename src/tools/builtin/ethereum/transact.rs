@@ -38,9 +38,7 @@ impl WalletTransactTool {
 
 /// Validate an Ethereum address (0x + 40 hex characters).
 fn is_valid_eth_address(addr: &str) -> bool {
-    addr.len() == 42
-        && addr.starts_with("0x")
-        && addr[2..].chars().all(|c| c.is_ascii_hexdigit())
+    addr.len() == 42 && addr.starts_with("0x") && addr[2..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[async_trait]
@@ -207,10 +205,15 @@ mod tests {
         let tool = make_tool();
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
-        let required = schema["required"].as_array().expect("required should be an array");
+        let required = schema["required"]
+            .as_array()
+            .expect("required should be an array");
         let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(required_names.contains(&"to"), "to should be required");
-        assert!(required_names.contains(&"value"), "value should be required");
+        assert!(
+            required_names.contains(&"value"),
+            "value should be required"
+        );
     }
 
     #[test]

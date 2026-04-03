@@ -431,15 +431,10 @@ impl AppBuilder {
         ));
 
         let wc_session = if self.config.ethereum.enabled {
-            let session = Arc::new(
-                crate::tools::builtin::ethereum::WalletConnectSession::new(
-                    self.config.ethereum.walletconnect_project_id.clone(),
-                ),
-            );
-            tools.register_ethereum_tools(
-                Arc::clone(&session),
-                Arc::clone(&callback_registry),
-            );
+            let session = Arc::new(crate::tools::builtin::ethereum::WalletConnectSession::new(
+                self.config.ethereum.walletconnect_project_id.clone(),
+            ));
+            tools.register_ethereum_tools(Arc::clone(&session), Arc::clone(&callback_registry));
             tracing::info!("Ethereum wallet tools registered");
             Some(session)
         } else {
@@ -860,8 +855,16 @@ impl AppBuilder {
         } else {
             self.init_llm().await?
         };
-        let (safety, tools, embeddings, workspace, builder, credential_registry, callback_registry, wc_session) =
-            self.init_tools(&llm).await?;
+        let (
+            safety,
+            tools,
+            embeddings,
+            workspace,
+            builder,
+            credential_registry,
+            callback_registry,
+            wc_session,
+        ) = self.init_tools(&llm).await?;
 
         // Create hook registry early so runtime extension activation can register hooks.
         let hooks = Arc::new(HookRegistry::new());
