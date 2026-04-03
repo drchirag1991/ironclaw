@@ -67,7 +67,10 @@ use crate::channels::web::handlers::skills::{
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
-use crate::channels::web::util::{build_turns_from_db_messages, truncate_preview};
+use crate::channels::web::util::{
+    build_turns_from_db_messages, pending_plan_exit_info_from_pending, plan_state_from_metadata,
+    truncate_preview,
+};
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -2212,7 +2215,6 @@ async fn chat_history_handler(
     ))?;
 
     let session = session_manager.get_or_create_session(&user.user_id).await;
-    let sess = session.lock().await;
 
     let limit = query.limit.unwrap_or(50);
     let before_cursor = query
@@ -2235,6 +2237,7 @@ async fn chat_history_handler(
         Uuid::parse_str(tid)
             .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid thread_id".to_string()))?
     } else {
+        let sess = session.lock().await;
         sess.active_thread
             .ok_or((StatusCode::NOT_FOUND, "No active thread".to_string()))?
     };
@@ -2254,40 +2257,111 @@ async fn chat_history_handler(
                 tracing::error!(thread_id = %thread_id, error = %e, "DB error during thread ownership check");
                 (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
             })?;
-        if !owned && !sess.threads.contains_key(&thread_id) {
-            return Err((StatusCode::NOT_FOUND, "Thread not found".to_string()));
+        if !owned {
+            let sess = session.lock().await;
+            if !sess.threads.contains_key(&thread_id) {
+                return Err((StatusCode::NOT_FOUND, "Thread not found".to_string()));
+            }
         }
     }
 
-    let persisted_metadata = if let Some(ref store) = state.store {
-        store
-            .get_conversation_metadata(thread_id)
+    let mut in_memory_plan_mode = None;
+    let mut in_memory_pending_plan_exit = None;
+    let mut in_memory_pending_gate = None;
+    let mut in_memory_turns = None;
+    let mut in_memory_has_fresh_state = false;
+
+    {
+        let sess = session.lock().await;
+        if let Some(thread) = sess.threads.get(&thread_id) {
+            in_memory_plan_mode = Some(thread.plan_mode);
+            in_memory_pending_plan_exit = thread
+                .pending_plan_exit
+                .as_ref()
+                .map(pending_plan_exit_info_from_pending);
+            in_memory_pending_gate = thread.pending_approval.as_ref().map(|pa| PendingGateInfo {
+                request_id: pa.request_id.to_string(),
+                thread_id: thread_id.to_string(),
+                gate_name: "approval".into(),
+                tool_name: pa.tool_name.clone(),
+                description: pa.description.clone(),
+                parameters: serde_json::to_string_pretty(&pa.parameters).unwrap_or_default(),
+                resume_kind: serde_json::json!({"Approval":{"allow_always":true}}),
+            });
+
+            let has_fresh_state = !thread.turns.is_empty()
+                || thread.pending_approval.is_some()
+                || thread.pending_plan_exit.is_some()
+                || thread.plan_mode;
+
+            if before_cursor.is_none() && has_fresh_state {
+                in_memory_has_fresh_state = true;
+                in_memory_turns = Some(
+                    thread
+                        .turns
+                        .iter()
+                        .map(|t| TurnInfo {
+                            turn_number: t.turn_number,
+                            user_input: t.user_input.clone(),
+                            response: t.response.clone(),
+                            state: format!("{:?}", t.state),
+                            started_at: t.started_at.to_rfc3339(),
+                            completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
+                            tool_calls: t
+                                .tool_calls
+                                .iter()
+                                .map(|tc| ToolCallInfo {
+                                    name: tc.name.clone(),
+                                    has_result: tc.result.is_some(),
+                                    has_error: tc.error.is_some(),
+                                    result_preview: tc.result.as_ref().map(|r| {
+                                        let s = match r {
+                                            serde_json::Value::String(s) => s.clone(),
+                                            other => other.to_string(),
+                                        };
+                                        truncate_preview(&s, 500)
+                                    }),
+                                    error: tc.error.clone(),
+                                    rationale: tc.rationale.clone(),
+                                })
+                                .collect(),
+                            narrative: t.narrative.clone(),
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    if in_memory_has_fresh_state {
+        let pending_gate = history_pending_gate_info(&user.user_id, thread_scope)
             .await
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
-    let persisted_plan_mode = persisted_metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("plan_mode").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
-    let persisted_pending_plan_exit = persisted_metadata.as_ref().and_then(|metadata| {
-        crate::agent::session::PlanArtifact::from_metadata(metadata, thread_id).and_then(
-            |artifact| {
-                metadata
-                    .get("plan_exit_request_id")
-                    .and_then(|v| v.as_str())
-                    .map(|request_id| PendingPlanExitInfo {
-                        request_id: request_id.to_string(),
-                        title: artifact.title,
-                        markdown: artifact.markdown,
-                        path: Some(artifact.path),
-                        suggested_actions: artifact.suggested_actions,
-                    })
-            },
-        )
-    });
+            .or(in_memory_pending_gate);
+
+        return Ok(Json(HistoryResponse {
+            thread_id,
+            plan_mode: in_memory_plan_mode.unwrap_or(false),
+            turns: in_memory_turns.unwrap_or_default(),
+            has_more: false,
+            oldest_timestamp: None,
+            pending_gate,
+            pending_plan_exit: in_memory_pending_plan_exit,
+        }));
+    }
+
+    let (persisted_plan_mode, persisted_pending_plan_exit) =
+        if let Some(plan_mode) = in_memory_plan_mode {
+            (plan_mode, in_memory_pending_plan_exit)
+        } else if let Some(ref store) = state.store {
+            let metadata = store
+                .get_conversation_metadata(thread_id)
+                .await
+                .ok()
+                .flatten();
+            plan_state_from_metadata(metadata.as_ref(), thread_id)
+        } else {
+            (false, None)
+        };
 
     // For paginated requests (before cursor set), always go to DB
     if before_cursor.is_some()
@@ -2306,78 +2380,10 @@ async fn chat_history_handler(
             turns,
             has_more,
             oldest_timestamp,
-            pending_gate: history_pending_gate_info(&user.user_id, thread_scope).await,
+            pending_gate: history_pending_gate_info(&user.user_id, thread_scope)
+                .await
+                .or(in_memory_pending_gate),
             pending_plan_exit: persisted_pending_plan_exit,
-        }));
-    }
-
-    // Try in-memory first (freshest data for active threads)
-    if let Some(thread) = sess.threads.get(&thread_id)
-        && (!thread.turns.is_empty() || thread.pending_approval.is_some())
-    {
-        let turns: Vec<TurnInfo> = thread
-            .turns
-            .iter()
-            .map(|t| TurnInfo {
-                turn_number: t.turn_number,
-                user_input: t.user_input.clone(),
-                response: t.response.clone(),
-                state: format!("{:?}", t.state),
-                started_at: t.started_at.to_rfc3339(),
-                completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
-                tool_calls: t
-                    .tool_calls
-                    .iter()
-                    .map(|tc| ToolCallInfo {
-                        name: tc.name.clone(),
-                        has_result: tc.result.is_some(),
-                        has_error: tc.error.is_some(),
-                        result_preview: tc.result.as_ref().map(|r| {
-                            let s = match r {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            truncate_preview(&s, 500)
-                        }),
-                        error: tc.error.clone(),
-                        rationale: tc.rationale.clone(),
-                    })
-                    .collect(),
-                narrative: t.narrative.clone(),
-            })
-            .collect();
-
-        let pending_gate = history_pending_gate_info(&user.user_id, thread_scope)
-            .await
-            .or_else(|| {
-                thread.pending_approval.as_ref().map(|pa| PendingGateInfo {
-                    request_id: pa.request_id.to_string(),
-                    thread_id: thread_id.to_string(),
-                    gate_name: "approval".into(),
-                    tool_name: pa.tool_name.clone(),
-                    description: pa.description.clone(),
-                    parameters: serde_json::to_string_pretty(&pa.parameters).unwrap_or_default(),
-                    resume_kind: serde_json::json!({"Approval":{"allow_always":true}}),
-                })
-            });
-
-        return Ok(Json(HistoryResponse {
-            thread_id,
-            plan_mode: thread.plan_mode,
-            turns,
-            has_more: false,
-            oldest_timestamp: None,
-            pending_gate,
-            pending_plan_exit: thread
-                .pending_plan_exit
-                .as_ref()
-                .map(|pending| PendingPlanExitInfo {
-                    request_id: pending.request_id.to_string(),
-                    title: pending.artifact.title.clone(),
-                    markdown: pending.artifact.markdown.clone(),
-                    path: Some(pending.artifact.path.clone()),
-                    suggested_actions: pending.artifact.suggested_actions.clone(),
-                }),
         }));
     }
 
@@ -2410,7 +2416,9 @@ async fn chat_history_handler(
         turns: Vec::new(),
         has_more: false,
         oldest_timestamp: None,
-        pending_gate: history_pending_gate_info(&user.user_id, thread_scope).await,
+        pending_gate: history_pending_gate_info(&user.user_id, thread_scope)
+            .await
+            .or(in_memory_pending_gate),
         pending_plan_exit: persisted_pending_plan_exit,
     }))
 }

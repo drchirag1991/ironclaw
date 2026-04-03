@@ -1,12 +1,52 @@
 //! Shared utility functions for the web gateway.
 
-use crate::channels::web::types::{ToolCallInfo, TurnInfo};
+use uuid::Uuid;
+
+use crate::channels::web::types::{PendingPlanExitInfo, ToolCallInfo, TurnInfo};
 
 pub use ironclaw_common::truncate_preview;
 
 /// Convert stored tool errors into plain text suitable for UI display.
 pub fn tool_error_for_display(error: &str) -> String {
     ironclaw_safety::SafetyLayer::unwrap_tool_output(error).unwrap_or_else(|| error.to_string())
+}
+
+pub fn plan_state_from_metadata(
+    metadata: Option<&serde_json::Value>,
+    thread_id: Uuid,
+) -> (bool, Option<PendingPlanExitInfo>) {
+    let plan_mode = metadata
+        .and_then(|value| value.get("plan_mode"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let pending_plan_exit = metadata.and_then(|value| {
+        crate::agent::session::PlanArtifact::from_metadata(value, thread_id).and_then(|artifact| {
+            value
+                .get("plan_exit_request_id")
+                .and_then(|request_id| request_id.as_str())
+                .map(|request_id| PendingPlanExitInfo {
+                    request_id: request_id.to_string(),
+                    title: artifact.title,
+                    markdown: artifact.markdown,
+                    path: Some(artifact.path),
+                    suggested_actions: artifact.suggested_actions,
+                })
+        })
+    });
+
+    (plan_mode, pending_plan_exit)
+}
+
+pub fn pending_plan_exit_info_from_pending(
+    pending: &crate::agent::session::PendingPlanExit,
+) -> PendingPlanExitInfo {
+    PendingPlanExitInfo {
+        request_id: pending.request_id.to_string(),
+        title: pending.artifact.title.clone(),
+        markdown: pending.artifact.markdown.clone(),
+        path: Some(pending.artifact.path.clone()),
+        suggested_actions: pending.artifact.suggested_actions.clone(),
+    }
 }
 
 /// Parse tool call summary JSON objects into `ToolCallInfo` structs.
@@ -303,5 +343,29 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert!(turns[0].narrative.is_none());
         assert_eq!(turns[0].tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_state_from_metadata_extracts_pending_plan_exit() {
+        let thread_id = Uuid::new_v4();
+        let metadata = serde_json::json!({
+            "plan_mode": true,
+            "plan_exit_request_id": Uuid::new_v4().to_string(),
+            "plan_artifact_title": "Review auth flow",
+            "plan_artifact_markdown": "Investigate token refresh handling",
+            "plan_artifact_path": "plans/thread-test.md",
+            "plan_artifact_updated_at": chrono::Utc::now().to_rfc3339(),
+            "plan_artifact_suggested_actions": ["Approve", "Keep planning"],
+        });
+
+        let (plan_mode, pending_plan_exit) = plan_state_from_metadata(Some(&metadata), thread_id);
+
+        assert!(plan_mode);
+        let pending_plan_exit = pending_plan_exit.expect("pending plan exit should parse");
+        assert_eq!(pending_plan_exit.title, "Review auth flow");
+        assert_eq!(
+            pending_plan_exit.suggested_actions,
+            vec!["Approve", "Keep planning"]
+        );
     }
 }

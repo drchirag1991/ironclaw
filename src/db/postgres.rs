@@ -215,14 +215,13 @@ impl ConversationStore for PgBackend {
             .await
     }
 
-    async fn update_conversation_metadata_field(
+    async fn update_conversation_metadata_fields(
         &self,
         id: Uuid,
-        key: &str,
-        value: &serde_json::Value,
+        patch: &serde_json::Value,
     ) -> Result<(), DatabaseError> {
         self.store
-            .update_conversation_metadata_field(id, key, value)
+            .update_conversation_metadata_fields(id, patch)
             .await
     }
 

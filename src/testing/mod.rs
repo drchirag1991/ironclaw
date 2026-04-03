@@ -719,6 +719,36 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn test_conversation_metadata_batch_update_persistence() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let conv_id = db
+            .create_conversation("web", "bob", None)
+            .await
+            .expect("create conversation");
+
+        db.update_conversation_metadata_fields(
+            conv_id,
+            &serde_json::json!({
+                "thread_type": "assistant",
+                "model": "gpt-4.1",
+            }),
+        )
+        .await
+        .expect("batch update metadata");
+
+        let meta = db
+            .get_conversation_metadata(conv_id)
+            .await
+            .expect("get metadata after batch update")
+            .expect("metadata should exist");
+        assert_eq!(meta["thread_type"], "assistant");
+        assert_eq!(meta["model"], "gpt-4.1");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn test_conversation_belongs_to_user() {
         let harness = TestHarnessBuilder::new().build().await;
         let db = &harness.db;

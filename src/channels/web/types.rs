@@ -115,7 +115,7 @@ pub struct PendingGateInfo {
 }
 
 /// Review card for exiting plan mode.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PendingPlanExitInfo {
     pub request_id: String,
     pub title: String,

@@ -409,11 +409,10 @@ impl TenantScope {
     }
 
     /// Update metadata on a conversation. Returns `NotFound` if not owned by this user.
-    pub async fn update_conversation_metadata_field(
+    pub async fn update_conversation_metadata_fields(
         &self,
         id: Uuid,
-        key: &str,
-        value: &serde_json::Value,
+        patch: &serde_json::Value,
     ) -> Result<(), DatabaseError> {
         if !self.conversation_belongs_to_user(id).await? {
             return Err(DatabaseError::NotFound {
@@ -422,7 +421,20 @@ impl TenantScope {
             });
         }
         self.inner
-            .update_conversation_metadata_field(id, key, value)
+            .update_conversation_metadata_fields(id, patch)
+            .await
+    }
+
+    /// Update metadata on a conversation. Returns `NotFound` if not owned by this user.
+    pub async fn update_conversation_metadata_field(
+        &self,
+        id: Uuid,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        let mut patch = serde_json::Map::with_capacity(1);
+        patch.insert(key.to_string(), value.clone());
+        self.update_conversation_metadata_fields(id, &serde_json::Value::Object(patch))
             .await
     }
 

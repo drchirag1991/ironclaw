@@ -273,28 +273,17 @@ impl Tool for PlanArtifactSaveTool {
         }
 
         if let Some(store) = self.store.as_ref() {
-            let updates = [
-                ("plan_artifact_title", serde_json::json!(artifact.title)),
-                (
-                    "plan_artifact_markdown",
-                    serde_json::json!(artifact.markdown),
-                ),
-                ("plan_artifact_path", serde_json::json!(artifact.path)),
-                (
-                    "plan_artifact_updated_at",
-                    serde_json::json!(artifact.updated_at.to_rfc3339()),
-                ),
-                (
-                    "plan_artifact_suggested_actions",
-                    serde_json::json!(artifact.suggested_actions),
-                ),
-            ];
-            for (key, value) in updates {
-                store
-                    .update_conversation_metadata_field(thread_id, key, &value)
-                    .await
-                    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-            }
+            let metadata_patch = serde_json::json!({
+                "plan_artifact_title": artifact.title,
+                "plan_artifact_markdown": artifact.markdown,
+                "plan_artifact_path": artifact.path,
+                "plan_artifact_updated_at": artifact.updated_at.to_rfc3339(),
+                "plan_artifact_suggested_actions": artifact.suggested_actions,
+            });
+            store
+                .update_conversation_metadata_fields(thread_id, &metadata_patch)
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
         }
 
         Ok(ToolOutput::success(

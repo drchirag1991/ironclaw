@@ -544,15 +544,19 @@ impl ConversationStore for LibSqlBackend {
         Ok((all, has_more))
     }
 
-    async fn update_conversation_metadata_field(
+    async fn update_conversation_metadata_fields(
         &self,
         id: Uuid,
-        key: &str,
-        value: &serde_json::Value,
+        patch: &serde_json::Value,
     ) -> Result<(), DatabaseError> {
+        if !patch.is_object() {
+            return Err(DatabaseError::Query(
+                "conversation metadata patch must be a JSON object".to_string(),
+            ));
+        }
+
         let conn = self.connect().await?;
-        // SQLite: use json_patch to merge the key
-        let patch = serde_json::json!({ key: value });
+        // SQLite: use json_patch to merge top-level keys.
         conn.execute(
             "UPDATE conversations SET metadata = json_patch(metadata, ?2) WHERE id = ?1",
             params![id.to_string(), patch.to_string()],

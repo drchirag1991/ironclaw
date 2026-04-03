@@ -409,9 +409,7 @@ pub enum Submission {
     },
 
     /// Generic thread-level plan mode.
-    PlanMode {
-        action: PlanModeAction,
-    },
+    PlanMode { action: PlanModeAction },
 
     /// Decision on a pending plan-exit review card.
     PlanExitDecision {

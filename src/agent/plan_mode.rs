@@ -32,6 +32,10 @@ const ALWAYS_ALLOWED_TOOLS: &[&str] = &[
     "image_analyze",
 ];
 
+const FORBIDDEN_SHELL_SYNTAX: &[&str] = &[
+    "&&", "||", ";", "|", "&", ">", "<", "$(", "`", "\\", "\n", "\r",
+];
+
 /// Instruction injected into the conversational prompt when a thread is in
 /// plan mode.
 pub(crate) const PLAN_MODE_PROMPT: &str = "PLAN MODE IS ACTIVE.\n\
@@ -90,7 +94,7 @@ pub(crate) fn check_tool_allowed(
             let Some(command) = params.get("command").and_then(|v| v.as_str()) else {
                 return Err("missing command");
             };
-            let has_forbidden_syntax = ["&&", "||", ";", "|", ">", "<", "$(", "`", "\n", "\r"]
+            let has_forbidden_syntax = FORBIDDEN_SHELL_SYNTAX
                 .iter()
                 .any(|needle| command.contains(needle));
 
@@ -171,6 +175,22 @@ mod tests {
             check_tool_allowed(
                 "shell",
                 &serde_json::json!({ "command": "cargo build" }),
+                &shell
+            )
+            .is_err()
+        );
+        assert!(
+            check_tool_allowed(
+                "shell",
+                &serde_json::json!({ "command": "ls & pwd" }),
+                &shell
+            )
+            .is_err()
+        );
+        assert!(
+            check_tool_allowed(
+                "shell",
+                &serde_json::json!({ "command": "ls \\\\tmp" }),
                 &shell
             )
             .is_err()

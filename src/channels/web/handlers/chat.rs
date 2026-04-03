@@ -10,7 +10,8 @@ use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
 use crate::channels::web::util::{
-    build_turns_from_db_messages, tool_error_for_display, truncate_preview,
+    build_turns_from_db_messages, pending_plan_exit_info_from_pending, plan_state_from_metadata,
+    tool_error_for_display, truncate_preview,
 };
 use axum::{
     Json,
@@ -139,7 +140,7 @@ pub async fn chat_history_handler(
         let owned = store
             .conversation_belongs_to_user(thread_id, &identity.user_id)
             .await
-            .unwrap_or(false);
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         if !owned {
             let sess = session.lock().await;
             if !sess.threads.contains_key(&thread_id) {
@@ -148,35 +149,93 @@ pub async fn chat_history_handler(
         }
     }
 
-    let persisted_metadata = if let Some(ref store) = state.store {
-        store
-            .get_conversation_metadata(thread_id)
-            .await
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
-    let persisted_plan_mode = persisted_metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("plan_mode").and_then(|v| v.as_bool()))
-        .unwrap_or(false);
-    let persisted_pending_plan_exit = persisted_metadata.as_ref().and_then(|metadata| {
-        crate::agent::session::PlanArtifact::from_metadata(metadata, thread_id).and_then(
-            |artifact| {
-                metadata
-                    .get("plan_exit_request_id")
-                    .and_then(|v| v.as_str())
-                    .map(|request_id| PendingPlanExitInfo {
-                        request_id: request_id.to_string(),
-                        title: artifact.title,
-                        markdown: artifact.markdown,
-                        path: Some(artifact.path),
-                        suggested_actions: artifact.suggested_actions,
+    let mut in_memory_plan_mode = None;
+    let mut in_memory_pending_plan_exit = None;
+
+    {
+        let sess = session.lock().await;
+        if let Some(thread) = sess.threads.get(&thread_id) {
+            in_memory_plan_mode = Some(thread.plan_mode);
+            in_memory_pending_plan_exit = thread
+                .pending_plan_exit
+                .as_ref()
+                .map(pending_plan_exit_info_from_pending);
+
+            let has_fresh_state = !thread.turns.is_empty()
+                || thread.pending_approval.is_some()
+                || thread.pending_plan_exit.is_some()
+                || thread.plan_mode;
+
+            if before_cursor.is_none() && has_fresh_state {
+                let turns: Vec<TurnInfo> = thread
+                    .turns
+                    .iter()
+                    .map(|t| TurnInfo {
+                        turn_number: t.turn_number,
+                        user_input: t.user_input.clone(),
+                        response: t.response.clone(),
+                        state: format!("{:?}", t.state),
+                        started_at: t.started_at.to_rfc3339(),
+                        completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
+                        tool_calls: t
+                            .tool_calls
+                            .iter()
+                            .map(|tc| ToolCallInfo {
+                                name: tc.name.clone(),
+                                has_result: tc.result.is_some(),
+                                has_error: tc.error.is_some(),
+                                result_preview: tc.result.as_ref().map(|r| {
+                                    let s = match r {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    };
+                                    truncate_preview(&s, 500)
+                                }),
+                                error: tc.error.as_deref().map(tool_error_for_display),
+                                rationale: tc.rationale.clone(),
+                            })
+                            .collect(),
+                        narrative: t.narrative.clone(),
                     })
-            },
-        )
-    });
+                    .collect();
+
+                let pending_gate = thread.pending_approval.as_ref().map(|pa| PendingGateInfo {
+                    request_id: pa.request_id.to_string(),
+                    thread_id: thread_id.to_string(),
+                    gate_name: "approval".into(),
+                    tool_name: pa.tool_name.clone(),
+                    description: pa.description.clone(),
+                    parameters: serde_json::to_string_pretty(&pa.parameters).unwrap_or_default(),
+                    resume_kind: serde_json::json!({"Approval":{"allow_always":true}}),
+                });
+                let pending_plan_exit = in_memory_pending_plan_exit.clone();
+
+                return Ok(Json(HistoryResponse {
+                    thread_id,
+                    plan_mode: thread.plan_mode,
+                    turns,
+                    has_more: false,
+                    oldest_timestamp: None,
+                    pending_gate,
+                    pending_plan_exit,
+                }));
+            }
+        }
+    }
+
+    let (persisted_plan_mode, persisted_pending_plan_exit) =
+        if let Some(plan_mode) = in_memory_plan_mode {
+            (plan_mode, in_memory_pending_plan_exit)
+        } else if let Some(ref store) = state.store {
+            let metadata = store
+                .get_conversation_metadata(thread_id)
+                .await
+                .ok()
+                .flatten();
+            plan_state_from_metadata(metadata.as_ref(), thread_id)
+        } else {
+            (false, None)
+        };
 
     // For paginated requests (before cursor set), always go to DB
     if before_cursor.is_some()
@@ -198,78 +257,6 @@ pub async fn chat_history_handler(
             pending_gate: None,
             pending_plan_exit: persisted_pending_plan_exit,
         }));
-    }
-
-    // Try in-memory first (freshest data for active threads)
-    // Lock only when checking in-memory state
-    {
-        let sess = session.lock().await;
-        if let Some(thread) = sess.threads.get(&thread_id)
-            && (!thread.turns.is_empty() || thread.pending_approval.is_some())
-        {
-            let turns: Vec<TurnInfo> = thread
-                .turns
-                .iter()
-                .map(|t| TurnInfo {
-                    turn_number: t.turn_number,
-                    user_input: t.user_input.clone(),
-                    response: t.response.clone(),
-                    state: format!("{:?}", t.state),
-                    started_at: t.started_at.to_rfc3339(),
-                    completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
-                    tool_calls: t
-                        .tool_calls
-                        .iter()
-                        .map(|tc| ToolCallInfo {
-                            name: tc.name.clone(),
-                            has_result: tc.result.is_some(),
-                            has_error: tc.error.is_some(),
-                            result_preview: tc.result.as_ref().map(|r| {
-                                let s = match r {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    other => other.to_string(),
-                                };
-                                truncate_preview(&s, 500)
-                            }),
-                            error: tc.error.as_deref().map(tool_error_for_display),
-                            rationale: tc.rationale.clone(),
-                        })
-                        .collect(),
-                    narrative: t.narrative.clone(),
-                })
-                .collect();
-
-            let pending_gate = thread.pending_approval.as_ref().map(|pa| PendingGateInfo {
-                request_id: pa.request_id.to_string(),
-                thread_id: thread_id.to_string(),
-                gate_name: "approval".into(),
-                tool_name: pa.tool_name.clone(),
-                description: pa.description.clone(),
-                parameters: serde_json::to_string_pretty(&pa.parameters).unwrap_or_default(),
-                resume_kind: serde_json::json!({"Approval":{"allow_always":true}}),
-            });
-            let pending_plan_exit =
-                thread
-                    .pending_plan_exit
-                    .as_ref()
-                    .map(|pending| PendingPlanExitInfo {
-                        request_id: pending.request_id.to_string(),
-                        title: pending.artifact.title.clone(),
-                        markdown: pending.artifact.markdown.clone(),
-                        path: Some(pending.artifact.path.clone()),
-                        suggested_actions: pending.artifact.suggested_actions.clone(),
-                    });
-
-            return Ok(Json(HistoryResponse {
-                thread_id,
-                plan_mode: thread.plan_mode,
-                turns,
-                has_more: false,
-                oldest_timestamp: None,
-                pending_gate,
-                pending_plan_exit,
-            }));
-        }
     }
 
     // Fall back to DB for historical threads not in memory (paginated)

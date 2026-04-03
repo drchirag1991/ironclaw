@@ -449,12 +449,22 @@ pub trait ConversationStore: Send + Sync {
         before: Option<DateTime<Utc>>,
         limit: i64,
     ) -> Result<(Vec<ConversationMessage>, bool), DatabaseError>;
+    async fn update_conversation_metadata_fields(
+        &self,
+        id: Uuid,
+        patch: &serde_json::Value,
+    ) -> Result<(), DatabaseError>;
     async fn update_conversation_metadata_field(
         &self,
         id: Uuid,
         key: &str,
         value: &serde_json::Value,
-    ) -> Result<(), DatabaseError>;
+    ) -> Result<(), DatabaseError> {
+        let mut patch = serde_json::Map::with_capacity(1);
+        patch.insert(key.to_string(), value.clone());
+        self.update_conversation_metadata_fields(id, &serde_json::Value::Object(patch))
+            .await
+    }
     async fn get_conversation_metadata(
         &self,
         id: Uuid,

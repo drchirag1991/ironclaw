@@ -2003,6 +2003,27 @@ impl Store {
         Ok((messages, has_more))
     }
 
+    /// Merge multiple keys into a conversation's metadata JSONB.
+    pub async fn update_conversation_metadata_fields(
+        &self,
+        id: Uuid,
+        patch: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        if !patch.is_object() {
+            return Err(DatabaseError::Query(
+                "conversation metadata patch must be a JSON object".to_string(),
+            ));
+        }
+
+        let conn = self.conn().await?;
+        conn.execute(
+            "UPDATE conversations SET metadata = metadata || $2 WHERE id = $1",
+            &[&id, &patch],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Merge a single key into a conversation's metadata JSONB.
     pub async fn update_conversation_metadata_field(
         &self,
@@ -2010,14 +2031,10 @@ impl Store {
         key: &str,
         value: &serde_json::Value,
     ) -> Result<(), DatabaseError> {
-        let conn = self.conn().await?;
-        let patch = serde_json::json!({ key: value });
-        conn.execute(
-            "UPDATE conversations SET metadata = metadata || $2 WHERE id = $1",
-            &[&id, &patch],
-        )
-        .await?;
-        Ok(())
+        let mut patch = serde_json::Map::with_capacity(1);
+        patch.insert(key.to_string(), value.clone());
+        self.update_conversation_metadata_fields(id, &serde_json::Value::Object(patch))
+            .await
     }
 
     /// Read the metadata JSONB for a conversation.
