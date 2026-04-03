@@ -50,10 +50,10 @@ use crate::db::Database;
 use crate::error::ChannelError;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
-use crate::skills::catalog::SkillCatalog;
-use crate::skills::registry::SkillRegistry;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
+use ironclaw_skills::catalog::SkillCatalog;
+use ironclaw_skills::registry::SkillRegistry;
 
 use self::log_layer::{LogBroadcaster, LogLevelHandle};
 
@@ -617,6 +617,7 @@ impl Channel for GatewayChannel {
                 instructions,
                 auth_url,
                 setup_url,
+                thread_id: None,
             },
             StatusUpdate::AuthCompleted {
                 extension_name,
@@ -626,6 +627,7 @@ impl Channel for GatewayChannel {
                 extension_name,
                 success,
                 message,
+                thread_id: None,
             },
             StatusUpdate::ImageGenerated { data_url, path } => AppEvent::ImageGenerated {
                 data_url,
@@ -658,6 +660,10 @@ impl Channel for GatewayChannel {
                 input_tokens,
                 output_tokens,
                 cost_usd,
+                thread_id,
+            },
+            StatusUpdate::SkillActivated { skill_names } => AppEvent::SkillActivated {
+                skill_names,
                 thread_id,
             },
         };
