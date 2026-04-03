@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
 
--- ==================== Workspace entities (V15) ====================
+-- ==================== Workspace entities (consolidated; V18 incremental) ====================
 
 CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
@@ -95,7 +95,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     thread_id TEXT,
     started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     last_activity TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    metadata TEXT NOT NULL DEFAULT '{}'
+    metadata TEXT NOT NULL DEFAULT '{}',
+    source_channel TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversations_channel ON conversations(channel);
@@ -670,6 +671,69 @@ INSERT OR IGNORE INTO leak_detection_patterns (id, name, pattern, severity, acti
     ('550e8400-e29b-41d4-a716-446655440011', 'mailchimp_api_key', '[a-f0-9]{32}-us[0-9]{1,2}', 'medium', 'block', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     ('550e8400-e29b-41d4-a716-446655440012', 'high_entropy_hex', '(?<![a-fA-F0-9])[a-fA-F0-9]{64}(?![a-fA-F0-9])', 'medium', 'warn', 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 
+-- ==================== User management (V14) ====================
+
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT UNIQUE,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    role TEXT NOT NULL DEFAULT 'member',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_login_at TEXT,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash BLOB NOT NULL,
+    token_prefix TEXT NOT NULL,
+    name TEXT NOT NULL,
+    expires_at TEXT,
+    last_used_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
+
+-- ==================== User identities (consolidated; V17 incremental) ====================
+
+CREATE TABLE IF NOT EXISTS user_identities (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    provider_user_id TEXT NOT NULL,
+    email TEXT,
+    email_verified INTEGER NOT NULL DEFAULT 0,
+    display_name TEXT,
+    avatar_url TEXT,
+    raw_profile TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (provider, provider_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_identities_user ON user_identities(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_identities_email ON user_identities(email) WHERE email IS NOT NULL;
+
+-- ==================== Document versions (consolidated; V16 incremental) ====================
+
+CREATE TABLE IF NOT EXISTS memory_document_versions (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES memory_documents(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    changed_by TEXT,
+    UNIQUE(document_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_doc_versions_lookup
+    ON memory_document_versions(document_id, version DESC);
 "#;
 
 /// Incremental migrations applied after the base schema.
@@ -850,6 +914,18 @@ CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
     ),
     (
         15,
+        "conversation_source_channel",
+        // Marked idempotent because fresh databases already have the column in
+        // the consolidated base schema and SQLite does not support
+        // ALTER TABLE ... ADD COLUMN IF NOT EXISTS.
+        //
+        // The runner checks pragma_table_info before executing the ALTER.
+        r#"
+ALTER TABLE conversations ADD COLUMN source_channel TEXT;
+"#,
+    ),
+    (
+        18,
         "workspaces",
         r#"
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -1039,16 +1115,52 @@ PRAGMA foreign_keys=ON;
     ),
     (
         16,
-        "conversation_source_channel",
-        // Add source_channel to conversations for cross-channel approval authorization.
-        // Skip logic lives in should_skip_migration_sql() because SQLite does
-        // not support IF NOT EXISTS for ADD COLUMN.
+        "document_versions",
         r#"
-ALTER TABLE conversations ADD COLUMN source_channel TEXT;
+CREATE TABLE IF NOT EXISTS memory_document_versions (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES memory_documents(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    changed_by TEXT,
+    UNIQUE(document_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_doc_versions_lookup
+    ON memory_document_versions(document_id, version DESC);
+"#,
+    ),
+    (
+        17,
+        "user_identities",
+        r#"
+CREATE TABLE IF NOT EXISTS user_identities (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    provider_user_id TEXT NOT NULL,
+    email TEXT,
+    email_verified INTEGER NOT NULL DEFAULT 0,
+    display_name TEXT,
+    avatar_url TEXT,
+    raw_profile TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (provider, provider_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_identities_user ON user_identities(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_identities_email ON user_identities(email) WHERE email IS NOT NULL;
 "#,
     ),
 ];
 
+/// Migrations whose ADD COLUMN should be skipped when the column already
+/// exists (e.g. because the base SCHEMA was updated to include it).
+/// Each entry is `(version, table_name, column_name)`.
+const IDEMPOTENT_ADD_COLUMN_MIGRATIONS: &[(i64, &str, &str)] =
+    &[(15, "conversations", "source_channel")];
 /// Check whether `table` already contains `column` via `pragma_table_info`.
 async fn column_exists(
     conn: &libsql::Connection,
@@ -1086,39 +1198,86 @@ async fn table_exists(
     Ok(rows.next().await.ok().flatten().is_some())
 }
 
+/// Repair databases where V15 was recorded as "document_versions" due to a
+/// migration numbering conflict in an earlier release. Deletes the stale
+/// _migrations row so V15 reruns with the correct SQL (conversation_source_channel).
+async fn repair_misnumbered_v15(
+    conn: &libsql::Connection,
+) -> Result<(), crate::error::DatabaseError> {
+    use crate::error::DatabaseError;
+
+    let mut rows = conn
+        .query(
+            "SELECT name FROM _migrations WHERE version = 15",
+            libsql::params![],
+        )
+        .await
+        .map_err(|e| DatabaseError::Migration(format!("V15 repair check failed: {e}")))?;
+
+    let maybe_row = rows
+        .next()
+        .await
+        .map_err(|e| DatabaseError::Migration(format!("V15 repair: failed to fetch row: {e}")))?;
+    if let Some(row) = maybe_row {
+        let name: String = row.get(0).map_err(|e| {
+            DatabaseError::Migration(format!("V15 repair: failed to read name: {e}"))
+        })?;
+        if name == "document_versions" {
+            tracing::warn!(
+                recorded_name = %name,
+                "libSQL: V15 was mis-recorded as document_versions; deleting stale _migrations row to reapply"
+            );
+            conn.execute(
+                "DELETE FROM _migrations WHERE version = 15",
+                libsql::params![],
+            )
+            .await
+            .map_err(|e| {
+                DatabaseError::Migration(format!("V15 repair: failed to delete stale row: {e}"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 async fn should_skip_migration_sql(
     conn: &libsql::Connection,
     version: i64,
 ) -> Result<bool, crate::error::DatabaseError> {
-    match version {
-        13 => column_exists(conn, "routines", "workspace_id").await,
-        15 => {
-            let required_tables = ["workspaces", "workspace_members"];
-            for table in required_tables {
-                if !table_exists(conn, table).await? {
-                    return Ok(false);
-                }
-            }
-
-            let required_columns = [
-                ("conversations", "workspace_id"),
-                ("agent_jobs", "workspace_id"),
-                ("memory_documents", "workspace_id"),
-                ("routines", "workspace_id"),
-                ("settings", "workspace_id"),
-            ];
-
-            for (table, column) in required_columns {
-                if !column_exists(conn, table, column).await? {
-                    return Ok(false);
-                }
-            }
-
-            Ok(true)
-        }
-        16 => column_exists(conn, "conversations", "source_channel").await,
-        _ => Ok(false),
+    if version == 13 {
+        return column_exists(conn, "routines", "workspace_id").await;
     }
+
+    if let Some(&(_, table, column)) = IDEMPOTENT_ADD_COLUMN_MIGRATIONS
+        .iter()
+        .find(|(migration_version, _, _)| *migration_version == version)
+    {
+        return column_exists(conn, table, column).await;
+    }
+
+    if version == 18 {
+        for table in ["workspaces", "workspace_members"] {
+            if !table_exists(conn, table).await? {
+                return Ok(false);
+            }
+        }
+
+        for (table, column) in [
+            ("conversations", "workspace_id"),
+            ("agent_jobs", "workspace_id"),
+            ("memory_documents", "workspace_id"),
+            ("routines", "workspace_id"),
+            ("settings", "workspace_id"),
+        ] {
+            if !column_exists(conn, table, column).await? {
+                return Ok(false);
+            }
+        }
+
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 /// Run incremental migrations that haven't been applied yet.
@@ -1127,6 +1286,11 @@ async fn should_skip_migration_sql(
 /// recorded in `_migrations` so it won't run again.
 pub async fn run_incremental(conn: &libsql::Connection) -> Result<(), crate::error::DatabaseError> {
     use crate::error::DatabaseError;
+
+    // Repair: an earlier release mis-recorded V15 as "document_versions".
+    // Delete the stale record so V15 reruns as conversation_source_channel
+    // and later migrations can apply in the correct order.
+    repair_misnumbered_v15(conn).await?;
 
     let mut applied_count = 0;
     for &(version, name, sql) in INCREMENTAL_MIGRATIONS {
@@ -1392,6 +1556,12 @@ CREATE INDEX idx_settings_user ON settings(user_id);
         assert!(table_exists(&conn, "workspaces").await.unwrap());
         assert!(table_exists(&conn, "workspace_members").await.unwrap());
         assert!(
+            table_exists(&conn, "memory_document_versions")
+                .await
+                .unwrap()
+        );
+        assert!(table_exists(&conn, "user_identities").await.unwrap());
+        assert!(
             column_exists(&conn, "routines", "workspace_id")
                 .await
                 .unwrap()
@@ -1404,6 +1574,8 @@ CREATE INDEX idx_settings_user ON settings(user_id);
         assert!(migration_recorded(&conn, 13).await.unwrap());
         assert!(migration_recorded(&conn, 15).await.unwrap());
         assert!(migration_recorded(&conn, 16).await.unwrap());
+        assert!(migration_recorded(&conn, 17).await.unwrap());
+        assert!(migration_recorded(&conn, 18).await.unwrap());
         assert!(
             index_exists(&conn, "idx_routines_event_triggers_personal")
                 .await
@@ -1498,6 +1670,12 @@ CREATE INDEX idx_settings_user ON settings(user_id);
 
         assert!(table_exists(&conn, "workspaces").await.unwrap());
         assert!(table_exists(&conn, "workspace_members").await.unwrap());
+        assert!(
+            table_exists(&conn, "memory_document_versions")
+                .await
+                .unwrap()
+        );
+        assert!(table_exists(&conn, "user_identities").await.unwrap());
         for (table, column) in [
             ("conversations", "workspace_id"),
             ("agent_jobs", "workspace_id"),
@@ -1531,6 +1709,8 @@ CREATE INDEX idx_settings_user ON settings(user_id);
 
         assert!(migration_recorded(&conn, 15).await.unwrap());
         assert!(migration_recorded(&conn, 16).await.unwrap());
+        assert!(migration_recorded(&conn, 17).await.unwrap());
+        assert!(migration_recorded(&conn, 18).await.unwrap());
         assert!(
             !index_exists(&conn, "idx_routines_event_triggers")
                 .await

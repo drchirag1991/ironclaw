@@ -1,15 +1,6 @@
-//! Chat handlers: send, approval, auth, SSE events, WebSocket, history, threads.
+//! Chat handlers: send, approval, auth, SSE events, WebSocket, history, and shared helpers.
 
 use std::sync::Arc;
-
-use axum::{
-    Json,
-    extract::{Query, State, WebSocketUpgrade},
-    http::StatusCode,
-    response::IntoResponse,
-};
-use serde::Deserialize;
-use uuid::Uuid;
 
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::AuthenticatedUser;
@@ -19,6 +10,14 @@ use crate::channels::web::types::*;
 use crate::channels::web::util::{
     build_turns_from_db_messages, tool_error_for_display, truncate_preview,
 };
+use axum::{
+    Json,
+    extract::{Query, State, WebSocketUpgrade},
+    http::StatusCode,
+    response::IntoResponse,
+};
+use serde::Deserialize;
+use uuid::Uuid;
 
 pub async fn chat_send_handler(
     State(state): State<Arc<GatewayState>>,
@@ -228,6 +227,7 @@ pub async fn chat_auth_token_handler(
                         instructions: Some(result.message),
                         auth_url: None,
                         setup_url: None,
+                        thread_id: req.thread_id.clone(),
                     },
                 );
             } else {
@@ -240,6 +240,7 @@ pub async fn chat_auth_token_handler(
                         extension_name: req.extension_name.clone(),
                         success: true,
                         message: result.message,
+                        thread_id: req.thread_id.clone(),
                     },
                 );
             }
@@ -257,6 +258,7 @@ pub async fn chat_auth_token_handler(
                         instructions: Some(msg.clone()),
                         auth_url: None,
                         setup_url: None,
+                        thread_id: req.thread_id.clone(),
                     },
                 );
             }
@@ -274,6 +276,8 @@ pub async fn chat_auth_cancel_handler(
     clear_auth_mode(&state, &identity.user_id).await;
     Ok(Json(ActionResponse::ok("Auth cancelled")))
 }
+
+// ── Shared helpers used by server.rs handlers ──────────────────────────
 
 /// Clear pending auth mode on the active thread.
 pub async fn clear_auth_mode(state: &GatewayState, user_id: &str) {
@@ -313,6 +317,8 @@ async fn resolve_auth_event_workspace_scope(
 
     Ok(active_auth_workspace_scope(state, &user.user_id).await)
 }
+
+// ── SSE / WebSocket handlers ───────────────────────────────────────────
 
 pub async fn chat_events_handler(
     State(state): State<Arc<GatewayState>>,
@@ -371,6 +377,8 @@ pub async fn chat_ws_handler(
         crate::channels::web::ws::handle_ws_connection(socket, state, identity, workspace_id)
     }))
 }
+
+// ── Thread management and history handlers ────────────────────────────
 
 #[derive(Deserialize)]
 pub struct HistoryQuery {
@@ -454,7 +462,7 @@ pub async fn chat_history_handler(
             turns,
             has_more,
             oldest_timestamp,
-            pending_approval: None,
+            pending_gate: None,
         }));
     }
 
@@ -497,22 +505,22 @@ pub async fn chat_history_handler(
                 })
                 .collect();
 
-            let pending_approval = thread
-                .pending_approval
-                .as_ref()
-                .map(|pa| PendingApprovalInfo {
-                    request_id: pa.request_id.to_string(),
-                    tool_name: pa.tool_name.clone(),
-                    description: pa.description.clone(),
-                    parameters: serde_json::to_string_pretty(&pa.parameters).unwrap_or_default(),
-                });
+            let pending_gate = thread.pending_approval.as_ref().map(|pa| PendingGateInfo {
+                request_id: pa.request_id.to_string(),
+                thread_id: thread_id.to_string(),
+                gate_name: "approval".into(),
+                tool_name: pa.tool_name.clone(),
+                description: pa.description.clone(),
+                parameters: serde_json::to_string_pretty(&pa.parameters).unwrap_or_default(),
+                resume_kind: serde_json::json!({"Approval":{"allow_always":true}}),
+            });
 
             return Ok(Json(HistoryResponse {
                 thread_id,
                 turns,
                 has_more: false,
                 oldest_timestamp: None,
-                pending_approval,
+                pending_gate,
             }));
         }
     }
@@ -532,7 +540,7 @@ pub async fn chat_history_handler(
                 turns,
                 has_more,
                 oldest_timestamp,
-                pending_approval: None,
+                pending_gate: None,
             }));
         }
     }
@@ -543,7 +551,7 @@ pub async fn chat_history_handler(
         turns: Vec::new(),
         has_more: false,
         oldest_timestamp: None,
-        pending_approval: None,
+        pending_gate: None,
     }))
 }
 
@@ -724,6 +732,7 @@ pub async fn chat_new_thread_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::web::util::build_turns_from_db_messages;
 
     #[test]
     fn test_build_turns_from_db_messages_complete() {
