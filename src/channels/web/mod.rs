@@ -104,6 +104,7 @@ impl GatewayChannel {
             env_auth: MultiAuthState::single(auth_token, owner_id.clone()),
             db_auth: None,
             oidc: oidc_state,
+            oidc_allowed_domains: Vec::new(),
         };
 
         let state = Arc::new(GatewayState {
@@ -233,6 +234,20 @@ impl GatewayChannel {
         // on security-critical actions (suspend, role change, token revoke).
         self.rebuild_state(|s| s.db_auth = Some(Arc::new(authenticator.clone())));
         self.auth.db_auth = Some(authenticator);
+        self
+    }
+
+    /// Apply gateway OAuth configuration.
+    ///
+    /// This branch only needs the OIDC-domain restriction portion at runtime.
+    /// Direct social-login routes from newer gateway builds are not wired into
+    /// this merge target, so provider-specific settings are ignored here.
+    pub fn with_oauth(
+        mut self,
+        oauth: crate::config::oauth::OAuthConfig,
+        _gateway_port: u16,
+    ) -> Self {
+        self.auth.oidc_allowed_domains = oauth.allowed_domains;
         self
     }
 
@@ -460,6 +475,7 @@ impl Channel for GatewayChannel {
                 instructions,
                 auth_url,
                 setup_url,
+                thread_id: None,
             },
             StatusUpdate::AuthCompleted {
                 extension_name,
@@ -469,6 +485,7 @@ impl Channel for GatewayChannel {
                 extension_name,
                 success,
                 message,
+                thread_id: None,
             },
             StatusUpdate::ImageGenerated { data_url, path } => AppEvent::ImageGenerated {
                 data_url,

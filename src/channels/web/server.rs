@@ -987,6 +987,7 @@ async fn oauth_callback_handler(
                     extension_name: flow.extension_name.clone(),
                     success: false,
                     message: "OAuth flow expired. Please try again.".to_string(),
+                    thread_id: None,
                 },
             );
         }
@@ -1164,6 +1165,7 @@ async fn oauth_callback_handler(
                 extension_name: flow.extension_name,
                 success,
                 message: final_message.clone(),
+                thread_id: None,
             },
         );
     }
@@ -1427,6 +1429,7 @@ async fn slack_relay_oauth_callback_handler(
         extension_name: DEFAULT_RELAY_NAME.to_string(),
         success,
         message: message.clone(),
+        thread_id: None,
     });
 
     if success {
@@ -1695,6 +1698,7 @@ async fn chat_auth_token_handler(
                         instructions: Some(result.message),
                         auth_url: None,
                         setup_url: None,
+                        thread_id: None,
                     },
                 );
             } else if result.activated {
@@ -1707,6 +1711,7 @@ async fn chat_auth_token_handler(
                         extension_name: req.extension_name.clone(),
                         success: true,
                         message: result.message,
+                        thread_id: None,
                     },
                 );
             } else {
@@ -1716,6 +1721,7 @@ async fn chat_auth_token_handler(
                         extension_name: req.extension_name.clone(),
                         success: false,
                         message: result.message,
+                        thread_id: None,
                     },
                 );
             }
@@ -1758,6 +1764,7 @@ async fn chat_auth_token_handler(
                                         "Credential '{}' stored successfully.",
                                         req.extension_name
                                     ),
+                                    thread_id: None,
                                 },
                             );
                             return Ok(Json(ActionResponse::ok(format!(
@@ -1788,6 +1795,7 @@ async fn chat_auth_token_handler(
                         instructions: Some(msg.clone()),
                         auth_url: None,
                         setup_url: None,
+                        thread_id: None,
                     },
                 );
             }
@@ -2773,6 +2781,7 @@ async fn extensions_setup_submit_handler(
                         extension_name: name.clone(),
                         success: result.activated,
                         message: resp.message.clone(),
+                        thread_id: None,
                     },
                 );
             }

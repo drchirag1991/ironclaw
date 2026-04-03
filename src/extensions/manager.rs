@@ -1324,6 +1324,10 @@ impl ExtensionManager {
                         "Channel relay extensions cannot be installed by URL".to_string(),
                     ))
                 }
+                ExtensionKind::AcpAgent => Err(ExtensionError::InstallFailed(
+                    "ACP agents are configured via 'ironclaw acp add', not the extension manager"
+                        .to_string(),
+                )),
             }
             .map_err(|e| {
                 let sanitized = sanitize_url_for_logging(url);
@@ -1356,6 +1360,9 @@ impl ExtensionManager {
             ExtensionKind::WasmTool => self.auth_wasm_tool(name, user_id).await,
             ExtensionKind::WasmChannel => self.auth_wasm_channel_status(name, user_id).await,
             ExtensionKind::ChannelRelay => self.auth_channel_relay(name, user_id).await,
+            ExtensionKind::AcpAgent => {
+                Ok(AuthResult::no_auth_required(name.to_string(), ExtensionKind::AcpAgent))
+            }
         }
     }
 
@@ -1373,6 +1380,15 @@ impl ExtensionManager {
             ExtensionKind::WasmTool => self.activate_wasm_tool(name, user_id).await,
             ExtensionKind::WasmChannel => self.activate_wasm_channel(name, user_id).await,
             ExtensionKind::ChannelRelay => self.activate_channel_relay(name, user_id).await,
+            ExtensionKind::AcpAgent => Ok(ActivateResult {
+                name: name.to_string(),
+                kind: ExtensionKind::AcpAgent,
+                tools_loaded: Vec::new(),
+                message: format!(
+                    "ACP agent '{}' is managed via 'ironclaw acp' commands",
+                    name
+                ),
+            }),
         }
     }
 
@@ -1813,6 +1829,10 @@ impl ExtensionManager {
 
                 Ok(format!("Removed channel relay '{}'", name))
             }
+            ExtensionKind::AcpAgent => Ok(format!(
+                "ACP agent '{}' should be removed via 'ironclaw acp remove {}'",
+                name, name
+            )),
         }
     }
 
@@ -1904,7 +1924,7 @@ impl ExtensionManager {
                 &self.wasm_channels_dir,
                 crate::tools::wasm::WIT_CHANNEL_VERSION,
             ),
-            ExtensionKind::McpServer | ExtensionKind::ChannelRelay => {
+            ExtensionKind::McpServer | ExtensionKind::ChannelRelay | ExtensionKind::AcpAgent => {
                 return UpgradeOutcome {
                     name: name.to_string(),
                     kind,
@@ -1930,7 +1950,9 @@ impl ExtensionManager {
                                 .ok()
                                 .and_then(|c| c.wit_version)
                         }
-                        ExtensionKind::McpServer | ExtensionKind::ChannelRelay => None,
+                        ExtensionKind::McpServer
+                        | ExtensionKind::ChannelRelay
+                        | ExtensionKind::AcpAgent => None,
                     };
                     wit
                 }
@@ -2099,6 +2121,14 @@ impl ExtensionManager {
                     "name": name,
                     "kind": "channel_relay",
                     "active": self.active_channel_names.read().await.contains(name),
+                });
+                Ok(info)
+            }
+            ExtensionKind::AcpAgent => {
+                let info = serde_json::json!({
+                    "name": name,
+                    "kind": "acp_agent",
+                    "installed": true,
                 });
                 Ok(info)
             }
@@ -2291,6 +2321,9 @@ impl ExtensionManager {
                     ),
                 })
             }
+            ExtensionKind::AcpAgent => Err(ExtensionError::InstallFailed(
+                "ACP agents are configured via 'ironclaw acp add', not the registry".to_string(),
+            )),
         }
     }
 
@@ -2652,6 +2685,7 @@ impl ExtensionManager {
             ExtensionKind::WasmChannel => "WASM channel",
             ExtensionKind::McpServer => "MCP server",
             ExtensionKind::ChannelRelay => "channel relay",
+            ExtensionKind::AcpAgent => "ACP agent",
         };
 
         tracing::info!(
@@ -2862,6 +2896,7 @@ impl ExtensionManager {
                 },
                 client_secret_expires_at,
                 created_at: std::time::Instant::now(),
+                auto_activate_extension: true,
             };
 
             Ok(self
@@ -3133,7 +3168,7 @@ impl ExtensionManager {
                     oauth_scopes_secret_name(&token_secret_name),
                 );
             }
-            ExtensionKind::ChannelRelay => {}
+            ExtensionKind::ChannelRelay | ExtensionKind::AcpAgent => {}
         }
 
         Ok(plan)
@@ -3630,6 +3665,7 @@ impl ExtensionManager {
                 client_secret_secret_name: None,
                 client_secret_expires_at: None,
                 created_at: std::time::Instant::now(),
+                auto_activate_extension: true,
             };
 
             Ok(self
@@ -3739,6 +3775,7 @@ impl ExtensionManager {
                         extension_name: ext_name,
                         success,
                         message,
+                        thread_id: None,
                     });
                 }
             });
@@ -5661,6 +5698,11 @@ impl ExtensionManager {
                 }];
                 (std::collections::HashSet::new(), relay_fields)
             }
+            ExtensionKind::AcpAgent => {
+                return Err(ExtensionError::Other(
+                    "ACP agents do not require setup through the extension manager".to_string(),
+                ));
+            }
         };
 
         let allowed_fields: std::collections::HashSet<String> =
@@ -5946,7 +5988,7 @@ impl ExtensionManager {
             ExtensionKind::WasmChannel => self.activate_wasm_channel(name, user_id).await,
             ExtensionKind::McpServer => self.activate_mcp(name, user_id).await,
             ExtensionKind::ChannelRelay => self.activate_channel_relay(name, user_id).await,
-            ExtensionKind::WasmTool => {
+            ExtensionKind::WasmTool | ExtensionKind::AcpAgent => {
                 return Ok(ConfigureResult {
                     message: format!("Configuration saved for '{}'.", name),
                     activated: false,
@@ -6108,6 +6150,11 @@ impl ExtensionManager {
             }
             ExtensionKind::ChannelRelay => {
                 return Err(ExtensionError::AuthRequired);
+            }
+            ExtensionKind::AcpAgent => {
+                return Err(ExtensionError::Other(
+                    "ACP agents do not use token-based authentication".to_string(),
+                ));
             }
         };
 

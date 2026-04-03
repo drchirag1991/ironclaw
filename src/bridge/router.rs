@@ -149,6 +149,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                     )),
                     auth_url: None,
                     setup_url: None,
+                    thread_id: None,
                 };
                 sse_for_auth.broadcast(event);
             })))
@@ -1297,6 +1298,7 @@ pub async fn handle_with_engine(
                                         "Credential '{}' stored.",
                                         pending.credential_name
                                     ),
+                                    thread_id: None,
                                 },
                             );
                         }
