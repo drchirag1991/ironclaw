@@ -33,6 +33,7 @@ use crate::widgets::approval::{ApprovalAction, ApprovalWidget};
 use crate::widgets::command_palette::CommandPaletteWidget;
 use crate::widgets::help_overlay::HelpOverlayWidget;
 use crate::widgets::logs::LogsWidget;
+use crate::widgets::model_picker::{ModelPickerState, ModelPickerWidget};
 use crate::widgets::registry::{BuiltinWidgets, create_default_widgets};
 use crate::widgets::thread_picker::ThreadPickerWidget;
 use crate::widgets::{
@@ -70,6 +71,8 @@ pub struct TuiAppConfig {
     pub memory_count: usize,
     /// Identity files loaded at startup (e.g. "AGENTS.md", "SOUL.md").
     pub identity_files: Vec<String>,
+    /// Best-effort model list for the `/model` picker.
+    pub available_models: Vec<String>,
 }
 
 /// Start the TUI application. Returns a handle for bi-directional communication.
@@ -142,6 +145,7 @@ async fn run_tui(
         workspace_path: config.workspace_path,
         memory_count: config.memory_count,
         identity_files: config.identity_files,
+        model_picker: ModelPickerState::with_models(config.available_models),
         ..AppState::default()
     };
 
@@ -320,20 +324,7 @@ async fn handle_event(
                     state.history_draft = widgets.input_box.current_text();
                 }
 
-                if !state.command_palette.visible {
-                    if let Some(cmd) =
-                        crate::input::parse_slash_command(&widgets.input_box.current_text())
-                    {
-                        state.command_palette.open(cmd);
-                    }
-                } else {
-                    let input = widgets.input_box.current_text();
-                    if input.starts_with('/') {
-                        state.command_palette.open(input.trim());
-                    } else {
-                        state.command_palette.close();
-                    }
-                }
+                update_input_overlays_from_input(&widgets.input_box, state);
 
                 if state.search.active {
                     state.search.query = widgets.input_box.current_text();
@@ -348,12 +339,24 @@ async fn handle_event(
 
             match action {
                 InputAction::Submit => {
-                    // Close palette if open
+                    let selected_model = if state.model_picker.visible {
+                        state.model_picker.selected_model().map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    state.model_picker.close();
                     state.command_palette.close();
                     let text = widgets.input_box.take_input();
-                    let trimmed = text.trim().to_string();
+                    let trimmed = if let Some(ref model) = selected_model {
+                        format!("/model {model}")
+                    } else {
+                        text.trim().to_string()
+                    };
                     let attachments = std::mem::take(&mut state.pending_attachments);
                     if !trimmed.is_empty() || !attachments.is_empty() {
+                        state.awaiting_model_list = selected_model.is_none()
+                            && attachments.is_empty()
+                            && trimmed == "/model";
                         // Push to input history
                         if !trimmed.is_empty() {
                             state.input_history.push(trimmed.clone());
@@ -382,6 +385,9 @@ async fn handle_event(
                             cost_summary: None,
                         });
                         state.scroll_offset = 0;
+                        if let Some(model) = selected_model {
+                            state.model = model;
+                        }
                         // Send to agent
                         let _ = msg_tx
                             .send(TuiUserMessage {
@@ -482,19 +488,121 @@ async fn handle_event(
                     }
                 }
                 InputAction::PaletteUp => {
-                    state.command_palette.move_up();
+                    if state.model_picker.visible {
+                        state.model_picker.move_up();
+                    } else {
+                        state.command_palette.move_up();
+                    }
                 }
                 InputAction::PaletteDown => {
-                    state.command_palette.move_down();
+                    if state.model_picker.visible {
+                        state.model_picker.move_down();
+                    } else {
+                        state.command_palette.move_down();
+                    }
                 }
                 InputAction::PaletteSelect => {
-                    if let Some(cmd) = state.command_palette.selected_command() {
-                        let text = format!("{cmd} ");
-                        widgets.input_box.set_text(&text);
+                    if state.model_picker.visible {
+                        let command = state
+                            .model_picker
+                            .selected_model()
+                            .map(|model| format!("/model {model}"))
+                            .unwrap_or_else(|| widgets.input_box.current_text().trim().to_string());
+                        let attachments = std::mem::take(&mut state.pending_attachments);
+                        let _ = widgets.input_box.take_input();
+                        state.model_picker.close();
+                        state.command_palette.close();
+
+                        if !command.is_empty() || !attachments.is_empty() {
+                            state.awaiting_model_list =
+                                attachments.is_empty() && command == "/model";
+                            if !command.is_empty() {
+                                state.input_history.push(command.clone());
+                            }
+                            state.history_index = None;
+                            state.history_draft.clear();
+                            state.suggestions.clear();
+
+                            let display_content = if attachments.is_empty() {
+                                command.clone()
+                            } else {
+                                let labels: Vec<&str> =
+                                    attachments.iter().map(|a| a.label.as_str()).collect();
+                                format!("{command} [{}]", labels.join("] ["))
+                            };
+
+                            state.messages.push(ChatMessage {
+                                role: MessageRole::User,
+                                content: display_content,
+                                timestamp: chrono::Utc::now(),
+                                cost_summary: None,
+                            });
+                            state.scroll_offset = 0;
+
+                            if let Some(model) = command.strip_prefix("/model ") {
+                                state.model = model.to_string();
+                            }
+
+                            let _ = msg_tx
+                                .send(TuiUserMessage {
+                                    text: command,
+                                    attachments,
+                                })
+                                .await;
+                        }
+                    } else if let Some(cmd) = state.command_palette.selected_command() {
+                        state.command_palette.close();
+                        if cmd == "/model" {
+                            if state.model_picker.has_models() {
+                                widgets.input_box.set_text("/model ");
+                                state.model_picker.open("");
+                            } else {
+                                let command = cmd.to_string();
+                                let attachments = std::mem::take(&mut state.pending_attachments);
+                                let _ = widgets.input_box.take_input();
+
+                                if !command.is_empty() || !attachments.is_empty() {
+                                    state.awaiting_model_list =
+                                        attachments.is_empty() && command == "/model";
+                                    if !command.is_empty() {
+                                        state.input_history.push(command.clone());
+                                    }
+                                    state.history_index = None;
+                                    state.history_draft.clear();
+                                    state.suggestions.clear();
+
+                                    let display_content = if attachments.is_empty() {
+                                        command.clone()
+                                    } else {
+                                        let labels: Vec<&str> =
+                                            attachments.iter().map(|a| a.label.as_str()).collect();
+                                        format!("{command} [{}]", labels.join("] ["))
+                                    };
+
+                                    state.messages.push(ChatMessage {
+                                        role: MessageRole::User,
+                                        content: display_content,
+                                        timestamp: chrono::Utc::now(),
+                                        cost_summary: None,
+                                    });
+                                    state.scroll_offset = 0;
+
+                                    let _ = msg_tx
+                                        .send(TuiUserMessage {
+                                            text: command,
+                                            attachments,
+                                        })
+                                        .await;
+                                }
+                            }
+                        } else {
+                            let text = format!("{cmd} ");
+                            widgets.input_box.set_text(&text);
+                        }
                     }
-                    state.command_palette.close();
                 }
                 InputAction::PaletteClose => {
+                    state.model_picker.close();
                     state.command_palette.close();
                 }
                 InputAction::SearchToggle => {
@@ -533,6 +641,7 @@ async fn handle_event(
                         state.history_index = Some(new_idx);
                         if let Some(text) = state.input_history.get(new_idx) {
                             widgets.input_box.set_text(text);
+                            update_input_overlays_from_input(&widgets.input_box, state);
                         }
                     }
                 }
@@ -543,11 +652,13 @@ async fn handle_event(
                             state.history_index = None;
                             let draft = state.history_draft.clone();
                             widgets.input_box.set_text(&draft);
+                            update_input_overlays_from_input(&widgets.input_box, state);
                         } else {
                             let new_idx = idx + 1;
                             state.history_index = Some(new_idx);
                             if let Some(text) = state.input_history.get(new_idx) {
                                 widgets.input_box.set_text(text);
+                                update_input_overlays_from_input(&widgets.input_box, state);
                             }
                         }
                     }
@@ -655,7 +766,7 @@ async fn handle_event(
                     } else {
                         widgets.input_box.handle_key(key, state);
                         // Update command palette visibility based on input content
-                        update_palette_from_input(&widgets.input_box, state);
+                        update_input_overlays_from_input(&widgets.input_box, state);
                     }
                 }
             }
@@ -830,6 +941,12 @@ async fn handle_event(
             let was_streaming = state.is_streaming;
             state.is_streaming = false;
             state.status_text.clear();
+            let parsed_model_response = if state.awaiting_model_list {
+                parse_model_list_response(&content)
+            } else {
+                None
+            };
+            state.awaiting_model_list = false;
             // Streaming responses accumulate via StreamChunk; non-streaming
             // responses still need a fresh assistant message.
             if let Some(last) = state.messages.last_mut() {
@@ -853,6 +970,13 @@ async fn handle_event(
             }
             state.scroll_offset = 0;
             state.active_tools.clear();
+
+            if let Some((active_model, models)) = parsed_model_response {
+                state.model = active_model;
+                state.model_picker.set_models(models);
+                widgets.input_box.set_text("/model ");
+                update_input_overlays_from_input(&widgets.input_box, state);
+            }
         }
 
         TuiEvent::JobStarted { job_id, title } => {
@@ -1168,7 +1292,7 @@ fn resolve_key_action(
     widgets: &BuiltinWidgets,
 ) -> InputAction {
     let approval_active = state.pending_approval.is_some();
-    let palette_active = state.command_palette.visible;
+    let palette_active = state.command_palette.visible || state.model_picker.visible;
     let search_active = state.search.active;
     let help_active = state.help_visible;
     let tool_detail_active = state.tool_detail_modal.is_some();
@@ -1216,6 +1340,49 @@ fn tool_activity_matches(tool: &ToolActivity, name: &str, call_id: Option<&str>)
     match call_id {
         Some(call_id) => tool.call_id.as_deref() == Some(call_id),
         None => tool.name == name,
+    }
+}
+
+fn parse_model_list_response(content: &str) -> Option<(String, Vec<String>)> {
+    let mut lines = content.lines();
+    let active_model = lines
+        .next()?
+        .strip_prefix("Active model: ")?
+        .trim()
+        .to_string();
+
+    let mut in_model_section = false;
+    let mut models = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "Available models:" {
+            in_model_section = true;
+            continue;
+        }
+
+        if !in_model_section {
+            continue;
+        }
+
+        if trimmed.is_empty() || trimmed.starts_with("Use /model ") {
+            break;
+        }
+
+        let model = trimmed
+            .strip_suffix(" (active)")
+            .unwrap_or(trimmed)
+            .trim()
+            .to_string();
+        if !model.is_empty() {
+            models.push(model);
+        }
+    }
+
+    if models.is_empty() {
+        None
+    } else {
+        Some((active_model, models))
     }
 }
 
@@ -1756,6 +1923,13 @@ fn render_frame(
         }
     }
 
+    if state.model_picker.visible {
+        let modal_area = ModelPickerWidget::modal_area(size, state.model_picker.filtered.len());
+        widgets
+            .model_picker
+            .render_picker(modal_area, frame.buffer_mut(), state);
+    }
+
     // Approval modal (rendered on top of everything)
     if state.pending_approval.is_some() {
         let modal_area = ApprovalWidget::modal_area(size);
@@ -1794,13 +1968,26 @@ fn render_frame(
     capture_screen_snapshot(frame, state);
 }
 
-/// Check input text and open/close the command palette accordingly.
-fn update_palette_from_input(
+/// Check input text and update slash-command overlays.
+fn update_input_overlays_from_input(
     input_box: &crate::widgets::input_box::InputBoxWidget,
     state: &mut AppState,
 ) {
     let text = input_box.current_text();
     let trimmed = text.trim();
+
+    if state.model_picker.has_models() && (trimmed == "/model" || trimmed.starts_with("/model ")) {
+        let filter = trimmed
+            .split_once(' ')
+            .map(|(_, rest)| rest.trim())
+            .unwrap_or("");
+        state.command_palette.close();
+        state.model_picker.open(filter);
+        return;
+    }
+
+    state.model_picker.close();
+
     if trimmed.starts_with('/') && !trimmed.contains(' ') {
         // Text after the leading '/'
         let filter = &trimmed[1..];
@@ -2433,6 +2620,159 @@ mod tests {
 
         assert_eq!(widgets.input_box.current_text(), "draft prompt");
         assert_eq!(state.history_index, None);
+    }
+
+    #[test]
+    fn slash_model_opens_model_picker_instead_of_command_palette() {
+        let mut state = AppState::default();
+        state.model_picker.set_models(vec![
+            "gpt-4o".to_string(),
+            "gpt-5".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        ]);
+
+        let layout = TuiLayout::default();
+        let mut widgets = create_default_widgets(&layout);
+        widgets.input_box.set_text("/model gpt");
+
+        update_input_overlays_from_input(&widgets.input_box, &mut state);
+
+        assert!(state.model_picker.visible);
+        assert_eq!(state.model_picker.filter, "gpt");
+        assert_eq!(state.model_picker.filtered.len(), 2);
+        assert!(!state.command_palette.visible);
+    }
+
+    #[tokio::test]
+    async fn enter_on_model_picker_submits_selected_model_command() {
+        let mut state = AppState::default();
+        state.model = "gpt-4o".to_string();
+        state
+            .model_picker
+            .set_models(vec!["gpt-4o".to_string(), "gpt-5".to_string()]);
+
+        let layout = TuiLayout::default();
+        let mut widgets = create_default_widgets(&layout);
+        let (msg_tx, mut msg_rx) = mpsc::channel(4);
+
+        widgets.input_box.set_text("/model");
+        update_input_overlays_from_input(&widgets.input_box, &mut state);
+
+        handle_event(
+            TuiEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &mut state,
+            &mut widgets,
+            &msg_tx,
+            &layout,
+        )
+        .await;
+        handle_event(
+            TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut state,
+            &mut widgets,
+            &msg_tx,
+            &layout,
+        )
+        .await;
+
+        let message = msg_rx.try_recv().expect("model command sent");
+        assert_eq!(message.text, "/model gpt-5");
+        assert_eq!(state.model, "gpt-5");
+        assert!(!state.model_picker.visible);
+    }
+
+    #[tokio::test]
+    async fn slash_model_without_available_models_submits_on_enter() {
+        let mut state = AppState::default();
+        let layout = TuiLayout::default();
+        let mut widgets = create_default_widgets(&layout);
+        let (msg_tx, mut msg_rx) = mpsc::channel(4);
+
+        widgets.input_box.set_text("/model");
+        update_input_overlays_from_input(&widgets.input_box, &mut state);
+        assert!(state.command_palette.visible);
+        assert!(!state.model_picker.visible);
+
+        handle_event(
+            TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut state,
+            &mut widgets,
+            &msg_tx,
+            &layout,
+        )
+        .await;
+
+        let message = msg_rx.try_recv().expect("/model command sent");
+        assert_eq!(message.text, "/model");
+        assert!(state.awaiting_model_list);
+        assert!(!state.command_palette.visible);
+        assert!(widgets.input_box.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slash_palette_model_selection_opens_model_picker_when_models_exist() {
+        let mut state = AppState::default();
+        state
+            .model_picker
+            .set_models(vec!["gpt-4o".to_string(), "gpt-5".to_string()]);
+
+        let layout = TuiLayout::default();
+        let mut widgets = create_default_widgets(&layout);
+        let (msg_tx, _msg_rx) = mpsc::channel(4);
+
+        widgets.input_box.set_text("/mo");
+        update_input_overlays_from_input(&widgets.input_box, &mut state);
+        assert!(state.command_palette.visible);
+
+        handle_event(
+            TuiEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut state,
+            &mut widgets,
+            &msg_tx,
+            &layout,
+        )
+        .await;
+
+        assert_eq!(widgets.input_box.current_text(), "/model ");
+        assert!(state.model_picker.visible);
+        assert!(!state.command_palette.visible);
+    }
+
+    #[test]
+    fn parse_model_response_extracts_active_and_available_models() {
+        let parsed = parse_model_list_response(
+            "Active model: gpt-5\n\nAvailable models:\n  gpt-5 (active)\n  gpt-4o\n\nUse /model <name> to switch.",
+        )
+        .expect("parsed model response");
+
+        assert_eq!(parsed.0, "gpt-5");
+        assert_eq!(parsed.1, vec!["gpt-5".to_string(), "gpt-4o".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn model_response_hydrates_picker_after_first_fetch() {
+        let mut state = AppState::default();
+        state.awaiting_model_list = true;
+        let layout = TuiLayout::default();
+        let mut widgets = create_default_widgets(&layout);
+
+        handle_event(
+            TuiEvent::Response {
+                content: "Active model: gpt-5\n\nAvailable models:\n  gpt-5 (active)\n  gpt-4o\n\nUse /model <name> to switch.".to_string(),
+                thread_id: None,
+            },
+            &mut state,
+            &mut widgets,
+            &mpsc::channel(1).0,
+            &layout,
+        )
+        .await;
+
+        assert_eq!(state.model, "gpt-5");
+        assert_eq!(widgets.input_box.current_text(), "/model ");
+        assert!(state.model_picker.visible);
+        assert_eq!(state.model_picker.filtered.len(), 2);
+        assert!(!state.awaiting_model_list);
     }
 
     #[tokio::test]

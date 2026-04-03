@@ -455,10 +455,39 @@ async fn async_main() -> anyhow::Result<()> {
             (0, Vec::new())
         };
 
+        let current_model = components.llm.model_name().to_string();
+        let available_models = match tokio::time::timeout(
+            Duration::from_secs(5),
+            components.llm.list_models(),
+        )
+        .await
+        {
+            Ok(Ok(mut models)) if !models.is_empty() => {
+                if let Some(pos) = models.iter().position(|m| m == &current_model) {
+                    if pos != 0 {
+                        let current = models.remove(pos);
+                        models.insert(0, current);
+                    }
+                } else {
+                    models.insert(0, current_model.clone());
+                }
+                models
+            }
+            Ok(Ok(_)) => Vec::new(),
+            Ok(Err(e)) => {
+                tracing::debug!("TUI model picker unavailable: could not list models: {}", e);
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::debug!("TUI model picker unavailable: model discovery timed out");
+                Vec::new()
+            }
+        };
+
         let tui_channel = ironclaw::channels::TuiChannel::new(
             config.owner_id.clone(),
             env!("CARGO_PKG_VERSION"),
-            components.llm.model_name(),
+            current_model,
         )
         .with_layout(layout)
         .with_log_broadcaster(Arc::clone(&log_broadcaster))
@@ -466,7 +495,8 @@ async fn async_main() -> anyhow::Result<()> {
         .with_skills(skill_categories)
         .with_workspace_path(workspace_path)
         .with_memory_count(memory_count)
-        .with_identity_files(identity_files);
+        .with_identity_files(identity_files)
+        .with_available_models(available_models);
 
         channels.add(Box::new(tui_channel)).await;
         channel_names.push("tui".to_string());

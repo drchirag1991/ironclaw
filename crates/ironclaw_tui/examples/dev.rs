@@ -161,6 +161,13 @@ fn main() {
             .unwrap_or_else(|_| "~/projects/ironclaw".into()),
         memory_count: 42,
         identity_files: vec!["AGENTS.md".into(), "SOUL.md".into(), "USER.md".into()],
+        available_models: vec![
+            "gpt-4o".into(),
+            "gpt-5.3-codex".into(),
+            "gpt-5.4".into(),
+            "claude-sonnet-4-6".into(),
+            "gemini-2.5-pro".into(),
+        ],
     };
 
     let handle = start_tui(config);

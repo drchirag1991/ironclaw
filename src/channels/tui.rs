@@ -141,6 +141,7 @@ pub struct TuiChannel {
     workspace_path: String,
     memory_count: usize,
     identity_files: Vec<String>,
+    available_models: Vec<String>,
 }
 
 impl TuiChannel {
@@ -163,6 +164,7 @@ impl TuiChannel {
             workspace_path: String::new(),
             memory_count: 0,
             identity_files: Vec::new(),
+            available_models: Vec::new(),
         }
     }
 
@@ -207,6 +209,12 @@ impl TuiChannel {
         self.identity_files = files;
         self
     }
+
+    /// Set the available models for the `/model` picker.
+    pub fn with_available_models(mut self, models: Vec<String>) -> Self {
+        self.available_models = models;
+        self
+    }
 }
 
 #[async_trait]
@@ -233,6 +241,7 @@ impl Channel for TuiChannel {
             workspace_path: self.workspace_path.clone(),
             memory_count: self.memory_count,
             identity_files: self.identity_files.clone(),
+            available_models: self.available_models.clone(),
         };
 
         let ironclaw_tui::TuiAppHandle {

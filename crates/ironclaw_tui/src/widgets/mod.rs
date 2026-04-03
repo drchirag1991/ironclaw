@@ -12,6 +12,7 @@ pub mod header;
 pub mod help_overlay;
 pub mod input_box;
 pub mod logs;
+pub mod model_picker;
 pub mod registry;
 pub mod status_bar;
 pub mod tab_bar;
@@ -25,6 +26,7 @@ use ratatui::layout::Rect;
 use crate::event::LogRingBuffer;
 use crate::layout::TuiSlot;
 use command_palette::CommandPaletteState;
+use model_picker::ModelPickerState;
 
 /// Which main content tab is currently active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -105,6 +107,12 @@ pub struct AppState {
 
     /// Command palette state.
     pub command_palette: CommandPaletteState,
+
+    /// Model picker state, triggered from `/model`.
+    pub model_picker: ModelPickerState,
+
+    /// Whether the TUI is waiting for a `/model` response to hydrate the picker.
+    pub awaiting_model_list: bool,
 
     /// Current spinner animation frame index (cycles 0..9 on each tick).
     pub spinner_frame: usize,
@@ -209,6 +217,8 @@ impl Default for AppState {
             log_scroll: 0,
             context_window: 128_000,
             command_palette: CommandPaletteState::default(),
+            model_picker: ModelPickerState::default(),
+            awaiting_model_list: false,
             spinner_frame: 0,
             input_history: Vec::new(),
             history_index: None,
