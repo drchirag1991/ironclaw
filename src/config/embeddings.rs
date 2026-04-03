@@ -262,6 +262,7 @@ mod tests {
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("EMBEDDING_BASE_URL");
             std::env::remove_var("EMBEDDING_CACHE_SIZE");
+            std::env::remove_var("EMBEDDING_DIMENSION");
         }
     }
 
