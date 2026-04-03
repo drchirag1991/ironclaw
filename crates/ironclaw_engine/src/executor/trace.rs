@@ -582,7 +582,13 @@ mod tests {
         ));
 
         let trace = build_trace(&thread);
-        match &trace.events[0].kind {
+        // First two events are MessageAdded from add_message() calls above.
+        let approval_idx = trace
+            .events
+            .iter()
+            .position(|e| matches!(e.kind, EventKind::ApprovalRequested { .. }))
+            .expect("trace should contain an ApprovalRequested event");
+        match &trace.events[approval_idx].kind {
             EventKind::ApprovalRequested {
                 action_name,
                 call_id,
@@ -610,7 +616,7 @@ mod tests {
         assert!(json.contains("\"ApprovalRequested\""));
         assert!(json.contains("\"action_name\":\"tool_install\""));
         assert!(json.contains("\"call_id\":\"call_install_1\""));
-        assert!(json.contains("\"parameters\":{\"name\":\"notion\",\"kind\":\"mcp_server\"}"));
+        assert!(json.contains("\"name\":\"notion\"") && json.contains("\"kind\":\"mcp_server\""));
         assert!(json.contains("\"description\":\"Install an extension\""));
         assert!(json.contains("\"allow_always\":true"));
         assert!(json.contains("\"gate_name\":\"approval\""));

@@ -164,10 +164,11 @@ impl MissionManager {
     /// For shared missions, the caller (web handler) must
     /// verify admin role before calling this. The engine only checks ownership.
     pub async fn pause_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
-        // Validate ownership. Shared missions require admin role (checked by caller).
+        // Validate ownership. Shared missions require the "system" user_id;
+        // the caller (web handler) must verify admin role before passing it.
         if let Some(mission) = self.store.load_mission(id).await?
             && !mission.is_owned_by(user_id)
-            && !mission.owner_id().is_shared()
+            && !(mission.owner_id().is_shared() && crate::types::is_shared_owner(user_id))
         {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
@@ -187,10 +188,11 @@ impl MissionManager {
     /// For shared missions, the caller (web handler) must
     /// verify admin role before calling this. The engine only checks ownership.
     pub async fn resume_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
-        // Validate ownership. Shared missions require admin role (checked by caller).
+        // Validate ownership. Shared missions require the "system" user_id;
+        // the caller (web handler) must verify admin role before passing it.
         if let Some(mission) = self.store.load_mission(id).await?
             && !mission.is_owned_by(user_id)
-            && !mission.owner_id().is_shared()
+            && !(mission.owner_id().is_shared() && crate::types::is_shared_owner(user_id))
         {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
