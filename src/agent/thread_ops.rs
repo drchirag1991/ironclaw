@@ -32,10 +32,7 @@ fn requires_preexisting_uuid_thread(channel: &str) -> bool {
     matches!(channel, "gateway" | "test")
 }
 
-fn validate_inbound_text_for_message(
-    safety: &SafetyLayer,
-    content: &str,
-) -> ValidationResult {
+fn validate_inbound_text_for_message(safety: &SafetyLayer, content: &str) -> ValidationResult {
     safety.validate_input(content)
 }
 
