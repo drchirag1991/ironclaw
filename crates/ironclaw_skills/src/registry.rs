@@ -700,10 +700,8 @@ async fn build_loaded_skill(
     let prompt_content = parsed.prompt_content;
 
     // Check gating requirements
-    if let Some(ref meta) = manifest.metadata
-        && let Some(ref openclaw) = meta.openclaw
     {
-        let result = gating::check_requirements(&openclaw.requires).await;
+        let result = gating::check_requirements(&manifest.requires).await;
         if !result.passed {
             return Err(SkillRegistryError::GatingFailed {
                 name: manifest.name.clone(),
@@ -842,7 +840,7 @@ mod tests {
 
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: gated-skill\nmetadata:\n  openclaw:\n    requires:\n      bins: [\"__nonexistent_bin__\"]\n---\n\nGated prompt.\n",
+            "---\nname: gated-skill\nrequires:\n  bins: [\"__nonexistent_bin__\"]\n---\n\nGated prompt.\n",
         ).unwrap();
 
         let mut registry = SkillRegistry::new(dir.path().to_path_buf());
@@ -1292,7 +1290,7 @@ mod tests {
 
         let bundled: &'static [(String, String)] = Box::leak(Box::new(vec![(
             "gated".to_string(),
-            "---\nname: gated\nmetadata:\n  openclaw:\n    requires:\n      bins: [\"__nonexistent__\"]\n---\n\nGated.\n".to_string(),
+            "---\nname: gated\nrequires:\n  bins: [\"__nonexistent__\"]\n---\n\nGated.\n".to_string(),
         )]));
 
         let mut registry =

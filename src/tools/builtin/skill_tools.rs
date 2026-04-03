@@ -354,17 +354,11 @@ impl Tool for SkillInstallTool {
                 .registry
                 .write()
                 .map_err(|e| ToolError::ExecutionFailed(format!("Lock poisoned: {}", e)))?;
-            let required_skills = loaded_skill
-                .manifest
-                .metadata
-                .as_ref()
-                .and_then(|m| m.openclaw.as_ref())
-                .map(|o| o.requires.skills.clone())
-                .unwrap_or_default();
+            let reqs = loaded_skill.manifest.requires.clone();
             guard
                 .commit_install(&skill_name, loaded_skill)
                 .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-            (skill_name, required_skills)
+            (skill_name, reqs.skills)
         };
 
         // Chain-install missing skill dependencies.
