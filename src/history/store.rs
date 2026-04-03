@@ -2828,6 +2828,60 @@ impl Store {
         }
         Ok(stats)
     }
+
+    pub async fn admin_usage_summary(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<crate::db::AdminUsageSummary, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_one(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM users) AS total_users,
+                    (SELECT COUNT(*) FROM users WHERE status = 'active') AS active_users,
+                    (SELECT COUNT(*) FROM users WHERE status = 'suspended') AS suspended_users,
+                    (SELECT COUNT(*) FROM users WHERE role = 'admin') AS admin_users,
+                    (
+                        SELECT COUNT(DISTINCT j.id)
+                        FROM llm_calls l
+                        LEFT JOIN agent_jobs j ON l.job_id = j.id
+                    ) AS total_jobs,
+                    (SELECT COALESCE(SUM(l.cost), 0) FROM llm_calls l) AS total_cost,
+                    (SELECT COUNT(*) FROM llm_calls WHERE created_at >= $1) AS llm_calls,
+                    (
+                        SELECT COALESCE(SUM(input_tokens), 0)
+                        FROM llm_calls
+                        WHERE created_at >= $1
+                    ) AS input_tokens,
+                    (
+                        SELECT COALESCE(SUM(output_tokens), 0)
+                        FROM llm_calls
+                        WHERE created_at >= $1
+                    ) AS output_tokens,
+                    (
+                        SELECT COALESCE(SUM(cost), 0)
+                        FROM llm_calls
+                        WHERE created_at >= $1
+                    ) AS usage_cost
+                "#,
+                &[&since],
+            )
+            .await?;
+
+        Ok(crate::db::AdminUsageSummary {
+            total_users: row.get("total_users"),
+            active_users: row.get("active_users"),
+            suspended_users: row.get("suspended_users"),
+            admin_users: row.get("admin_users"),
+            total_jobs: row.get("total_jobs"),
+            total_cost: row.get("total_cost"),
+            llm_calls: row.get("llm_calls"),
+            input_tokens: row.get("input_tokens"),
+            output_tokens: row.get("output_tokens"),
+            usage_cost: row.get("usage_cost"),
+        })
+    }
 }
 
 #[cfg(feature = "postgres")]

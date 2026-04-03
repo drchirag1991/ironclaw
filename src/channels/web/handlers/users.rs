@@ -584,44 +584,49 @@ pub async fn usage_summary_handler(
     ))?;
 
     let since_30d = chrono::Utc::now() - chrono::Duration::days(30);
-    let (users, summary_stats, usage_stats) = tokio::try_join!(
-        store.list_users(None),
-        store.user_summary_stats(None),
-        store.user_usage_stats(None, since_30d),
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let total = users.len();
-    let active = users.iter().filter(|u| u.status == "active").count();
-    let suspended = users.iter().filter(|u| u.status == "suspended").count();
-    let admins = users.iter().filter(|u| u.role == "admin").count();
-
-    let total_jobs: i64 = summary_stats.iter().map(|s| s.job_count).sum();
-    let total_cost: rust_decimal::Decimal = summary_stats.iter().map(|s| s.total_cost).sum();
-
-    let llm_calls: i64 = usage_stats.iter().map(|s| s.call_count).sum();
-    let input_tokens: i64 = usage_stats.iter().map(|s| s.input_tokens).sum();
-    let output_tokens: i64 = usage_stats.iter().map(|s| s.output_tokens).sum();
-    let usage_cost: rust_decimal::Decimal = usage_stats.iter().map(|s| s.total_cost).sum();
+    let summary = store
+        .admin_usage_summary(since_30d)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let uptime_seconds = state.startup_time.elapsed().as_secs();
 
     Ok(Json(AdminUsageSummaryResponse {
         users: AdminUsageSummaryUsers {
-            total,
-            active,
-            suspended,
-            admins,
+            total: usize::try_from(summary.total_users).map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid total_users count".to_string(),
+                )
+            })?,
+            active: usize::try_from(summary.active_users).map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid active_users count".to_string(),
+                )
+            })?,
+            suspended: usize::try_from(summary.suspended_users).map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid suspended_users count".to_string(),
+                )
+            })?,
+            admins: usize::try_from(summary.admin_users).map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "invalid admin_users count".to_string(),
+                )
+            })?,
         },
         jobs: AdminUsageSummaryJobs {
-            total: total_jobs,
-            total_cost: total_cost.to_string(),
+            total: summary.total_jobs,
+            total_cost: summary.total_cost.to_string(),
         },
         usage_30d: AdminUsageSummaryWindow {
-            llm_calls,
-            input_tokens,
-            output_tokens,
-            total_cost: usage_cost.to_string(),
+            llm_calls: summary.llm_calls,
+            input_tokens: summary.input_tokens,
+            output_tokens: summary.output_tokens,
+            total_cost: summary.usage_cost.to_string(),
         },
         uptime_seconds,
     }))
