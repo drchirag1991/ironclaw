@@ -47,8 +47,8 @@
     activeTab = sessionStorage.getItem(SESSION_TAB_KEY) || 'activity';
     panelOpen = sessionStorage.getItem(SESSION_OPEN_KEY) !== 'false';
 
-    currentTurn = 1;
-    viewingTurn = 1;
+    currentTurn = 0;
+    viewingTurn = 0;
 
     createToolbarButton();
     createPanel();
