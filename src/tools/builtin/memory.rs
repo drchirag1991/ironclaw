@@ -283,10 +283,7 @@ impl Tool for MemoryWriteTool {
         // When orchestrator self-modification is enabled, writing to protected
         // paths (orchestrator code, prompt overlays) always requires explicit
         // human approval — even if the session has auto-approve enabled.
-        let target = params
-            .get("target")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let target = params.get("target").and_then(|v| v.as_str()).unwrap_or("");
         if is_protected_orchestrator_path(target) {
             let self_modify_enabled = std::env::var("ORCHESTRATOR_SELF_MODIFY")
                 .map(|v| v == "true" || v == "1")

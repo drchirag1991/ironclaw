@@ -2319,7 +2319,9 @@ except Exception as e:
     async fn sandbox_context_variable_is_not_mutable() {
         let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
         let mut thread = make_test_thread();
-        thread.add_message(crate::types::message::ThreadMessage::user("original message"));
+        thread.add_message(crate::types::message::ThreadMessage::user(
+            "original message",
+        ));
         let original_count = thread.messages.len();
         let original_goal = thread.goal.clone();
 

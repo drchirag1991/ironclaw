@@ -1193,7 +1193,7 @@ impl Store for HybridStore {
         let mut stamped = doc.clone();
         // Stamp a content hash for audit trail on all protected docs.
         if is_protected_orchestrator_doc(doc) {
-            use sha2::{Sha256, Digest};
+            use sha2::{Digest, Sha256};
             let hash = format!("{:x}", Sha256::digest(doc.content.as_bytes()));
             stamped
                 .metadata
