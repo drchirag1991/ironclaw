@@ -1324,7 +1324,7 @@ pub(crate) fn strip_suggestions(text: &str) -> String {
 }
 
 fn image_generation_summary_tool_message(
-    safety: &crate::safety::SafetyLayer,
+    safety: &ironclaw_safety::SafetyLayer,
     tool_name: &str,
     tool_call_id: &str,
     sentinel: &GeneratedImageSentinel,
@@ -2713,7 +2713,7 @@ mod tests {
 
     #[test]
     fn test_image_generation_summary_tool_message_omits_data_url() {
-        let safety = crate::safety::SafetyLayer::new(&crate::config::SafetyConfig {
+        let safety = ironclaw_safety::SafetyLayer::new(&crate::config::SafetyConfig {
             max_output_length: 4000,
             injection_check_enabled: true,
         });

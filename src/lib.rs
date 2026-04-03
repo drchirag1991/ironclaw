@@ -53,8 +53,8 @@ pub mod error;
 pub mod estimation;
 pub mod evaluation;
 pub mod extensions;
-pub(crate) mod generated_images;
 pub mod gate;
+pub(crate) mod generated_images;
 pub mod history;
 pub mod hooks;
 #[cfg(feature = "import")]
