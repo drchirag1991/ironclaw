@@ -16,8 +16,8 @@ use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    ApiTokenRecord, ConversationStore, Database, JobStore, RoutineStore, SandboxStore,
-    SettingsStore, ToolFailureStore, UserRecord, UserStore, WorkspaceStore,
+    ApiTokenRecord, ChannelStateStore, ConversationStore, Database, JobStore, RoutineStore,
+    SandboxStore, SettingsStore, ToolFailureStore, UserRecord, UserStore, WorkspaceStore,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -916,5 +916,87 @@ impl UserStore for PgBackend {
         self.store
             .create_user_with_token(user, token_name, token_hash, token_prefix, expires_at)
             .await
+    }
+}
+
+// ==================== ChannelStateStore ====================
+
+#[async_trait]
+impl ChannelStateStore for PgBackend {
+    async fn channel_state_read(
+        &self,
+        channel_name: &str,
+        path: &str,
+    ) -> Result<Option<String>, DatabaseError> {
+        let conn = self.pool().get().await?;
+        let row = conn
+            .query_opt(
+                "SELECT content FROM channel_state WHERE channel_name = $1 AND path = $2",
+                &[&channel_name, &path],
+            )
+            .await?;
+        Ok(row.map(|r| r.get("content")))
+    }
+
+    async fn channel_state_write(
+        &self,
+        channel_name: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.pool().get().await?;
+        conn.execute(
+            r#"
+            INSERT INTO channel_state (channel_name, path, content)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (channel_name, path) DO UPDATE SET
+                content = EXCLUDED.content,
+                updated_at = NOW()
+            "#,
+            &[&channel_name, &path, &content],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn channel_state_delete(
+        &self,
+        channel_name: &str,
+        path: &str,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.pool().get().await?;
+        let count = conn
+            .execute(
+                "DELETE FROM channel_state WHERE channel_name = $1 AND path = $2",
+                &[&channel_name, &path],
+            )
+            .await?;
+        Ok(count > 0)
+    }
+
+    async fn channel_state_list(
+        &self,
+        channel_name: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<String>, DatabaseError> {
+        let conn = self.pool().get().await?;
+        let rows = match prefix {
+            Some(prefix) => {
+                let pattern = format!("{}%", prefix);
+                conn.query(
+                    "SELECT path FROM channel_state WHERE channel_name = $1 AND path LIKE $2 ORDER BY path",
+                    &[&channel_name, &pattern],
+                )
+                .await?
+            }
+            None => {
+                conn.query(
+                    "SELECT path FROM channel_state WHERE channel_name = $1 ORDER BY path",
+                    &[&channel_name],
+                )
+                .await?
+            }
+        };
+        Ok(rows.iter().map(|r| r.get("path")).collect())
     }
 }

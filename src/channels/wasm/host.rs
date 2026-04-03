@@ -15,6 +15,15 @@ use crate::tools::wasm::{HostState, LogLevel};
 /// Maximum emitted messages per callback execution.
 const MAX_EMITS_PER_EXECUTION: usize = 100;
 
+/// Outbound WebSocket frame (text or binary).
+#[derive(Debug, Clone)]
+pub enum WsOutbound {
+    /// UTF-8 text frame (e.g., JSON for Discord Gateway).
+    Text(String),
+    /// Binary frame (e.g., protobuf for Signal Protocol).
+    Binary(Vec<u8>),
+}
+
 /// Maximum message content size (64 KB).
 const MAX_MESSAGE_CONTENT_SIZE: usize = 64 * 1024;
 
@@ -180,6 +189,14 @@ pub struct ChannelHostState {
 
     /// Total bytes stored in attachment_data (for enforcing limits).
     attachment_data_total: u64,
+
+    /// Outbound WebSocket frame sender.
+    ///
+    /// When set, the WASM module can send frames back through the
+    /// host-managed WebSocket connection via `websocket-send` and
+    /// `websocket-send-text` host functions. The sender is cloned from
+    /// the WebSocket runtime's outbound channel.
+    websocket_tx: Option<tokio::sync::mpsc::UnboundedSender<WsOutbound>>,
 }
 
 impl std::fmt::Debug for ChannelHostState {
@@ -211,7 +228,19 @@ impl ChannelHostState {
             emits_dropped: 0,
             attachment_data: HashMap::new(),
             attachment_data_total: 0,
+            websocket_tx: None,
         }
+    }
+
+    /// Set the outbound WebSocket sender.
+    ///
+    /// Called when the channel has an active WebSocket runtime so that
+    /// WASM callbacks can send frames via `websocket-send` host functions.
+    pub fn set_websocket_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<WsOutbound>,
+    ) {
+        self.websocket_tx = Some(tx);
     }
 
     /// Get the channel name.
@@ -499,6 +528,26 @@ impl ChannelHostState {
     /// Take logs (delegates to base).
     pub fn take_logs(&mut self) -> Vec<crate::tools::wasm::LogEntry> {
         self.base.take_logs()
+    }
+
+    /// Send a binary frame through the host-managed WebSocket.
+    pub fn websocket_send(&self, data: Vec<u8>) -> Result<(), String> {
+        let tx = self
+            .websocket_tx
+            .as_ref()
+            .ok_or_else(|| "No WebSocket connection configured".to_string())?;
+        tx.send(WsOutbound::Binary(data))
+            .map_err(|_| "WebSocket connection closed".to_string())
+    }
+
+    /// Send a text frame through the host-managed WebSocket.
+    pub fn websocket_send_text(&self, text: String) -> Result<(), String> {
+        let tx = self
+            .websocket_tx
+            .as_ref()
+            .ok_or_else(|| "No WebSocket connection configured".to_string())?;
+        tx.send(WsOutbound::Text(text))
+            .map_err(|_| "WebSocket connection closed".to_string())
     }
 }
 

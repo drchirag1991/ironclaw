@@ -656,6 +656,22 @@ impl near::agent::channel_host::Host for ChannelStoreData {
             .read_allow_from(&channel)
             .map_err(|e| e.to_string())
     }
+
+    fn websocket_send(&mut self, data: Vec<u8>) -> Result<(), String> {
+        tracing::debug!(
+            bytes = data.len(),
+            "WASM websocket_send called"
+        );
+        self.host_state.websocket_send(data)
+    }
+
+    fn websocket_send_text(&mut self, text: String) -> Result<(), String> {
+        tracing::debug!(
+            len = text.len(),
+            "WASM websocket_send_text called"
+        );
+        self.host_state.websocket_send_text(text)
+    }
 }
 
 /// A WASM-based channel implementing the Channel trait.
@@ -1110,7 +1126,7 @@ impl WasmChannel {
         tokio::spawn(async move {
             let mut shutdown = std::pin::pin!(shutdown_rx);
             let mut reconnect_attempt = 0u32;
-            let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<String>();
+            let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<crate::channels::wasm::WsOutbound>();
 
             tracing::info!(
                 channel = %channel_name,
@@ -1177,11 +1193,15 @@ impl WasmChannel {
                                 .map(|interval_ms| Box::pin(tokio::time::sleep(websocket_heartbeat_sleep_duration(interval_ms))));
                         }
                         outbound = outbound_rx.recv() => {
-                            if let Some(payload) = outbound
-                                && let Err(error) = write.send(WebsocketMessage::Text(payload.into())).await
-                            {
-                                tracing::warn!(channel = %channel_name, error = %error, "Websocket outbound control send failed");
-                                break;
+                            if let Some(payload) = outbound {
+                                let ws_msg = match payload {
+                                    crate::channels::wasm::WsOutbound::Text(t) => WebsocketMessage::Text(t.into()),
+                                    crate::channels::wasm::WsOutbound::Binary(b) => WebsocketMessage::Binary(b.into()),
+                                };
+                                if let Err(error) = write.send(ws_msg).await {
+                                    tracing::warn!(channel = %channel_name, error = %error, "Websocket outbound send failed");
+                                    break;
+                                }
                             }
                         }
                         _ = &mut shutdown => {
@@ -1266,6 +1286,46 @@ impl WasmChannel {
                                     }
                                     if should_break {
                                         break;
+                                    }
+                                }
+                                Some(Ok(WebsocketMessage::Binary(bytes))) => {
+                                    log_websocket_diagnostic(&channel_name, &WebsocketMessage::Binary(bytes.clone()));
+
+                                    // Base64-encode binary frame and enqueue as {"type":"binary","data":"..."}
+                                    use base64::Engine;
+                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                    let entry = serde_json::json!({"type": "binary", "data": b64}).to_string();
+                                    if let Err(error) = workspace_store.append_json_text_queue(
+                                        &queue_path,
+                                        &entry,
+                                        WEBSOCKET_EVENT_QUEUE_MAX_ITEMS,
+                                    ) {
+                                        tracing::warn!(channel = %channel_name, error = %error, "Failed to enqueue websocket binary frame");
+                                    } else if let Ok(poll_guard) = Arc::clone(&websocket_poll_lock).try_lock_owned() {
+                                        spawn_websocket_poll(
+                                            poll_guard,
+                                            WebsocketPollContext {
+                                                channel_name: channel_name.clone(),
+                                                runtime: Arc::clone(&runtime),
+                                                prepared: Arc::clone(&prepared),
+                                                capabilities: capabilities.clone(),
+                                                poll_capabilities: poll_capabilities.clone(),
+                                                credentials: Arc::clone(&credentials),
+                                                pairing_store: pairing_store.clone(),
+                                                workspace_store: workspace_store.clone(),
+                                                message_tx: message_tx.clone(),
+                                                rate_limiter: Arc::clone(&rate_limiter),
+                                                last_broadcast_metadata: Arc::clone(&last_broadcast_metadata),
+                                                settings_store: settings_store.clone(),
+                                                owner_scope_id: owner_scope_id.clone(),
+                                                owner_actor_id: owner_actor_id.clone(),
+                                                secrets_store: websocket_secrets_store.clone(),
+                                                outbound_tx: outbound_tx.clone(),
+                                                queue_path: queue_path.clone(),
+                                                processing_queue_path: processing_queue_path.clone(),
+                                                callback_timeout,
+                                            },
+                                        );
                                     }
                                 }
                                 Some(Ok(other)) => {
@@ -3338,7 +3398,7 @@ struct WebsocketPollContext {
     owner_scope_id: String,
     owner_actor_id: Option<String>,
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
-    outbound_tx: mpsc::UnboundedSender<String>,
+    outbound_tx: mpsc::UnboundedSender<crate::channels::wasm::WsOutbound>,
     queue_path: String,
     processing_queue_path: String,
     callback_timeout: Duration,
@@ -3417,7 +3477,7 @@ fn spawn_websocket_poll(poll_guard: tokio::sync::OwnedMutexGuard<()>, ctx: Webso
                 ctx.workspace_store.as_ref(),
                 ctx.pairing_store.as_ref(),
             ) {
-                let _ = ctx.outbound_tx.send(payload);
+                let _ = ctx.outbound_tx.send(crate::channels::wasm::WsOutbound::Text(payload));
             }
         }
     });

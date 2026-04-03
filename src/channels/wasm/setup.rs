@@ -86,7 +86,6 @@ pub async fn setup_wasm_channels(
         "cli",
         "repl",
         "http",
-        "signal",
         "telegram",
         "slack-relay",
         "secret_save",

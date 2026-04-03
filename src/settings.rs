@@ -339,41 +339,6 @@ pub struct ChannelSettings {
     #[serde(default = "default_true")]
     pub cli_enabled: bool,
 
-    /// Whether Signal channel is enabled.
-    #[serde(default)]
-    pub signal_enabled: bool,
-
-    /// Signal HTTP URL (signal-cli daemon endpoint).
-    #[serde(default)]
-    pub signal_http_url: Option<String>,
-
-    /// Signal account (E.164 phone number).
-    #[serde(default)]
-    pub signal_account: Option<String>,
-
-    /// Signal allow from list for DMs (comma-separated E.164 phone numbers).
-    /// Comma-separated identifiers: E.164 phone numbers, `*`, bare UUIDs, or `uuid:<id>` entries.
-    /// Defaults to the configured account.
-    #[serde(default)]
-    pub signal_allow_from: Option<String>,
-
-    /// Signal allow from groups (comma-separated group IDs).
-    #[serde(default)]
-    pub signal_allow_from_groups: Option<String>,
-
-    /// Signal DM policy: "open", "allowlist", or "pairing". Default: "pairing".
-    #[serde(default)]
-    pub signal_dm_policy: Option<String>,
-
-    /// Signal group policy: "allowlist", "open", or "disabled". Default: "allowlist".
-    #[serde(default)]
-    pub signal_group_policy: Option<String>,
-
-    /// Signal group allow from (comma-separated group member IDs).
-    /// If empty, inherits from signal_allow_from.
-    #[serde(default)]
-    pub signal_group_allow_from: Option<String>,
-
     /// Per-channel owner user IDs. When set, the channel only responds to this user.
     /// Key: channel name (e.g., "telegram"), Value: owner user ID.
     #[serde(default)]
@@ -405,14 +370,6 @@ impl Default for ChannelSettings {
             gateway_port: None,
             gateway_auth_token: None,
             cli_enabled: true,
-            signal_enabled: false,
-            signal_http_url: None,
-            signal_account: None,
-            signal_allow_from: None,
-            signal_allow_from_groups: None,
-            signal_dm_policy: None,
-            signal_group_policy: None,
-            signal_group_allow_from: None,
             wasm_channel_owner_ids: std::collections::HashMap::new(),
             wasm_channels: Vec::new(),
             wasm_channels_enabled: true,
@@ -1966,8 +1923,6 @@ mod tests {
             channels: ChannelSettings {
                 http_enabled: true,
                 http_port: Some(8080),
-                signal_enabled: true,
-                signal_account: Some("+1234567890".to_string()),
                 wasm_channels: vec!["telegram".to_string()],
                 ..Default::default()
             },
@@ -1998,7 +1953,6 @@ mod tests {
         // Verify: everything else preserved
         assert!(current.channels.http_enabled, "HTTP channel must survive");
         assert_eq!(current.channels.http_port, Some(8080));
-        assert!(current.channels.signal_enabled, "Signal must survive");
         assert_eq!(
             current.channels.wasm_channels,
             vec!["telegram".to_string()],
@@ -2082,7 +2036,6 @@ mod tests {
             channels: ChannelSettings {
                 http_enabled: true,
                 http_port: Some(8080),
-                signal_enabled: true,
                 wasm_channels: vec!["telegram".to_string()],
                 ..Default::default()
             },
@@ -2131,10 +2084,6 @@ mod tests {
             "HTTP channel must survive quick mode re-run"
         );
         assert_eq!(current.channels.http_port, Some(8080));
-        assert!(
-            current.channels.signal_enabled,
-            "Signal must survive quick mode re-run"
-        );
         assert_eq!(
             current.channels.wasm_channels,
             vec!["telegram".to_string()],
@@ -2372,7 +2321,6 @@ mod tests {
             },
             channels: ChannelSettings {
                 http_enabled: true,
-                signal_enabled: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -2398,10 +2346,6 @@ mod tests {
         assert!(
             current.channels.http_enabled,
             "http_enabled=true must not be reset to false by default overlay"
-        );
-        assert!(
-            current.channels.signal_enabled,
-            "signal_enabled=true must not be reset to false by default overlay"
         );
         assert_eq!(current.heartbeat.interval_secs, 600);
     }

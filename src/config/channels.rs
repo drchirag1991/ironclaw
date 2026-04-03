@@ -13,7 +13,6 @@ pub struct ChannelsConfig {
     pub cli: CliConfig,
     pub http: Option<HttpConfig>,
     pub gateway: Option<GatewayConfig>,
-    pub signal: Option<SignalConfig>,
     /// Directory containing WASM channel modules (default: ~/.ironclaw/channels/).
     pub wasm_channels_dir: std::path::PathBuf,
     /// Whether WASM channels are enabled.
@@ -74,48 +73,6 @@ pub struct GatewayOidcConfig {
     pub audience: Option<String>,
 }
 
-/// Signal channel configuration (signal-cli daemon HTTP/JSON-RPC).
-#[derive(Debug, Clone)]
-pub struct SignalConfig {
-    /// Base URL of the signal-cli daemon HTTP endpoint (e.g. `http://127.0.0.1:8080`).
-    pub http_url: String,
-    /// Signal account identifier (E.164 phone number, e.g. `+1234567890`).
-    pub account: String,
-    /// Users allowed to interact with the bot in DMs.
-    ///
-    /// Each entry is one of:
-    /// - `*` — allow everyone
-    /// - E.164 phone number (e.g. `+1234567890`)
-    /// - bare UUID (e.g. `a1b2c3d4-e5f6-7890-abcd-ef1234567890`)
-    /// - `uuid:<id>` prefix form (e.g. `uuid:a1b2c3d4-e5f6-7890-abcd-ef1234567890`)
-    ///
-    /// An empty list denies all senders (secure by default).
-    pub allow_from: Vec<String>,
-    /// Groups allowed to interact with the bot.
-    ///
-    /// - Empty list — deny all group messages (DMs only, secure by default).
-    /// - `*` — allow all groups.
-    /// - Specific group IDs — allow only those groups.
-    pub allow_from_groups: Vec<String>,
-    /// DM policy: "open", "allowlist", or "pairing". Default: "pairing".
-    ///
-    /// - "open" — allow all DM senders (ignores allow_from for DMs)
-    /// - "allowlist" — only allow senders in allow_from list
-    /// - "pairing" — allowlist + send pairing reply to unknown users
-    pub dm_policy: String,
-    /// Group policy: "allowlist", "open", or "disabled". Default: "allowlist".
-    ///
-    /// - "disabled" — deny all group messages
-    /// - "allowlist" — check allow_from_groups and group_allow_from
-    /// - "open" — accept all group messages (respects allow_from_groups for group ID)
-    pub group_policy: String,
-    /// Allow list for group message senders. If empty, inherits from allow_from.
-    pub group_allow_from: Vec<String>,
-    /// Skip messages that contain only attachments (no text).
-    pub ignore_attachments: bool,
-    /// Skip story messages.
-    pub ignore_stories: bool,
-}
 
 impl ChannelsConfig {
     pub(crate) fn resolve(settings: &Settings, owner_id: &str) -> Result<Self, ConfigError> {
@@ -251,64 +208,6 @@ impl ChannelsConfig {
             None
         };
 
-        let signal_url = optional_env("SIGNAL_HTTP_URL")?.or_else(|| cs.signal_http_url.clone());
-        let signal = if let Some(http_url) = signal_url {
-            let account = optional_env("SIGNAL_ACCOUNT")?
-                .or_else(|| cs.signal_account.clone())
-                .ok_or(ConfigError::InvalidValue {
-                    key: "SIGNAL_ACCOUNT".to_string(),
-                    message: "SIGNAL_ACCOUNT is required when SIGNAL_HTTP_URL is set".to_string(),
-                })?;
-            let allow_from =
-                match optional_env("SIGNAL_ALLOW_FROM")?.or_else(|| cs.signal_allow_from.clone()) {
-                    None => vec![account.clone()],
-                    Some(s) => s
-                        .split(',')
-                        .map(|e| e.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect(),
-                };
-            let dm_policy = optional_env("SIGNAL_DM_POLICY")?
-                .or_else(|| cs.signal_dm_policy.clone())
-                .unwrap_or_else(|| "pairing".to_string());
-            let group_policy = optional_env("SIGNAL_GROUP_POLICY")?
-                .or_else(|| cs.signal_group_policy.clone())
-                .unwrap_or_else(|| "allowlist".to_string());
-            Some(SignalConfig {
-                http_url,
-                account,
-                allow_from,
-                allow_from_groups: optional_env("SIGNAL_ALLOW_FROM_GROUPS")?
-                    .or_else(|| cs.signal_allow_from_groups.clone())
-                    .map(|s| {
-                        s.split(',')
-                            .map(|e| e.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                dm_policy,
-                group_policy,
-                group_allow_from: optional_env("SIGNAL_GROUP_ALLOW_FROM")?
-                    .or_else(|| cs.signal_group_allow_from.clone())
-                    .map(|s| {
-                        s.split(',')
-                            .map(|e| e.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                ignore_attachments: optional_env("SIGNAL_IGNORE_ATTACHMENTS")?
-                    .map(|s| s.to_lowercase() == "true" || s == "1")
-                    .unwrap_or(false),
-                ignore_stories: optional_env("SIGNAL_IGNORE_STORIES")?
-                    .map(|s| s.to_lowercase() == "true" || s == "1")
-                    .unwrap_or(true),
-            })
-        } else {
-            None
-        };
-
         let cli_enabled = parse_bool_env("CLI_ENABLED", cs.cli_enabled)?;
 
         Ok(Self {
@@ -317,7 +216,6 @@ impl ChannelsConfig {
             },
             http,
             gateway,
-            signal,
             wasm_channels_dir: optional_env("WASM_CHANNELS_DIR")?
                 .map(PathBuf::from)
                 .or_else(|| cs.wasm_channels_dir.clone())
@@ -423,57 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn signal_config_fields_and_defaults() {
-        let cfg = SignalConfig {
-            http_url: "http://127.0.0.1:8080".to_string(),
-            account: "+1234567890".to_string(),
-            allow_from: vec!["+1234567890".to_string()],
-            allow_from_groups: vec![],
-            dm_policy: "pairing".to_string(),
-            group_policy: "allowlist".to_string(),
-            group_allow_from: vec![],
-            ignore_attachments: false,
-            ignore_stories: true,
-        };
-        assert_eq!(cfg.http_url, "http://127.0.0.1:8080");
-        assert_eq!(cfg.account, "+1234567890");
-        assert_eq!(cfg.allow_from, vec!["+1234567890"]);
-        assert!(cfg.allow_from_groups.is_empty());
-        assert_eq!(cfg.dm_policy, "pairing");
-        assert_eq!(cfg.group_policy, "allowlist");
-        assert!(cfg.group_allow_from.is_empty());
-        assert!(!cfg.ignore_attachments);
-        assert!(cfg.ignore_stories);
-    }
-
-    #[test]
-    fn signal_config_open_policies() {
-        let cfg = SignalConfig {
-            http_url: "http://localhost:7583".to_string(),
-            account: "+0000000000".to_string(),
-            allow_from: vec!["*".to_string()],
-            allow_from_groups: vec!["*".to_string()],
-            dm_policy: "open".to_string(),
-            group_policy: "open".to_string(),
-            group_allow_from: vec![],
-            ignore_attachments: true,
-            ignore_stories: false,
-        };
-        assert_eq!(cfg.allow_from, vec!["*"]);
-        assert_eq!(cfg.allow_from_groups, vec!["*"]);
-        assert_eq!(cfg.dm_policy, "open");
-        assert_eq!(cfg.group_policy, "open");
-        assert!(cfg.ignore_attachments);
-        assert!(!cfg.ignore_stories);
-    }
-
-    #[test]
     fn channels_config_fields() {
         let cfg = ChannelsConfig {
             cli: CliConfig { enabled: true },
             http: None,
             gateway: None,
-            signal: None,
             wasm_channels_dir: PathBuf::from("/tmp/channels"),
             wasm_channels_enabled: true,
             wasm_channel_owner_ids: HashMap::new(),
@@ -481,7 +333,6 @@ mod tests {
         assert!(cfg.cli.enabled);
         assert!(cfg.http.is_none());
         assert!(cfg.gateway.is_none());
-        assert!(cfg.signal.is_none());
         assert_eq!(cfg.wasm_channels_dir, PathBuf::from("/tmp/channels"));
         assert!(cfg.wasm_channels_enabled);
         assert!(cfg.wasm_channel_owner_ids.is_empty());
@@ -497,7 +348,6 @@ mod tests {
             cli: CliConfig { enabled: false },
             http: None,
             gateway: None,
-            signal: None,
             wasm_channels_dir: PathBuf::from("/opt/channels"),
             wasm_channels_enabled: false,
             wasm_channel_owner_ids: ids,
@@ -527,9 +377,6 @@ mod tests {
         settings.channels.gateway_host = Some("127.0.0.3".to_string());
         settings.channels.gateway_port = Some(9191);
         settings.channels.gateway_auth_token = Some("tok".to_string());
-        settings.channels.signal_http_url = Some("http://127.0.0.1:8080".to_string());
-        settings.channels.signal_account = Some("+15551234567".to_string());
-        settings.channels.signal_allow_from = Some("+15551234567,+15557654321".to_string());
         settings.channels.wasm_channels_dir = Some(PathBuf::from("/tmp/settings-channels"));
         settings.channels.wasm_channels_enabled = false;
 
@@ -544,10 +391,6 @@ mod tests {
         assert_eq!(gateway.host, "127.0.0.3");
         assert_eq!(gateway.port, 9191);
         assert_eq!(gateway.auth_token.as_deref(), Some("tok"));
-
-        let signal = cfg.signal.expect("signal config");
-        assert_eq!(signal.account, "+15551234567");
-        assert_eq!(signal.allow_from, vec!["+15551234567", "+15557654321"]);
 
         assert_eq!(
             cfg.wasm_channels_dir,

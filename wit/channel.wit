@@ -194,6 +194,28 @@ interface channel-host {
     /// - Write operation fails
     workspace-write: func(path: string, content: string) -> result<_, string>;
 
+    // ==================== WebSocket ====================
+
+    /// Send a binary frame through the host-managed WebSocket connection.
+    ///
+    /// The host manages the WebSocket lifecycle (connect, reconnect, ping/pong).
+    /// WASM modules use this function to send protocol-specific frames back
+    /// through the connection (e.g., Signal protobuf acknowledgments, Discord
+    /// heartbeats/identify payloads).
+    ///
+    /// Returns Err if:
+    /// - No WebSocket is configured or connected
+    /// - The send fails (connection dropped)
+    /// - Rate limit exceeded
+    websocket-send: func(data: list<u8>) -> result<_, string>;
+
+    /// Send a text frame through the host-managed WebSocket connection.
+    ///
+    /// Same as websocket-send but for text (UTF-8) frames.
+    /// Used for protocols that communicate via JSON over WebSocket
+    /// (e.g., Discord Gateway).
+    websocket-send-text: func(text: string) -> result<_, string>;
+
     // ==================== DM Pairing ====================
 
     /// Result of upserting a pairing request.

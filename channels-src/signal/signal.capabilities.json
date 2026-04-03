@@ -1,0 +1,75 @@
+{
+  "version": "0.1.0",
+  "wit_version": "0.3.0",
+  "type": "channel",
+  "name": "signal",
+  "description": "Native Signal Protocol channel — no external daemon needed",
+  "auth": {
+    "secret_name": "signal_credentials",
+    "display_name": "Signal",
+    "instructions": "Link this device to your Signal account. Run: ironclaw channel setup signal",
+    "env_var": "SIGNAL_CREDENTIALS"
+  },
+  "setup": {
+    "required_secrets": [
+      {
+        "name": "signal_credentials",
+        "prompt": "Signal credentials (set during device linking)",
+        "optional": false
+      }
+    ]
+  },
+  "capabilities": {
+    "http": {
+      "allowlist": [
+        { "host": "chat.signal.org", "path_prefix": "/" },
+        { "host": "storage.signal.org", "path_prefix": "/" },
+        { "host": "cdn.signal.org", "path_prefix": "/" },
+        { "host": "cdn2.signal.org", "path_prefix": "/" },
+        { "host": "cdn3.signal.org", "path_prefix": "/" }
+      ],
+      "credentials": {
+        "signal_auth": {
+          "secret_name": "signal_credentials",
+          "location": { "type": "basic_auth" },
+          "host_patterns": ["chat.signal.org", "storage.signal.org"]
+        }
+      },
+      "max_response_bytes": 52428800,
+      "rate_limit": {
+        "requests_per_minute": 120,
+        "requests_per_hour": 5000
+      }
+    },
+    "secrets": {
+      "allowed_names": ["signal_*"]
+    },
+    "websocket": {
+      "url": "wss://chat.signal.org/v1/websocket/",
+      "connect_on_start": true,
+      "identify_secret_name": "signal_credentials",
+      "headers": {
+        "X-Signal-Receive-Stories": "false"
+      }
+    },
+    "channel": {
+      "allowed_paths": [],
+      "allow_polling": true,
+      "min_poll_interval_ms": 5000,
+      "workspace_prefix": "channels/signal/",
+      "durable_workspace": true,
+      "emit_rate_limit": {
+        "messages_per_minute": 100,
+        "messages_per_hour": 5000
+      }
+    }
+  },
+  "config": {
+    "allow_from": [],
+    "allow_from_groups": [],
+    "dm_policy": "pairing",
+    "group_policy": "allowlist",
+    "group_allow_from": [],
+    "ignore_stories": true
+  }
+}

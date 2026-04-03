@@ -918,6 +918,46 @@ pub struct UserSummaryStats {
     pub last_active_at: Option<DateTime<Utc>>,
 }
 
+/// Persistent key-value store for WASM channel state.
+///
+/// Channels that declare `"durable_workspace": true` in their capabilities
+/// get their workspace reads and writes backed by the database instead of
+/// in-memory storage. This ensures cryptographic session state (e.g., Signal
+/// Protocol sessions and pre-keys) survives process restarts.
+///
+/// Namespaced by `channel_name` — each channel's state is isolated.
+#[async_trait]
+pub trait ChannelStateStore: Send + Sync {
+    /// Read a value from the channel's persistent workspace.
+    async fn channel_state_read(
+        &self,
+        channel_name: &str,
+        path: &str,
+    ) -> Result<Option<String>, DatabaseError>;
+
+    /// Write a value to the channel's persistent workspace.
+    async fn channel_state_write(
+        &self,
+        channel_name: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<(), DatabaseError>;
+
+    /// Delete a value from the channel's persistent workspace.
+    async fn channel_state_delete(
+        &self,
+        channel_name: &str,
+        path: &str,
+    ) -> Result<bool, DatabaseError>;
+
+    /// List all keys for a channel, optionally filtered by path prefix.
+    async fn channel_state_list(
+        &self,
+        channel_name: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<String>, DatabaseError>;
+}
+
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers
@@ -932,6 +972,7 @@ pub trait Database:
     + SettingsStore
     + WorkspaceStore
     + UserStore
+    + ChannelStateStore
     + Send
     + Sync
 {

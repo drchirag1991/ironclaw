@@ -556,6 +556,19 @@ CREATE INDEX IF NOT EXISTS idx_routine_runs_status ON routine_runs(status);
 -- heartbeat_state
 CREATE INDEX IF NOT EXISTS idx_heartbeat_next_run ON heartbeat_state(next_run);
 
+-- ==================== Channel State ====================
+
+CREATE TABLE IF NOT EXISTS channel_state (
+    channel_name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (channel_name, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_state_channel ON channel_state(channel_name);
+CREATE INDEX IF NOT EXISTS idx_channel_state_prefix ON channel_state(channel_name, path);
+
 -- ==================== Seed data ====================
 
 -- Pre-populate leak detection patterns (matches PostgreSQL V2 migration).

@@ -33,7 +33,7 @@ use crate::llm::{SessionConfig, SessionManager};
 use crate::secrets::{SecretsCrypto, SecretsStore};
 use crate::settings::{KeySource, Settings};
 use crate::setup::channels::{
-    SecretsContext, setup_http, setup_signal, setup_tunnel, setup_wasm_channel,
+    SecretsContext, setup_http, setup_tunnel, setup_wasm_channel,
 };
 use crate::setup::prompts::{
     confirm, input, optional_input, print_banner, print_error, print_header, print_info,
@@ -43,7 +43,6 @@ use crate::setup::prompts::{
 // unused const, keep commented for clarity / future use
 // const CHANNEL_INDEX_CLI: usize = 0;
 const CHANNEL_INDEX_HTTP: usize = 1;
-const CHANNEL_INDEX_SIGNAL: usize = 2;
 
 /// Setup wizard error.
 #[derive(Debug, thiserror::Error)]
@@ -2534,7 +2533,6 @@ impl SetupWizard {
                 "HTTP webhook".to_string(),
                 self.settings.channels.http_enabled,
             ),
-            ("Signal".to_string(), self.settings.channels.signal_enabled),
         ];
 
         let non_wasm_count = options.len();
@@ -2637,29 +2635,6 @@ impl SetupWizard {
             }
         } else {
             self.settings.channels.http_enabled = false;
-        }
-
-        // Signal channel
-        if selected.contains(&CHANNEL_INDEX_SIGNAL) {
-            println!();
-            let result = setup_signal(&self.settings).await?;
-            self.settings.channels.signal_enabled = result.enabled;
-            self.settings.channels.signal_http_url = Some(result.http_url);
-            self.settings.channels.signal_account = Some(result.account);
-            self.settings.channels.signal_allow_from = Some(result.allow_from);
-            self.settings.channels.signal_allow_from_groups = Some(result.allow_from_groups);
-            self.settings.channels.signal_dm_policy = Some(result.dm_policy);
-            self.settings.channels.signal_group_policy = Some(result.group_policy);
-            self.settings.channels.signal_group_allow_from = Some(result.group_allow_from);
-        } else {
-            self.settings.channels.signal_enabled = false;
-            self.settings.channels.signal_http_url = None;
-            self.settings.channels.signal_account = None;
-            self.settings.channels.signal_allow_from = None;
-            self.settings.channels.signal_allow_from_groups = None;
-            self.settings.channels.signal_dm_policy = None;
-            self.settings.channels.signal_group_policy = None;
-            self.settings.channels.signal_group_allow_from = None;
         }
 
         let discovered_by_name: HashMap<String, ChannelCapabilitiesFile> =
@@ -3065,7 +3040,7 @@ impl SetupWizard {
     /// Only true chicken-and-egg settings are written here — things needed
     /// before the database is connected: `DATABASE_BACKEND`, `DATABASE_URL`,
     /// `LIBSQL_PATH`, `SECRETS_MASTER_KEY`, `ONBOARD_COMPLETED`, and
-    /// channel config vars (Signal, Claude Code sandbox).
+    /// channel config vars (Claude Code sandbox).
     ///
     /// **LLM settings and credentials are NOT written here.** `LLM_BACKEND`,
     /// base URLs, and model names are persisted to the DB via
@@ -3103,39 +3078,6 @@ impl SetupWizard {
         // Claude Code sandbox mode
         if self.settings.sandbox.claude_code_enabled {
             env_vars.push(("CLAUDE_CODE_ENABLED".to_string(), "true".to_string()));
-        }
-
-        // Signal channel env vars (chicken-and-egg: config resolves before DB).
-        if let Some(ref url) = self.settings.channels.signal_http_url {
-            env_vars.push(("SIGNAL_HTTP_URL".to_string(), url.clone()));
-        }
-        if let Some(ref account) = self.settings.channels.signal_account {
-            env_vars.push(("SIGNAL_ACCOUNT".to_string(), account.clone()));
-        }
-        if let Some(ref allow_from) = self.settings.channels.signal_allow_from {
-            env_vars.push(("SIGNAL_ALLOW_FROM".to_string(), allow_from.clone()));
-        }
-        if let Some(ref allow_from_groups) = self.settings.channels.signal_allow_from_groups
-            && !allow_from_groups.is_empty()
-        {
-            env_vars.push((
-                "SIGNAL_ALLOW_FROM_GROUPS".to_string(),
-                allow_from_groups.clone(),
-            ));
-        }
-        if let Some(ref dm_policy) = self.settings.channels.signal_dm_policy {
-            env_vars.push(("SIGNAL_DM_POLICY".to_string(), dm_policy.clone()));
-        }
-        if let Some(ref group_policy) = self.settings.channels.signal_group_policy {
-            env_vars.push(("SIGNAL_GROUP_POLICY".to_string(), group_policy.clone()));
-        }
-        if let Some(ref group_allow_from) = self.settings.channels.signal_group_allow_from
-            && !group_allow_from.is_empty()
-        {
-            env_vars.push((
-                "SIGNAL_GROUP_ALLOW_FROM".to_string(),
-                group_allow_from.clone(),
-            ));
         }
 
         if !env_vars.is_empty() {

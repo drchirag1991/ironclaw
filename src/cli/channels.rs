@@ -106,28 +106,6 @@ async fn cmd_list(
         });
     }
 
-    // Built-in: Signal
-    if let Some(ref sig) = config.signal {
-        channels.push(ChannelInfo {
-            name: "signal".to_string(),
-            kind: "built-in",
-            enabled: true,
-            details: vec![
-                ("http_url", sig.http_url.clone()),
-                ("account", sig.account.clone()),
-                ("dm_policy", sig.dm_policy.clone()),
-                ("group_policy", sig.group_policy.clone()),
-            ],
-        });
-    } else {
-        channels.push(ChannelInfo {
-            name: "signal".to_string(),
-            kind: "built-in",
-            enabled: false,
-            details: vec![],
-        });
-    }
-
     // WASM channels: scan directory
     if config.wasm_channels_enabled {
         let wasm_channels = discover_wasm_channels(&config.wasm_channels_dir).await;

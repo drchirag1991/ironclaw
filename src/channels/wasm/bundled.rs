@@ -18,6 +18,7 @@ const CARGO_MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 /// Known channel names and their crate names (for locating build artifacts).
 const KNOWN_CHANNELS: &[(&str, &str)] = &[
+    ("signal", "signal_channel"),
     ("telegram", "telegram_channel"),
     ("slack", "slack_channel"),
     ("discord", "discord_channel"),
