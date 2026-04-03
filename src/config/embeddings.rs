@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::config::helpers::{optional_env, parse_bool_env, parse_optional_env, validate_base_url};
+use crate::config::helpers::{
+    db_first_bool, db_first_or_default, optional_env, parse_optional_env, validate_base_url,
+};
 use crate::error::ConfigError;
 use crate::llm::{BedrockConfig, SessionManager};
 use crate::settings::Settings;
@@ -72,23 +74,41 @@ pub(crate) fn default_dimension_for_model(model: &str) -> usize {
 
 impl EmbeddingsConfig {
     pub(crate) fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
+        let defaults = crate::settings::EmbeddingsSettings::default();
+
         let openai_api_key = optional_env("OPENAI_API_KEY")?.map(SecretString::from);
 
-        let provider = optional_env("EMBEDDING_PROVIDER")?
-            .unwrap_or_else(|| settings.embeddings.provider.clone());
+        let provider = db_first_or_default(
+            &settings.embeddings.provider,
+            &defaults.provider,
+            "EMBEDDING_PROVIDER",
+        )?;
 
-        let model = optional_env("EMBEDDING_MODEL")?.unwrap_or_else(|| {
-            if provider == "bedrock" {
-                "amazon.titan-embed-text-v2:0".to_string()
-            } else {
-                settings.embeddings.model.clone()
-            }
-        });
+        let model = if provider == "bedrock" {
+            optional_env("EMBEDDING_MODEL")?
+                .unwrap_or_else(|| "amazon.titan-embed-text-v2:0".to_string())
+        } else {
+            db_first_or_default(
+                &settings.embeddings.model,
+                &defaults.model,
+                "EMBEDDING_MODEL",
+            )?
+        };
 
-        let ollama_base_url = optional_env("OLLAMA_BASE_URL")?
-            .or_else(|| settings.ollama_base_url.clone())
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
+        // ollama_base_url lives on the top-level Settings, not the embeddings
+        // sub-struct. Use a manual DB > env > default chain.
+        let default_ollama_url = "http://localhost:11434".to_string();
+        let ollama_base_url = match settings
+            .ollama_base_url
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned()
+        {
+            Some(url) => url,
+            None => optional_env("OLLAMA_BASE_URL")?.unwrap_or(default_ollama_url),
+        };
 
+        // Dimension depends on the resolved model, not on a DB setting — env-only.
         let dimension =
             parse_optional_env("EMBEDDING_DIMENSION", default_dimension_for_model(&model))?;
         if provider == "bedrock" && !matches!(dimension, 256 | 512 | 1024) {
@@ -99,7 +119,11 @@ impl EmbeddingsConfig {
             });
         }
 
-        let enabled = parse_bool_env("EMBEDDING_ENABLED", settings.embeddings.enabled)?;
+        let enabled = db_first_bool(
+            settings.embeddings.enabled,
+            defaults.enabled,
+            "EMBEDDING_ENABLED",
+        )?;
 
         let openai_base_url = optional_env("EMBEDDING_BASE_URL")?;
 
@@ -248,7 +272,7 @@ impl EmbeddingsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::helpers::ENV_MUTEX;
+    use crate::config::helpers::lock_env;
     use crate::settings::{EmbeddingsSettings, Settings};
     use crate::testing::credentials::*;
 
@@ -259,16 +283,18 @@ mod tests {
             std::env::remove_var("EMBEDDING_ENABLED");
             std::env::remove_var("EMBEDDING_PROVIDER");
             std::env::remove_var("EMBEDDING_MODEL");
+            std::env::remove_var("EMBEDDING_DIMENSION");
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("EMBEDDING_BASE_URL");
             std::env::remove_var("EMBEDDING_CACHE_SIZE");
             std::env::remove_var("EMBEDDING_DIMENSION");
+            std::env::remove_var("OLLAMA_BASE_URL");
         }
     }
 
     #[test]
     fn embeddings_disabled_not_overridden_by_openai_key() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let _guard = lock_env();
         clear_embedding_env();
         // SAFETY: Under ENV_MUTEX, no concurrent env access.
         unsafe {
@@ -298,7 +324,7 @@ mod tests {
 
     #[test]
     fn embeddings_enabled_from_settings() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let _guard = lock_env();
         clear_embedding_env();
 
         let settings = Settings {
@@ -317,18 +343,21 @@ mod tests {
     }
 
     #[test]
-    fn embeddings_env_override_takes_precedence() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+    fn db_settings_override_env() {
+        let _guard = lock_env();
         clear_embedding_env();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
-            std::env::set_var("EMBEDDING_ENABLED", "true");
+            std::env::set_var("EMBEDDING_ENABLED", "false");
+            std::env::set_var("EMBEDDING_PROVIDER", "ollama");
+            std::env::set_var("EMBEDDING_MODEL", "all-minilm");
         }
 
         let settings = Settings {
             embeddings: EmbeddingsSettings {
-                enabled: false,
-                ..Default::default()
+                enabled: true,
+                provider: "openai".to_string(),
+                model: "text-embedding-3-large".to_string(),
             },
             ..Default::default()
         };
@@ -336,18 +365,61 @@ mod tests {
         let config = EmbeddingsConfig::resolve(&settings).expect("resolve should succeed");
         assert!(
             config.enabled,
-            "EMBEDDING_ENABLED=true env var should override settings"
+            "DB enabled=true should win over env EMBEDDING_ENABLED=false"
+        );
+        assert_eq!(config.provider, "openai", "DB provider should win over env");
+        assert_eq!(
+            config.model, "text-embedding-3-large",
+            "DB model should win over env"
         );
 
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::remove_var("EMBEDDING_ENABLED");
+            std::env::remove_var("EMBEDDING_PROVIDER");
+            std::env::remove_var("EMBEDDING_MODEL");
+        }
+    }
+
+    #[test]
+    fn env_used_when_no_db_setting() {
+        let _guard = lock_env();
+        clear_embedding_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("EMBEDDING_ENABLED", "true");
+            std::env::set_var("EMBEDDING_PROVIDER", "ollama");
+            std::env::set_var("EMBEDDING_MODEL", "nomic-embed-text");
+        }
+
+        // Settings left at defaults — no explicit DB/TOML override
+        let settings = Settings::default();
+
+        let config = EmbeddingsConfig::resolve(&settings).expect("resolve should succeed");
+        assert!(
+            config.enabled,
+            "env EMBEDDING_ENABLED should be used when settings at default"
+        );
+        assert_eq!(
+            config.provider, "ollama",
+            "env EMBEDDING_PROVIDER should be used when settings at default"
+        );
+        assert_eq!(
+            config.model, "nomic-embed-text",
+            "env EMBEDDING_MODEL should be used when settings at default"
+        );
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("EMBEDDING_ENABLED");
+            std::env::remove_var("EMBEDDING_PROVIDER");
+            std::env::remove_var("EMBEDDING_MODEL");
         }
     }
 
     #[test]
     fn embedding_base_url_parsed_from_env() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let _guard = lock_env();
         clear_embedding_env();
 
         // SAFETY: Under ENV_MUTEX, no concurrent env access.
@@ -366,7 +438,7 @@ mod tests {
 
     #[test]
     fn embedding_base_url_defaults_to_none() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let _guard = lock_env();
         clear_embedding_env();
 
         let settings = Settings::default();
@@ -379,7 +451,7 @@ mod tests {
 
     #[test]
     fn cache_size_zero_rejected() {
-        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let _guard = lock_env();
         clear_embedding_env();
         // SAFETY: Under ENV_MUTEX.
         unsafe {

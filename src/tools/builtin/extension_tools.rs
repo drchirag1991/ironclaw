@@ -11,6 +11,15 @@ use crate::context::JobContext;
 use crate::extensions::{ExtensionKind, ExtensionManager};
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
 
+fn activation_error_requires_auth(err: &str) -> bool {
+    let err_lower = err.to_ascii_lowercase();
+    err_lower.contains("authentication required")
+        || err_lower.contains("authentication")
+        || err_lower.contains("unauthorized")
+        || err_lower.contains("not authenticated")
+        || err.contains("401")
+}
+
 // ── tool_search ──────────────────────────────────────────────────────────
 
 pub struct ToolSearchTool {
@@ -31,8 +40,11 @@ impl Tool for ToolSearchTool {
 
     fn description(&self) -> &str {
         "Search for available extensions to add new capabilities. Extensions include \
-         channels (Telegram, Slack, Discord — for messaging), tools, and MCP servers. \
-         Use discover:true to search online if the built-in registry has no results."
+         channels (Telegram, Slack, Discord — connect messaging platforms so IronClaw can \
+         receive and reply there), tools, and MCP servers. Use `tool_install` and \
+         `tool_activate` to install and enable channels; use the `message` tool for proactive \
+         outbound sends. Use discover:true to search online if the built-in registry has no \
+         results."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -130,7 +142,7 @@ impl Tool for ToolInstallTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -150,7 +162,7 @@ impl Tool for ToolInstallTool {
 
         let result = self
             .manager
-            .install(name, url, kind_hint)
+            .install(name, url, kind_hint, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -205,7 +217,7 @@ impl Tool for ToolAuthTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -213,13 +225,13 @@ impl Tool for ToolAuthTool {
 
         let result = self
             .manager
-            .auth(name)
+            .auth(name, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         // Auto-activate after successful auth so tools are available immediately
         if result.is_authenticated() {
-            match self.manager.activate(name).await {
+            match self.manager.activate(name, &ctx.user_id).await {
                 Ok(activate_result) => {
                     let output = serde_json::json!({
                         "status": "authenticated_and_activated",
@@ -304,13 +316,13 @@ impl Tool for ToolActivateTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
         let name = require_str(&params, "name")?;
 
-        match self.manager.activate(name).await {
+        match self.manager.activate(name, &ctx.user_id).await {
             Ok(result) => {
                 let output = serde_json::to_value(&result)
                     .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
@@ -318,10 +330,7 @@ impl Tool for ToolActivateTool {
             }
             Err(activate_err) => {
                 let err_str = activate_err.to_string();
-                let needs_auth = err_str.contains("authentication")
-                    || err_str.contains("401")
-                    || err_str.contains("Unauthorized")
-                    || err_str.contains("not authenticated");
+                let needs_auth = activation_error_requires_auth(&err_str);
 
                 if !needs_auth {
                     return Err(ToolError::ExecutionFailed(err_str));
@@ -329,12 +338,12 @@ impl Tool for ToolActivateTool {
 
                 // Activation failed due to missing auth; initiate auth flow
                 // so the agent loop can show the auth card.
-                match self.manager.auth(name).await {
+                match self.manager.auth(name, &ctx.user_id).await {
                     Ok(auth_result) if auth_result.is_authenticated() => {
                         // Auth succeeded (e.g. env var was set); retry activation.
                         let result = self
                             .manager
-                            .activate(name)
+                            .activate(name, &ctx.user_id)
                             .await
                             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
                         let output = serde_json::to_value(&result).unwrap_or_else(
@@ -404,7 +413,7 @@ impl Tool for ToolListTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -425,7 +434,7 @@ impl Tool for ToolListTool {
 
         let extensions = self
             .manager
-            .list(kind_filter, include_available)
+            .list(kind_filter, include_available, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -477,7 +486,7 @@ impl Tool for ToolRemoveTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -485,7 +494,7 @@ impl Tool for ToolRemoveTool {
 
         let message = self
             .manager
-            .remove(name)
+            .remove(name, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -541,7 +550,7 @@ impl Tool for ToolUpgradeTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -549,7 +558,7 @@ impl Tool for ToolUpgradeTool {
 
         let result = self
             .manager
-            .upgrade(name)
+            .upgrade(name, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -603,7 +612,7 @@ impl Tool for ExtensionInfoTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -611,7 +620,7 @@ impl Tool for ExtensionInfoTool {
 
         let info = self
             .manager
-            .extension_info(name)
+            .extension_info(name, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -632,6 +641,17 @@ mod tests {
         let schema = tool.parameters_schema();
         assert!(schema.get("properties").is_some());
         assert!(schema["properties"].get("query").is_some());
+    }
+
+    #[test]
+    fn test_tool_search_description_clarifies_channel_setup_vs_sending() {
+        let tool = ToolSearchTool {
+            manager: test_manager_stub(),
+        };
+
+        let description = tool.description();
+        assert!(description.contains("Use `tool_install` and `tool_activate`"));
+        assert!(description.contains("use the `message` tool for proactive outbound sends"));
     }
 
     #[test]
@@ -681,6 +701,17 @@ mod tests {
             tool.requires_approval(&serde_json::json!({})),
             ApprovalRequirement::Never
         );
+    }
+
+    #[test]
+    fn activation_error_requires_auth_detects_auth_required_variants() {
+        assert!(activation_error_requires_auth("Authentication required"));
+        assert!(activation_error_requires_auth("not authenticated"));
+        assert!(activation_error_requires_auth("401 unauthorized"));
+        assert!(activation_error_requires_auth("Unauthorized"));
+        assert!(!activation_error_requires_auth(
+            "Activation failed: crashed"
+        ));
     }
 
     #[test]
