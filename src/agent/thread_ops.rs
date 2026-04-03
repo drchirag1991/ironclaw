@@ -1103,6 +1103,11 @@ impl Agent {
                 }
             }
 
+            taken
+            // Lock dropped here — all approval bookkeeping is complete
+        };
+
+        if approved {
             // Defense-in-depth: don't persist AlwaysAllow for tools that
             // declare ApprovalRequirement::Always (the UI hides the
             // "Always" button for locked tools, but a crafted client
