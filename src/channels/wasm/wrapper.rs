@@ -632,14 +632,14 @@ impl near::agent::channel_host::Host for ChannelStoreData {
             serde_json::from_str(&meta_json).ok()
         };
         let store = self.pairing_store.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "pairing host callback requires a Tokio runtime".to_string())?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err("pairing host callback requires a multi-thread Tokio runtime".to_string());
+        }
         let result: Result<crate::db::PairingRequestRecord, crate::error::DatabaseError> =
-            // SAFETY: block_in_place requires a multi-thread Tokio runtime. WASM channel
-            // callbacks are always invoked from a multi-thread runtime worker thread.
-            // Do NOT use this pattern in #[tokio::test] (which uses current_thread by default).
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    store.upsert_request(&channel, &id, meta).await
-                })
+            tokio::task::block_in_place(move || {
+                handle.block_on(async move { store.upsert_request(&channel, &id, meta).await })
             });
         match result {
             Ok(req) => Ok(near::agent::channel_host::PairingUpsertResult {
@@ -656,14 +656,14 @@ impl near::agent::channel_host::Host for ChannelStoreData {
         external_id: String,
     ) -> Result<Option<String>, String> {
         let store = self.pairing_store.clone();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| "pairing host callback requires a Tokio runtime".to_string())?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err("pairing host callback requires a multi-thread Tokio runtime".to_string());
+        }
         let result: Result<Option<crate::ownership::Identity>, crate::error::DatabaseError> =
-            // SAFETY: block_in_place requires a multi-thread Tokio runtime. WASM channel
-            // callbacks are always invoked from a multi-thread runtime worker thread.
-            // Do NOT use this pattern from current-thread runtimes or non-Tokio contexts.
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    store.resolve_identity(&channel, &external_id).await
-                })
+            tokio::task::block_in_place(move || {
+                handle.block_on(async move { store.resolve_identity(&channel, &external_id).await })
             });
         match result {
             Ok(Some(identity)) => Ok(Some(identity.owner_id.to_string())),
