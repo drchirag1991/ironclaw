@@ -376,6 +376,29 @@ pub trait LlmProvider: Send + Sync {
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError>;
 
+    /// Complete with tool use support and token-level streaming.
+    ///
+    /// Content tokens are emitted via `on_token` as they arrive. Tool call
+    /// deltas are buffered internally (tool JSON must be complete before
+    /// execution). Returns the full `ToolCompletionResponse` after the
+    /// stream ends.
+    ///
+    /// Default falls back to non-streaming `complete_with_tools()` and
+    /// emits the content (if any) as a single chunk.
+    async fn complete_with_tools_streaming(
+        &self,
+        request: ToolCompletionRequest,
+        on_token: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        let response = self.complete_with_tools(request).await?;
+        if let Some(ref content) = response.content {
+            if !content.is_empty() {
+                on_token(content.clone());
+            }
+        }
+        Ok(response)
+    }
+
     /// List available models from the provider.
     /// Default implementation returns empty list.
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {
