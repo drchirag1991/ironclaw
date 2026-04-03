@@ -578,29 +578,21 @@ pub async fn usage_summary_handler(
         "Database not available".to_string(),
     ))?;
 
-    let users = store
-        .list_users(None)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let since_30d = chrono::Utc::now() - chrono::Duration::days(30);
+    let (users, summary_stats, usage_stats) = tokio::try_join!(
+        store.list_users(None),
+        store.user_summary_stats(None),
+        store.user_usage_stats(None, since_30d),
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let total = users.len();
     let active = users.iter().filter(|u| u.status == "active").count();
     let suspended = users.iter().filter(|u| u.status == "suspended").count();
     let admins = users.iter().filter(|u| u.role == "admin").count();
 
-    let summary_stats = store
-        .user_summary_stats(None)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     let total_jobs: i64 = summary_stats.iter().map(|s| s.job_count).sum();
     let total_cost: rust_decimal::Decimal = summary_stats.iter().map(|s| s.total_cost).sum();
-
-    let since_30d = chrono::Utc::now() - chrono::Duration::days(30);
-    let usage_stats = store
-        .user_usage_stats(None, since_30d)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let llm_calls: i64 = usage_stats.iter().map(|s| s.call_count).sum();
     let input_tokens: i64 = usage_stats.iter().map(|s| s.input_tokens).sum();

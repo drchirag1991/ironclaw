@@ -745,6 +745,7 @@ pub async fn start_server(
     // Static file routes (no auth, served from embedded strings)
     let statics = Router::new()
         .route("/", get(index_handler))
+        .route("/theme.css", get(theme_css_handler))
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler))
         .route("/theme-init.js", get(theme_init_handler))
@@ -891,6 +892,16 @@ async fn css_handler() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         include_str!("static/style.css"),
+    )
+}
+
+async fn theme_css_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("static/theme.css"),
     )
 }
 

@@ -146,6 +146,7 @@ Browser-facing HTTP API and SSE/WebSocket real-time streaming. Axum-based, singl
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | Single-page app HTML |
+| GET | `/theme.css` | Shared theme tokens for the web and admin SPAs |
 | GET | `/style.css` | App stylesheet |
 | GET | `/app.js` | App JavaScript |
 | GET | `/favicon.ico` | Favicon (cached 1 day) |

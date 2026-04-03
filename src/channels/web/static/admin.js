@@ -472,14 +472,14 @@
 
       // Profile card
       html += '<div class="detail-card"><h2>Profile</h2>';
-      html += detailRow('ID', '<span class="mono">' + escapeHtml(user.id) + '</span>');
-      html += detailRow('Email', escapeHtml(user.email || 'Not set'));
-      html += detailRow('Role', roleBadge(user.role));
-      html += detailRow('Status', statusBadge(user.status));
+      html += detailRowHtml('ID', '<span class="mono">' + escapeHtml(user.id) + '</span>');
+      html += detailRow('Email', user.email || 'Not set');
+      html += detailRowHtml('Role', roleBadge(user.role));
+      html += detailRowHtml('Status', statusBadge(user.status));
       html += detailRow('Created', formatRelativeTime(user.created_at));
       html += detailRow('Last Login', formatRelativeTime(user.last_login_at));
       if (user.created_by) {
-        html += detailRow('Created By', '<span class="mono">' + escapeHtml(truncateId(user.created_by)) + '</span>');
+        html += detailRowHtml('Created By', '<span class="mono">' + escapeHtml(truncateId(user.created_by)) + '</span>');
       }
       html += '</div>';
 
@@ -536,7 +536,12 @@
   }
 
   function detailRow(label, value) {
-    return '<div class="detail-row"><span class="detail-label">' + escapeHtml(label) + '</span><span class="detail-value">' + value + '</span></div>';
+    return '<div class="detail-row"><span class="detail-label">' + escapeHtml(label) + '</span><span class="detail-value">' + escapeHtml(value == null ? '' : String(value)) + '</span></div>';
+  }
+
+  // valueHtml must already be safe to inject.
+  function detailRowHtml(label, valueHtml) {
+    return '<div class="detail-row"><span class="detail-label">' + escapeHtml(label) + '</span><span class="detail-value">' + valueHtml + '</span></div>';
   }
 
   // --- Usage ---
