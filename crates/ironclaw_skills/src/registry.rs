@@ -1290,7 +1290,8 @@ mod tests {
 
         let bundled: &'static [(String, String)] = Box::leak(Box::new(vec![(
             "gated".to_string(),
-            "---\nname: gated\nrequires:\n  bins: [\"__nonexistent__\"]\n---\n\nGated.\n".to_string(),
+            "---\nname: gated\nrequires:\n  bins: [\"__nonexistent__\"]\n---\n\nGated.\n"
+                .to_string(),
         )]));
 
         let mut registry =

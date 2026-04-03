@@ -134,7 +134,6 @@ fn default_version() -> String {
     "0.0.0".to_string()
 }
 
-
 /// Requirements that must be satisfied for a skill to load.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatingRequirements {
