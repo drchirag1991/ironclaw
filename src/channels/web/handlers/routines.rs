@@ -14,21 +14,11 @@ use crate::agent::routine::{
     RoutineDisplayStatus, RoutineVerificationStatus, Trigger, next_cron_fire,
     routine_display_status_for_verification, routine_verification_status,
 };
-use crate::channels::web::auth::AuthenticatedUser;
+use crate::channels::web::auth::{AuthenticatedUser, ownership_identity};
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
 use crate::error::RoutineError;
-use crate::ownership::{Identity, OwnerId, UserRole, can_act_on};
-
-/// Build an `Identity` from the authenticated user, respecting the stored role.
-fn identity_from_auth(user: &crate::channels::web::auth::UserIdentity) -> Identity {
-    let role = if user.role.eq_ignore_ascii_case("admin") {
-        UserRole::Admin
-    } else {
-        UserRole::Member
-    };
-    Identity::new(OwnerId::from(user.user_id.clone()), role)
-}
+use crate::ownership::{OwnerId, can_act_on};
 
 pub async fn routines_list_handler(
     State(state): State<Arc<GatewayState>>,
@@ -150,7 +140,7 @@ pub async fn routines_detail_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
 
-    let actor = identity_from_auth(&user);
+    let actor = ownership_identity(&user);
     if !can_act_on(&actor, &OwnerId::from(routine.user_id.clone())) {
         return Err((StatusCode::NOT_FOUND, "Routine not found".to_string()));
     }
@@ -263,7 +253,7 @@ pub async fn routines_toggle_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
 
-    let actor = identity_from_auth(&user);
+    let actor = ownership_identity(&user);
     if !can_act_on(&actor, &OwnerId::from(routine.user_id.clone())) {
         return Err((StatusCode::NOT_FOUND, "Routine not found".to_string()));
     }
@@ -331,7 +321,7 @@ pub async fn routines_delete_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
 
-    let actor = identity_from_auth(&user);
+    let actor = ownership_identity(&user);
     if !can_act_on(&actor, &OwnerId::from(routine.user_id.clone())) {
         return Err((StatusCode::NOT_FOUND, "Routine not found".to_string()));
     }
@@ -380,7 +370,7 @@ pub async fn routines_runs_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
 
-    let actor = identity_from_auth(&user);
+    let actor = ownership_identity(&user);
     if !can_act_on(&actor, &OwnerId::from(routine.user_id.clone())) {
         return Err((StatusCode::NOT_FOUND, "Routine not found".to_string()));
     }

@@ -1,7 +1,8 @@
 //! In-process identity cache for the channel boundary.
 //!
 //! Maps `(channel, external_id)` → `Identity` (OwnerId + role).
-//! Write-through: updated on pairing approve/remove so reads never go stale.
+//! Read-through: populated after a DB-backed identity lookup succeeds.
+//! Explicit eviction happens on pairing removal and user invalidation paths.
 //! No TTL — role changes are not implemented yet; add eviction at the write
 //! site when they are.
 
@@ -34,7 +35,7 @@ impl OwnershipCache {
             .cloned()
     }
 
-    /// Insert or update an entry. Called on pairing approval.
+    /// Insert or update an entry after a successful identity resolution.
     pub fn insert(&self, channel: &str, external_id: &str, identity: Identity) {
         let key = (channel.to_string(), external_id.to_string());
         self.identities

@@ -60,7 +60,7 @@ When an unknown user DMs your bot, they receive a pairing code. You must approve
 2. Bot replies with a one-time pairing code
 3. The user enters that code in IronClaw's channel settings to claim the Telegram account
 4. CLI fallback: `ironclaw pairing approve telegram ABC12345`
-5. User is added to the allow list; future messages are delivered
+5. The user's Telegram identity is linked to the owner; future messages resolve to that owner and are delivered
 
 ### Commands
 
