@@ -96,6 +96,10 @@ pub struct ContainerJobConfig {
     /// Whether per-job MCP server filtering is enabled.
     /// When false, `mcp_servers` param on `create_job` is ignored.
     pub mcp_per_job_enabled: bool,
+    /// Whether Claude Code sandbox mode is available (from CLAUDE_CODE_ENABLED).
+    pub claude_code_enabled: bool,
+    /// Whether ACP agent mode is available (from ACP_ENABLED).
+    pub acp_enabled: bool,
 }
 
 impl Default for ContainerJobConfig {
@@ -114,6 +118,8 @@ impl Default for ContainerJobConfig {
             acp_memory_limit_mb: 4096,
             acp_timeout_secs: 1800,
             mcp_per_job_enabled: false,
+            claude_code_enabled: false,
+            acp_enabled: false,
         }
     }
 }
@@ -256,6 +262,16 @@ impl ContainerJobManager {
             containers: Arc::new(RwLock::new(HashMap::new())),
             docker: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Whether Claude Code mode is enabled for job creation.
+    pub fn claude_code_enabled(&self) -> bool {
+        self.config.claude_code_enabled
+    }
+
+    /// Whether ACP agent mode is enabled for job creation.
+    pub fn acp_enabled(&self) -> bool {
+        self.config.acp_enabled
     }
 
     fn extend_acp_env(
@@ -991,6 +1007,38 @@ mod tests {
     fn test_container_job_config_acp_timeout_default() {
         let config = ContainerJobConfig::default();
         assert_eq!(config.acp_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn test_container_job_config_claude_code_disabled_by_default() {
+        let config = ContainerJobConfig::default();
+        assert!(!config.claude_code_enabled);
+    }
+
+    #[test]
+    fn test_container_job_config_acp_disabled_by_default() {
+        let config = ContainerJobConfig::default();
+        assert!(!config.acp_enabled);
+    }
+
+    #[test]
+    fn test_container_job_manager_claude_code_enabled_accessor() {
+        let config = ContainerJobConfig {
+            claude_code_enabled: true,
+            ..Default::default()
+        };
+        let manager = ContainerJobManager::new(config, TokenStore::new());
+        assert!(manager.claude_code_enabled());
+    }
+
+    #[test]
+    fn test_container_job_manager_acp_enabled_accessor() {
+        let config = ContainerJobConfig {
+            acp_enabled: true,
+            ..Default::default()
+        };
+        let manager = ContainerJobManager::new(config, TokenStore::new());
+        assert!(manager.acp_enabled());
     }
 
     #[test]
