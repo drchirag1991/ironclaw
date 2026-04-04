@@ -17,8 +17,8 @@ use crate::types::error::EngineError;
 use crate::types::memory::MemoryDoc;
 use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
 use crate::types::project::ProjectId;
-use crate::types::shared_owner_id;
 use crate::types::thread::{ThreadConfig, ThreadId, ThreadType};
+use crate::types::{is_shared_owner, shared_owner_id};
 
 /// Notification emitted when a mission thread completes.
 ///
@@ -127,7 +127,9 @@ impl MissionManager {
                 reason: format!("mission {id} not found"),
             })?;
 
-        if !mission.owner_id().is_shared() && !mission.is_owned_by(user_id) {
+        if !(mission.is_owned_by(user_id)
+            || mission.owner_id().is_shared() && is_shared_owner(user_id))
+        {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
                 entity: format!("mission {id}"),
@@ -164,10 +166,10 @@ impl MissionManager {
     /// For shared missions, the caller (web handler) must
     /// verify admin role before calling this. The engine only checks ownership.
     pub async fn pause_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
-        // Validate ownership. Shared missions require admin role (checked by caller).
+        // Validate ownership. Shared/system missions require the system user to manage.
         if let Some(mission) = self.store.load_mission(id).await?
             && !mission.is_owned_by(user_id)
-            && !mission.owner_id().is_shared()
+            && !(mission.owner_id().is_shared() && is_shared_owner(user_id))
         {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),
@@ -187,10 +189,10 @@ impl MissionManager {
     /// For shared missions, the caller (web handler) must
     /// verify admin role before calling this. The engine only checks ownership.
     pub async fn resume_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
-        // Validate ownership. Shared missions require admin role (checked by caller).
+        // Validate ownership. Shared/system missions require the system user to manage.
         if let Some(mission) = self.store.load_mission(id).await?
             && !mission.is_owned_by(user_id)
-            && !mission.owner_id().is_shared()
+            && !(mission.owner_id().is_shared() && is_shared_owner(user_id))
         {
             return Err(EngineError::AccessDenied {
                 user_id: user_id.to_string(),

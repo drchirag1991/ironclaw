@@ -617,8 +617,9 @@ mod tests {
         let outcome = exec.run().await.unwrap();
         assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Done!"));
         assert_eq!(exec.thread.step_count, 2);
-        // Should have: system(nudge not counted), assistant+actions, action_result, assistant
-        assert!(exec.thread.messages.len() >= 3);
+        // The orchestrator's working transcript (internal_messages) should have:
+        // system, assistant+actions, action_result, assistant
+        assert!(exec.thread.internal_messages.len() >= 3);
     }
 
     #[tokio::test]
@@ -735,10 +736,10 @@ mod tests {
             matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "The answer is 42")
         );
         assert_eq!(exec.thread.step_count, 2);
-        // Should have nudge system message
+        // The nudge message lives in the orchestrator's working transcript (internal_messages)
         assert!(
             exec.thread
-                .messages
+                .internal_messages
                 .iter()
                 .any(|m| m.content.contains("did not include any tool calls"))
         );
@@ -873,10 +874,10 @@ mod tests {
             matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "done, x was 30")
         );
         assert_eq!(exec.thread.step_count, 2);
-        // The output metadata from first step should be in messages
+        // The output metadata from first step should be in the orchestrator's working transcript
         assert!(
             exec.thread
-                .messages
+                .internal_messages
                 .iter()
                 .any(|m| m.content.contains("x = 30"))
         );

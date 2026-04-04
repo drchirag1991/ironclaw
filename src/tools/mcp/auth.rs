@@ -392,6 +392,9 @@ async fn validate_url_safe(url: &str) -> Result<(), AuthError> {
     // For hostnames, resolve DNS and check each resolved address.
     // This prevents DNS-based SSRF where a hostname resolves to an internal IP
     // (e.g., 169.254.169.254 for cloud metadata endpoints).
+    // Skip DNS resolution in test builds — unit tests run in sandboxed
+    // environments without network access.
+    #[cfg(not(test))]
     if host.parse::<IpAddr>().is_err() {
         let addr = format!("{}:{}", host, parsed.port_or_known_default().unwrap_or(443));
         match tokio::net::lookup_host(&addr).await {

@@ -246,10 +246,11 @@ mod tests {
 
     #[tokio::test]
     async fn health_with_unreachable_url_is_false() {
-        // Use RFC 5737 TEST-NET-1 (192.0.2.0/24) for reliable failure even behind proxies.
+        // Use an invalid scheme so reqwest always rejects the URL,
+        // regardless of network config, proxies, or root privileges.
         let tunnel = CustomTunnel::new(
             "sleep 1".into(),
-            Some("http://192.0.2.1:9999/healthz".into()),
+            Some("ftp://unreachable:9999/healthz".into()),
             None,
         );
         assert!(
