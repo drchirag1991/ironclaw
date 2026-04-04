@@ -4146,7 +4146,7 @@ mod tests {
         use tower::ServiceExt;
 
         let secrets = test_secrets_store();
-        let (ext_mgr, _wasm_tools_dir, wasm_channels_dir, db, _db_tmp) =
+        let (ext_mgr, _wasm_tools_dir, wasm_channels_dir, _db, _db_tmp) =
             test_ext_mgr_with_db(secrets.clone()).await;
 
         std::fs::write(wasm_channels_dir.path().join("wechat.wasm"), b"\0asm fake")
@@ -4182,7 +4182,11 @@ mod tests {
             )
             .expect("runtime"),
         );
-        let pairing_store = Arc::new(crate::pairing::PairingStore::new());
+        let (db, _tmp) = crate::testing::test_db().await;
+        let pairing_store = Arc::new(crate::pairing::PairingStore::new(
+            Arc::clone(&db),
+            Arc::new(crate::ownership::OwnershipCache::new()),
+        ));
         let router = Arc::new(crate::channels::wasm::WasmChannelRouter::new());
         ext_mgr
             .set_channel_runtime(

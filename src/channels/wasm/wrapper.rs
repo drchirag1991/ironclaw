@@ -855,10 +855,7 @@ fn apply_emitted_metadata(mut msg: IncomingMessage, metadata_json: &str) -> Inco
     msg
 }
 
-fn apply_owner_scope_metadata(
-    mut msg: IncomingMessage,
-    owner_scope_id: &str,
-) -> IncomingMessage {
+fn apply_owner_scope_metadata(mut msg: IncomingMessage, owner_scope_id: &str) -> IncomingMessage {
     match &mut msg.metadata {
         serde_json::Value::Object(map) => {
             map.entry("owner_id".to_string())
@@ -2484,10 +2481,8 @@ impl WasmChannel {
             );
 
             // Convert to IncomingMessage
-            let mut msg =
-                IncomingMessage::new(&self.name, &resolved_user_id, &content).with_sender_id(
-                    &user_id,
-                );
+            let mut msg = IncomingMessage::new(&self.name, &resolved_user_id, &content)
+                .with_sender_id(&user_id);
 
             if let Some(name) = user_name {
                 msg = msg.with_user_name(name);

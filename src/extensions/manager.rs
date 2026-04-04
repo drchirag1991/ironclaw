@@ -7954,8 +7954,9 @@ mod tests {
             WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing())
                 .map_err(|err| format!("runtime: {err}"))?,
         );
-        let pairing_store = Arc::new(PairingStore::with_base_dir(
-            dir.path().join("pairing-state"),
+        let pairing_store = Arc::new(PairingStore::new(
+            Arc::clone(&db),
+            Arc::new(crate::ownership::OwnershipCache::new()),
         ));
         let router = Arc::new(WasmChannelRouter::new());
         manager
