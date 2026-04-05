@@ -8,6 +8,7 @@
 
 mod channel_state;
 mod conversations;
+mod identities;
 mod jobs;
 mod routines;
 mod sandbox;
