@@ -45,6 +45,20 @@ pub struct ParsedSkill {
 /// You are a helpful assistant that...
 /// ```
 pub fn parse_skill_md(content: &str) -> Result<ParsedSkill, SkillParseError> {
+    parse_skill_md_impl(content, true)
+}
+
+/// Parse a SKILL.md file without validating the `name` field.
+///
+/// Used by install paths that need to recover from invalid published names by
+/// rewriting them to a safe internal identifier before persisting to disk.
+pub(crate) fn parse_skill_md_without_name_validation(
+    content: &str,
+) -> Result<ParsedSkill, SkillParseError> {
+    parse_skill_md_impl(content, false)
+}
+
+fn parse_skill_md_impl(content: &str, validate_name: bool) -> Result<ParsedSkill, SkillParseError> {
     // Normalize line endings before parsing to handle CRLF (callers may not
     // have pre-normalized). This also makes `find_closing_delimiter`'s byte
     // offset arithmetic correct since it assumes single-byte `\n` separators.
@@ -78,7 +92,7 @@ pub fn parse_skill_md(content: &str) -> Result<ParsedSkill, SkillParseError> {
         serde_yml::from_str(yaml_str).map_err(|e| SkillParseError::InvalidYaml(e.to_string()))?;
 
     // Validate skill name
-    if !validate_skill_name(&manifest.name) {
+    if validate_name && !validate_skill_name(&manifest.name) {
         return Err(SkillParseError::InvalidName {
             name: manifest.name.clone(),
         });

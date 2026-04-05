@@ -19,11 +19,11 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::gating;
-use crate::parser::{SkillParseError, parse_skill_md};
+use crate::parser::{SkillParseError, parse_skill_md, parse_skill_md_without_name_validation};
 use crate::types::{
-    GatingRequirements, LoadedSkill, MAX_PROMPT_FILE_SIZE, SkillSource, SkillTrust,
+    GatingRequirements, LoadedSkill, MAX_PROMPT_FILE_SIZE, SkillManifest, SkillSource, SkillTrust,
 };
-use crate::validation::normalize_line_endings;
+use crate::validation::{normalize_line_endings, normalize_skill_identifier};
 
 /// Maximum total number of skills that can be discovered across all sources.
 /// Shared across workspace, user, and installed directories.
@@ -35,6 +35,76 @@ const DEFAULT_MAX_SCAN_DEPTH: usize = 3;
 
 fn to_lowercase_vec(items: &[String]) -> Vec<String> {
     items.iter().map(|s| s.to_lowercase()).collect()
+}
+
+fn parse_error_for_install(error_label: &str, error: SkillParseError) -> SkillRegistryError {
+    let reason = error.to_string();
+    match error {
+        SkillParseError::InvalidName { name } => SkillRegistryError::ParseError { name, reason },
+        _ => SkillRegistryError::ParseError {
+            name: error_label.to_string(),
+            reason,
+        },
+    }
+}
+
+fn render_skill_md(
+    manifest: &SkillManifest,
+    prompt_content: &str,
+) -> Result<String, SkillRegistryError> {
+    let yaml = serde_yml::to_string(manifest).map_err(|e| SkillRegistryError::ParseError {
+        name: manifest.name.clone(),
+        reason: format!("Failed to rewrite normalized SKILL.md: {}", e),
+    })?;
+
+    let yaml = yaml.strip_prefix("---\n").unwrap_or(&yaml);
+    let yaml = yaml.strip_suffix("...\n").unwrap_or(yaml);
+    let yaml = yaml.strip_suffix("...").unwrap_or(yaml);
+
+    let mut rendered = String::from("---\n");
+    rendered.push_str(yaml);
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered.push_str("---\n\n");
+    rendered.push_str(prompt_content);
+    Ok(rendered)
+}
+
+fn normalize_install_content(
+    normalized_content: &str,
+    requested_identifier: Option<&str>,
+) -> Result<(String, String), SkillRegistryError> {
+    match parse_skill_md(normalized_content) {
+        Ok(parsed) => Ok((parsed.manifest.name, normalized_content.to_string())),
+        Err(SkillParseError::InvalidName { .. }) => {
+            let mut parsed = parse_skill_md_without_name_validation(normalized_content)
+                .map_err(|e| parse_error_for_install("(install)", e))?;
+            let original_name = parsed.manifest.name.clone();
+            let normalized_name = requested_identifier
+                .and_then(normalize_skill_identifier)
+                .or_else(|| normalize_skill_identifier(&original_name))
+                .ok_or_else(|| SkillRegistryError::ParseError {
+                    name: original_name.clone(),
+                    reason: format!(
+                        "Invalid skill name '{}' could not be normalized to a safe install name",
+                        original_name
+                    ),
+                })?;
+
+            tracing::warn!(
+                original_name = %original_name,
+                normalized_name = %normalized_name,
+                requested_identifier = requested_identifier.unwrap_or(""),
+                "Normalizing invalid skill name during install"
+            );
+
+            parsed.manifest.name = normalized_name.clone();
+            let rendered = render_skill_md(&parsed.manifest, &parsed.prompt_content)?;
+            Ok((normalized_name, rendered))
+        }
+        Err(e) => Err(parse_error_for_install("(install)", e)),
+    }
 }
 
 /// Error type for skill registry operations.
@@ -426,6 +496,18 @@ impl SkillRegistry {
         self.skills.iter().find(|s| s.manifest.name == name)
     }
 
+    /// Resolve the on-disk install content and final in-memory skill name.
+    ///
+    /// Install flows use this to recover from invalid published names (for
+    /// example, catalog display names containing spaces) without relaxing the
+    /// parser for ordinary local skill discovery.
+    pub fn resolve_install_content(
+        normalized_content: &str,
+        requested_identifier: Option<&str>,
+    ) -> Result<(String, String), SkillRegistryError> {
+        normalize_install_content(normalized_content, requested_identifier)
+    }
+
     /// Perform the disk I/O and loading for a skill install.
     ///
     /// This is a static method so it doesn't borrow `&self`, allowing callers
@@ -484,23 +566,15 @@ impl SkillRegistry {
     /// hold time.
     pub async fn install_skill(&mut self, content: &str) -> Result<String, SkillRegistryError> {
         let normalized = normalize_line_endings(content);
-        let parsed = parse_skill_md(&normalized).map_err(|e: SkillParseError| match e {
-            SkillParseError::InvalidName { ref name } => SkillRegistryError::ParseError {
-                name: name.clone(),
-                reason: e.to_string(),
-            },
-            _ => SkillRegistryError::ParseError {
-                name: "(install)".to_string(),
-                reason: e.to_string(),
-            },
-        })?;
-        let skill_name = parsed.manifest.name.clone();
+        let (skill_name, install_content) = normalize_install_content(&normalized, None)?;
         if self.has(&skill_name) {
-            return Err(SkillRegistryError::AlreadyExists { name: skill_name });
+            return Err(SkillRegistryError::AlreadyExists {
+                name: skill_name.clone(),
+            });
         }
         let user_dir = self.user_dir.clone();
         let (name, skill) =
-            Self::prepare_install_to_disk(&user_dir, &skill_name, &normalized).await?;
+            Self::prepare_install_to_disk(&user_dir, &skill_name, &install_content).await?;
         self.commit_install(&name, skill)?;
         Ok(name)
     }
@@ -976,6 +1050,59 @@ mod tests {
         // Verify file was written to disk
         let skill_path = dir.path().join("test-install").join("SKILL.md");
         assert!(skill_path.exists());
+    }
+
+    #[test]
+    fn test_resolve_install_content_prefers_requested_slug_for_invalid_name() {
+        let content = "---\nname: Mortgage Calculator\ndescription: Installed skill\n---\n\nInstalled prompt.\n";
+
+        let (name, rewritten) =
+            SkillRegistry::resolve_install_content(content, Some("finance/mortgage-calculator"))
+                .unwrap();
+
+        assert_eq!(name, "finance-mortgage-calculator");
+        assert!(rewritten.contains("name: finance-mortgage-calculator"));
+        assert!(rewritten.contains("Installed prompt."));
+    }
+
+    #[test]
+    fn test_resolve_install_content_slugifies_invalid_name_without_slug() {
+        let content = "---\nname: Mortgage Calculator\n---\n\nPrompt.\n";
+
+        let (name, rewritten) = SkillRegistry::resolve_install_content(content, None).unwrap();
+
+        assert_eq!(name, "mortgage-calculator");
+        assert!(rewritten.contains("name: mortgage-calculator"));
+    }
+
+    #[tokio::test]
+    async fn test_install_skill_normalizes_invalid_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+
+        let content = "---\nname: Mortgage Calculator\ndescription: Installed skill\n---\n\nInstalled prompt.\n";
+        let name = registry.install_skill(content).await.unwrap();
+
+        assert_eq!(name, "mortgage-calculator");
+        assert!(registry.has("mortgage-calculator"));
+
+        let skill_path = dir.path().join("mortgage-calculator").join("SKILL.md");
+        assert!(skill_path.exists());
+
+        let written = fs::read_to_string(skill_path).unwrap();
+        assert!(written.contains("name: mortgage-calculator"));
+    }
+
+    #[test]
+    fn test_resolve_install_content_preserves_owner_for_invalid_slug_name() {
+        let content = "---\nname: Mortgage Calculator\n---\n\nPrompt.\n";
+
+        let (name, rewritten) =
+            SkillRegistry::resolve_install_content(content, Some("alice/mortgage-calculator"))
+                .unwrap();
+
+        assert_eq!(name, "alice-mortgage-calculator");
+        assert!(rewritten.contains("name: alice-mortgage-calculator"));
     }
 
     #[tokio::test]
