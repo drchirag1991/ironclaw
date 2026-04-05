@@ -133,9 +133,17 @@ impl LlmConfig {
         }
 
         // Session config (used by NearAI provider for OAuth/session-token auth)
-        let nearai_auth_url = optional_env("NEARAI_AUTH_URL")?
+        let nearai_auth_url_explicit = optional_env("NEARAI_AUTH_URL")?;
+        let nearai_auth_url = nearai_auth_url_explicit
+            .clone()
             .unwrap_or_else(|| "https://private.near.ai".to_string());
-        validate_base_url(&nearai_auth_url, "NEARAI_AUTH_URL")?;
+        // Only validate NearAI URLs when NearAI is active or the user explicitly
+        // set the URL.  Default URLs point to private.near.ai which requires DNS
+        // resolution — this blocks startup in environments without network access
+        // (CI runners, containers) when a different backend is configured.
+        if is_nearai || nearai_auth_url_explicit.is_some() {
+            validate_base_url(&nearai_auth_url, "NEARAI_AUTH_URL")?;
+        }
         let session = SessionConfig {
             auth_base_url: nearai_auth_url,
             session_path: optional_env("NEARAI_SESSION_PATH")?
@@ -161,16 +169,19 @@ impl LlmConfig {
         } else {
             crate::llm::DEFAULT_MODEL.to_string()
         };
+        let nearai_base_url_explicit = optional_env("NEARAI_BASE_URL")?;
         let nearai_base_url = if let Some(url) = nearai_override.and_then(|o| o.base_url.clone()) {
             url
-        } else if let Some(url) = optional_env("NEARAI_BASE_URL")? {
+        } else if let Some(url) = nearai_base_url_explicit.clone() {
             url
         } else if nearai_api_key.is_some() {
             "https://cloud-api.near.ai".to_string()
         } else {
             "https://private.near.ai".to_string()
         };
-        validate_base_url(&nearai_base_url, "NEARAI_BASE_URL")?;
+        if is_nearai || nearai_base_url_explicit.is_some() || nearai_api_key.is_some() {
+            validate_base_url(&nearai_base_url, "NEARAI_BASE_URL")?;
+        }
         let nearai = NearAiConfig {
             model: nearai_model,
             cheap_model: optional_env("NEARAI_CHEAP_MODEL")?,
@@ -2190,5 +2201,35 @@ mod tests {
         unsafe {
             std::env::remove_var("NEARAI_MODEL");
         }
+    }
+
+    /// Regression: when a non-NearAI backend is active, `resolve()` must not
+    /// call `validate_base_url()` on the default NearAI URLs.  Before the fix,
+    /// the unconditional DNS resolution of `private.near.ai` caused startup to
+    /// hang (or fail) in environments without external DNS (CI runners,
+    /// containers).
+    #[test]
+    fn non_nearai_backend_skips_nearai_url_validation() {
+        let _guard = lock_env();
+        // SAFETY: Under ENV_MUTEX — clear any NearAI vars so defaults kick in.
+        unsafe {
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("NEARAI_AUTH_URL");
+            std::env::remove_var("NEARAI_BASE_URL");
+            std::env::remove_var("NEARAI_API_KEY");
+            std::env::remove_var("NEARAI_MODEL");
+        }
+
+        let settings = Settings {
+            llm_backend: Some("openai_compatible".to_string()),
+            openai_compatible_base_url: Some("http://localhost:11434/v1".to_string()),
+            selected_model: Some("test-model".to_string()),
+            ..Default::default()
+        };
+
+        // This must succeed without attempting DNS resolution on private.near.ai.
+        let cfg = LlmConfig::resolve(&settings)
+            .expect("resolve should succeed for non-NearAI backend without NearAI URL validation");
+        assert_eq!(cfg.backend, "openai_compatible");
     }
 }
