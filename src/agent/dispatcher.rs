@@ -1151,9 +1151,11 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         let capped = if truncated {
                             let boundary = output
                                 .char_indices()
-                                .take_while(|(i, _)| *i < MAX_TOOL_OUTPUT_BYTES)
-                                .last()
-                                .map(|(i, c)| i + c.len_utf8())
+                                .filter_map(|(i, c)| {
+                                    let end = i + c.len_utf8();
+                                    (end <= MAX_TOOL_OUTPUT_BYTES).then_some(end)
+                                })
+                                .next_back()
                                 .unwrap_or(0);
                             output[..boundary].to_string()
                         } else {

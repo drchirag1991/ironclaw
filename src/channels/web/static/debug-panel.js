@@ -115,7 +115,7 @@
     var closeBtn = document.createElement('button');
     closeBtn.className = 'debug-close-btn';
     closeBtn.textContent = '\u00D7';
-    closeBtn.title = 'Close';
+    closeBtn.title = t('common.close');
     closeBtn.addEventListener('click', closePanel);
     header.appendChild(title);
     header.appendChild(closeBtn);
@@ -257,7 +257,8 @@
       try {
         var data = JSON.parse(e.data);
         var id = addActivity('tool', data.name || 'tool', timeNow(), 'pending');
-        pendingTools[data.name] = { id: id, start: Date.now() };
+        if (!pendingTools[data.name]) pendingTools[data.name] = [];
+        pendingTools[data.name].push({ id: id, start: Date.now() });
         sessionStats.toolCalls++;
         updateStatsDisplay();
       } catch (_) { /* ignore */ }
@@ -267,7 +268,8 @@
     es.addEventListener('tool_completed', function (e) {
       try {
         var data = JSON.parse(e.data);
-        var pending = pendingTools[data.name];
+        var queue = pendingTools[data.name] || [];
+        var pending = queue[0]; // FIFO: oldest start matches oldest completion
         var duration = pending ? (Date.now() - pending.start) : null;
         var status = data.success ? 'success' : 'failure';
         var meta = duration ? formatDuration(duration) : '';
@@ -281,9 +283,12 @@
 
         if (pending) {
           updateActivity(pending.id, status, meta, extra);
-          // Keep in pendingTools so tool_result / tool_result_full can still find it.
-          // Clean up after a short delay to handle late-arriving events.
-          setTimeout(function () { delete pendingTools[data.name]; }, 5000);
+          // Keep entry briefly so tool_result / tool_result_full can still find it,
+          // then shift it off the front of the queue.
+          setTimeout(function () {
+            if (queue.length > 0) queue.shift();
+            if (queue.length === 0) delete pendingTools[data.name];
+          }, 5000);
         } else {
           addActivity('tool', data.name || 'tool', meta, status, null, extra);
         }
@@ -295,7 +300,7 @@
     es.addEventListener('tool_result', function (e) {
       try {
         var data = JSON.parse(e.data);
-        var pending = pendingTools[data.name];
+        var pending = (pendingTools[data.name] || [])[0];
         if (pending) {
           appendActivityOutput(pending.id, data.preview || '');
         }
@@ -371,7 +376,7 @@
     es.addEventListener('tool_result_full', function (e) {
       try {
         var data = JSON.parse(e.data);
-        var pending = pendingTools[data.name];
+        var pending = (pendingTools[data.name] || [])[0];
         if (pending) {
           appendActivityOutput(pending.id, data.output || '');
         }
@@ -514,7 +519,7 @@
       if (extra.params) {
         var pl = document.createElement('div');
         pl.className = 'debug-activity-section-label';
-        pl.textContent = 'Parameters';
+        pl.textContent = t('debug.activityParams');
         details.appendChild(pl);
         var pp = document.createElement('pre');
         pp.className = 'debug-activity-pre';
@@ -524,7 +529,7 @@
       if (extra.output) {
         var ol = document.createElement('div');
         ol.className = 'debug-activity-section-label';
-        ol.textContent = 'Output';
+        ol.textContent = t('debug.activityOutput');
         details.appendChild(ol);
         var op = document.createElement('pre');
         op.className = 'debug-activity-pre debug-activity-output-pre';

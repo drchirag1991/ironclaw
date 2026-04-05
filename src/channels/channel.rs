@@ -397,13 +397,17 @@ impl StatusUpdate {
     ) -> Self {
         let success = result.is_ok();
         let sensitive = tool.map(|t| t.sensitive_params()).unwrap_or(&[]);
-        let safe = crate::tools::redact_params(params, sensitive);
-        let params_str = serde_json::to_string_pretty(&safe).unwrap_or_else(|_| safe.to_string());
+        let parameters = if !success {
+            let safe = crate::tools::redact_params(params, sensitive);
+            Some(serde_json::to_string_pretty(&safe).unwrap_or_else(|_| safe.to_string()))
+        } else {
+            None
+        };
         Self::ToolCompleted {
             name,
             success,
             error: result.as_ref().err().map(|e| e.to_string()),
-            parameters: Some(params_str),
+            parameters,
         }
     }
 }
@@ -706,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_completed_includes_redacted_params_on_success() {
+    fn tool_completed_no_params_on_success() {
         let params = serde_json::json!({"name": "key", "value": "secret"});
         let ok: Result<String, crate::error::Error> = Ok("done".into());
 
@@ -721,8 +725,12 @@ mod tests {
         {
             assert!(success);
             assert!(error.is_none());
-            // Parameters are always included (redacted) for debug panel visibility.
-            assert!(parameters.is_some(), "params should always be included");
+            // Parameters are only included on failure; verbose clients see full
+            // output via the ToolResultFull event instead.
+            assert!(
+                parameters.is_none(),
+                "params should not be included on success"
+            );
         } else {
             panic!("expected ToolCompleted variant");
         }

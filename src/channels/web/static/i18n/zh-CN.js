@@ -695,4 +695,6 @@ I18n.register('zh-CN', {
   'debug.statsSseReconnects': '重连次数',
   'debug.statsSseEvents': '事件数',
   'debug.statsSseLastEvent': '上次事件',
+  'debug.activityParams': '参数',
+  'debug.activityOutput': '输出',
 });

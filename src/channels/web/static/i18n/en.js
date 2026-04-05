@@ -706,4 +706,6 @@ I18n.register('en', {
   'debug.statsSseReconnects': 'Reconnects',
   'debug.statsSseEvents': 'Events',
   'debug.statsSseLastEvent': 'Last event',
+  'debug.activityParams': 'Parameters',
+  'debug.activityOutput': 'Output',
 });

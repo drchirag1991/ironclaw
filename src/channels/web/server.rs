@@ -196,6 +196,7 @@ pub struct ActiveConfigSnapshot {
     pub llm_backend: String,
     pub llm_model: String,
     pub enabled_channels: Vec<String>,
+    pub default_timezone: String,
 }
 
 /// Per-user rate limiter that maintains a separate sliding window per user_id.
@@ -3347,9 +3348,16 @@ async fn debug_prompt_handler(
         }
     }
 
-    // Assemble full system prompt if workspace supports it.
+    // Assemble full system prompt if workspace supports it, using the configured
+    // default timezone rather than a fixed UTC value so this reconstruction more
+    // closely matches runtime prompt generation.
+    let prompt_tz = state
+        .active_config
+        .default_timezone
+        .parse::<chrono_tz::Tz>()
+        .unwrap_or(chrono_tz::UTC);
     let system_prompt = match workspace
-        .system_prompt_for_context_tz(false, chrono_tz::UTC)
+        .system_prompt_for_context_tz(false, prompt_tz)
         .await
     {
         Ok(prompt) if !prompt.is_empty() => Some(prompt),
@@ -3362,7 +3370,7 @@ async fn debug_prompt_handler(
         total_estimated_tokens: total,
         system_prompt,
         model: state.active_config.llm_model.clone(),
-        context_limit: 100_000,
+        context_limit: crate::agent::context_monitor::DEFAULT_CONTEXT_LIMIT,
         note: "reconstructed, may differ from last turn",
     }))
 }
