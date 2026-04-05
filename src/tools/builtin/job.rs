@@ -169,7 +169,9 @@ impl CreateJobTool {
         let mut desc =
             String::from("Execution mode. 'worker' (default) uses the IronClaw sub-agent.");
         if self.claude_code_enabled() {
-            desc.push_str(" 'claude_code' uses Claude Code CLI.");
+            desc.push_str(
+                " 'claude_code' uses Claude Code CLI — prefer this for complex software engineering tasks.",
+            );
         }
         if self.acp_enabled() {
             desc.push_str(" 'acp' uses an ACP-compliant agent (Goose, Codex, Gemini CLI).");
@@ -845,8 +847,7 @@ impl Tool for CreateJobTool {
              sub-agent that has shell, file read/write, list_dir, and apply_patch tools. Use this \
              whenever the user asks you to build, create, or work on something. The task \
              description should be detailed enough for the sub-agent to work independently. \
-             Set wait=false to start immediately while continuing the conversation. Set mode \
-             to 'claude_code' for complex software engineering tasks."
+             Set wait=false to start immediately while continuing the conversation."
         } else {
             "Create a new job or task for the agent to work on. Use this when the user wants \
              you to do something substantial that should be tracked as a separate job."
@@ -2558,6 +2559,16 @@ mod tests {
         assert!(
             err.contains("acp mode is not enabled"),
             "expected acp disabled error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_description_omits_mode_guidance() {
+        let tool = sandbox_tool(false, false);
+        let desc = tool.description();
+        assert!(
+            !desc.contains("claude_code"),
+            "description should not mention claude_code when mode is disabled, got: {desc}"
         );
     }
 }

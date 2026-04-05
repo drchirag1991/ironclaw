@@ -274,6 +274,15 @@ impl ContainerJobManager {
         self.config.acp_enabled
     }
 
+    /// Whether the given job mode is allowed by the current configuration.
+    pub fn is_mode_enabled(&self, mode: JobMode) -> bool {
+        match mode {
+            JobMode::Worker => true,
+            JobMode::ClaudeCode => self.config.claude_code_enabled,
+            JobMode::Acp => self.config.acp_enabled,
+        }
+    }
+
     fn extend_acp_env(
         &self,
         env_vec: &mut Vec<String>,
@@ -1022,23 +1031,18 @@ mod tests {
     }
 
     #[test]
-    fn test_container_job_manager_claude_code_enabled_accessor() {
-        let config = ContainerJobConfig {
-            claude_code_enabled: true,
-            ..Default::default()
-        };
-        let manager = ContainerJobManager::new(config, TokenStore::new());
-        assert!(manager.claude_code_enabled());
-    }
-
-    #[test]
-    fn test_container_job_manager_acp_enabled_accessor() {
-        let config = ContainerJobConfig {
-            acp_enabled: true,
-            ..Default::default()
-        };
-        let manager = ContainerJobManager::new(config, TokenStore::new());
-        assert!(manager.acp_enabled());
+    fn test_is_mode_enabled_matches_individual_accessors() {
+        let manager = ContainerJobManager::new(
+            ContainerJobConfig {
+                claude_code_enabled: true,
+                acp_enabled: false,
+                ..Default::default()
+            },
+            TokenStore::new(),
+        );
+        assert!(manager.is_mode_enabled(JobMode::Worker));
+        assert!(manager.is_mode_enabled(JobMode::ClaudeCode));
+        assert!(!manager.is_mode_enabled(JobMode::Acp));
     }
 
     #[test]
