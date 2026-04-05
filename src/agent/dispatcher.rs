@@ -1127,18 +1127,26 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                             .await;
                     }
 
-                    // Check for auth awaiting
-                    if deferred_auth.is_none()
-                        && let Some((ext_name, instructions)) =
-                            check_auth_required(&tc.name, &tool_result)
+                    // Surface auth prompts immediately so the UI can show
+                    // OAuth links on the first attempt. Only awaiting_token
+                    // flows enter thread auth mode.
+                    if let Some(auth_data) = extract_auth_prompt(&tc.name, &tool_result)
+                        && let Some(ext_name) = auth_data.extension_name.clone()
                     {
-                        let auth_data = parse_auth_result(&tool_result);
-                        {
-                            let mut sess = self.session.lock().await;
-                            if let Some(thread) = sess.threads.get_mut(&self.thread_id) {
-                                thread.enter_auth_mode(ext_name.clone());
+                        if deferred_auth.is_none() && auth_data.awaiting_token {
+                            let instructions =
+                                auth_data.instructions.clone().unwrap_or_else(|| {
+                                    "Please provide your API token/key.".to_string()
+                                });
+                            {
+                                let mut sess = self.session.lock().await;
+                                if let Some(thread) = sess.threads.get_mut(&self.thread_id) {
+                                    thread.enter_auth_mode(ext_name.clone());
+                                }
                             }
+                            deferred_auth = Some(instructions);
                         }
+
                         let _ = self
                             .agent
                             .channels
@@ -1146,14 +1154,13 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                                 &self.message.channel,
                                 StatusUpdate::AuthRequired {
                                     extension_name: ext_name,
-                                    instructions: Some(instructions.clone()),
-                                    auth_url: auth_data.auth_url,
-                                    setup_url: auth_data.setup_url,
+                                    instructions: auth_data.instructions.clone(),
+                                    auth_url: auth_data.auth_url.clone(),
+                                    setup_url: auth_data.setup_url.clone(),
                                 },
                                 &self.message.metadata,
                             )
                             .await;
-                        deferred_auth = Some(instructions);
                     }
 
                     // Stash full output so subsequent tools can reference it
@@ -1247,17 +1254,30 @@ pub(super) async fn execute_chat_tool_standalone(
 
 /// Parsed auth result fields for emitting StatusUpdate::AuthRequired.
 pub(super) struct ParsedAuthData {
+    pub(super) extension_name: Option<String>,
+    pub(super) instructions: Option<String>,
     pub(super) auth_url: Option<String>,
     pub(super) setup_url: Option<String>,
+    pub(super) awaiting_token: bool,
 }
 
-/// Extract auth_url and setup_url from a tool_auth result JSON string.
+/// Extract auth prompt fields from a tool_auth/tool_activate result JSON string.
 pub(super) fn parse_auth_result(result: &Result<String, Error>) -> ParsedAuthData {
     let parsed = result
         .as_ref()
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
     ParsedAuthData {
+        extension_name: parsed
+            .as_ref()
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        instructions: parsed
+            .as_ref()
+            .and_then(|v| v.get("instructions"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         auth_url: parsed
             .as_ref()
             .and_then(|v| v.get("auth_url"))
@@ -1268,6 +1288,32 @@ pub(super) fn parse_auth_result(result: &Result<String, Error>) -> ParsedAuthDat
             .and_then(|v| v.get("setup_url"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        awaiting_token: parsed
+            .as_ref()
+            .and_then(|v| v.get("awaiting_token"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
+}
+
+/// Extract actionable auth prompt data from a tool_auth/tool_activate result.
+pub(super) fn extract_auth_prompt(
+    tool_name: &str,
+    result: &Result<String, Error>,
+) -> Option<ParsedAuthData> {
+    if tool_name != "tool_auth" && tool_name != "tool_activate" {
+        return None;
+    }
+
+    let auth_data = parse_auth_result(result);
+    if auth_data.extension_name.is_none() {
+        return None;
+    }
+
+    if auth_data.awaiting_token || auth_data.auth_url.is_some() || auth_data.setup_url.is_some() {
+        Some(auth_data)
+    } else {
+        None
     }
 }
 
@@ -1279,20 +1325,14 @@ pub(super) fn check_auth_required(
     tool_name: &str,
     result: &Result<String, Error>,
 ) -> Option<(String, String)> {
-    if tool_name != "tool_auth" && tool_name != "tool_activate" {
+    let auth_data = extract_auth_prompt(tool_name, result)?;
+    if !auth_data.awaiting_token {
         return None;
     }
-    let output = result.as_ref().ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(output).ok()?;
-    if parsed.get("awaiting_token") != Some(&serde_json::Value::Bool(true)) {
-        return None;
-    }
-    let name = parsed.get("name")?.as_str()?.to_string();
-    let instructions = parsed
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Please provide your API token/key.")
-        .to_string();
+    let name = auth_data.extension_name?;
+    let instructions = auth_data
+        .instructions
+        .unwrap_or_else(|| "Please provide your API token/key.".to_string());
     Some((name, instructions))
 }
 
@@ -1506,7 +1546,7 @@ mod tests {
     use crate::tools::ToolRegistry;
     use ironclaw_safety::SafetyLayer;
 
-    use super::{check_auth_required, selected_model_override};
+    use super::{check_auth_required, extract_auth_prompt, selected_model_override};
 
     /// Minimal LLM provider for unit tests that always returns a static response.
     struct StaticLlmProvider;
@@ -1905,6 +1945,26 @@ mod tests {
         .to_string());
 
         assert!(check_auth_required("tool_auth", &result).is_none());
+    }
+
+    #[test]
+    fn test_extract_auth_prompt_detects_oauth_link_without_awaiting_token() {
+        let result: Result<String, Error> = Ok(serde_json::json!({
+            "name": "gmail",
+            "kind": "WasmTool",
+            "status": "awaiting_authorization",
+            "auth_url": "https://accounts.google.com/o/oauth2/v2/auth?client_id=test"
+        })
+        .to_string());
+
+        let auth_data = extract_auth_prompt("tool_activate", &result).expect("auth prompt");
+        assert_eq!(auth_data.extension_name.as_deref(), Some("gmail"));
+        assert_eq!(
+            auth_data.auth_url.as_deref(),
+            Some("https://accounts.google.com/o/oauth2/v2/auth?client_id=test")
+        );
+        assert!(!auth_data.awaiting_token);
+        assert!(check_auth_required("tool_activate", &result).is_none());
     }
 
     #[test]

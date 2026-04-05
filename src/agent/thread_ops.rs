@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::agent::Agent;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::dispatcher::{
-    AgenticLoopResult, TurnUsageSummary, check_auth_required, execute_chat_tool_standalone,
+    AgenticLoopResult, TurnUsageSummary, execute_chat_tool_standalone, extract_auth_prompt,
     parse_auth_result,
 };
 use crate::agent::session::{MAX_PENDING_MESSAGES, PendingApproval, Session, ThreadState};
@@ -1227,21 +1227,36 @@ impl Agent {
                 }
             }
 
-            // If tool_auth returned awaiting_token, enter auth mode and
-            // return instructions directly (skip agentic loop continuation).
-            if let Some((ext_name, instructions)) =
-                check_auth_required(&pending.tool_name, &tool_result)
+            // Surface OAuth auth prompts immediately; only awaiting_token
+            // flows enter auth mode and short-circuit the turn.
+            if let Some(auth_data) = extract_auth_prompt(&pending.tool_name, &tool_result)
+                && let Some(ext_name) = auth_data.extension_name.clone()
             {
-                self.handle_auth_intercept(
-                    &session,
-                    thread_id,
+                if auth_data.awaiting_token {
+                    let instructions = auth_data
+                        .instructions
+                        .clone()
+                        .unwrap_or_else(|| "Please provide your API token/key.".to_string());
+                    self.handle_auth_intercept(
+                        &session,
+                        thread_id,
+                        message,
+                        &tool_result,
+                        ext_name,
+                        instructions.clone(),
+                    )
+                    .await;
+                    return Ok(SubmissionResult::response(instructions));
+                }
+
+                self.emit_auth_prompt(
                     message,
-                    &tool_result,
                     ext_name,
-                    instructions.clone(),
+                    auth_data.instructions.clone(),
+                    auth_data.auth_url.clone(),
+                    auth_data.setup_url.clone(),
                 )
                 .await;
-                return Ok(SubmissionResult::response(instructions));
             }
 
             context_messages.push(ChatMessage::tool_result(
@@ -1484,21 +1499,36 @@ impl Agent {
                     }
                 }
 
-                // Auth detection — defer return until all results are recorded
-                if deferred_auth.is_none()
-                    && let Some((ext_name, instructions)) =
-                        check_auth_required(&tc.name, &deferred_result)
+                // Auth detection — surface OAuth prompts immediately, but only
+                // awaiting_token flows interrupt the turn.
+                if let Some(auth_data) = extract_auth_prompt(&tc.name, &deferred_result)
+                    && let Some(ext_name) = auth_data.extension_name.clone()
                 {
-                    self.handle_auth_intercept(
-                        &session,
-                        thread_id,
-                        message,
-                        &deferred_result,
-                        ext_name,
-                        instructions.clone(),
-                    )
-                    .await;
-                    deferred_auth = Some(instructions);
+                    if deferred_auth.is_none() && auth_data.awaiting_token {
+                        let instructions = auth_data
+                            .instructions
+                            .clone()
+                            .unwrap_or_else(|| "Please provide your API token/key.".to_string());
+                        self.handle_auth_intercept(
+                            &session,
+                            thread_id,
+                            message,
+                            &deferred_result,
+                            ext_name,
+                            instructions.clone(),
+                        )
+                        .await;
+                        deferred_auth = Some(instructions);
+                    } else {
+                        self.emit_auth_prompt(
+                            message,
+                            ext_name,
+                            auth_data.instructions.clone(),
+                            auth_data.auth_url.clone(),
+                            auth_data.setup_url.clone(),
+                        )
+                        .await;
+                    }
                 }
 
                 context_messages.push(ChatMessage::tool_result(&tc.id, &tc.name, deferred_content));
@@ -1752,6 +1782,29 @@ impl Agent {
                     instructions: Some(instructions.clone()),
                     auth_url: auth_data.auth_url,
                     setup_url: auth_data.setup_url,
+                },
+                &message.metadata,
+            )
+            .await;
+    }
+
+    async fn emit_auth_prompt(
+        &self,
+        message: &IncomingMessage,
+        extension_name: String,
+        instructions: Option<String>,
+        auth_url: Option<String>,
+        setup_url: Option<String>,
+    ) {
+        let _ = self
+            .channels
+            .send_status(
+                &message.channel,
+                StatusUpdate::AuthRequired {
+                    extension_name,
+                    instructions,
+                    auth_url,
+                    setup_url,
                 },
                 &message.metadata,
             )
