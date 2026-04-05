@@ -356,12 +356,12 @@ impl Tool for WriteFileTool {
         // Staleness check for existing files — log a warning but don't hard-fail.
         // write_file replaces the entire file content, so the risk of overwriting
         // unseen content is lower than apply_patch (which does substring replacement).
-        if path.exists()
+        // Use async metadata instead of blocking path.exists().
+        if let Ok(existing_meta) = fs::metadata(&path).await
             && let Some(ref read_state) = self.read_state
         {
-            let current_mtime = fs::metadata(&path)
-                .await
-                .and_then(|m| m.modified())
+            let current_mtime = existing_meta
+                .modified()
                 .unwrap_or(std::time::UNIX_EPOCH);
             let state = read_state.read().await;
             if let Err(e) = state.check_before_edit(ctx.job_id, &path, current_mtime) {
