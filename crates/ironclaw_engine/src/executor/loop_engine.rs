@@ -618,7 +618,7 @@ mod tests {
         assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Done!"));
         assert_eq!(exec.thread.step_count, 2);
         // Should have: system(nudge not counted), assistant+actions, action_result, assistant
-        assert!(exec.thread.messages.len() >= 3);
+        assert!(exec.thread.internal_messages.len() >= 3);
     }
 
     #[tokio::test]
@@ -738,7 +738,7 @@ mod tests {
         // Should have nudge system message
         assert!(
             exec.thread
-                .messages
+                .internal_messages
                 .iter()
                 .any(|m| m.content.contains("did not include any tool calls"))
         );
@@ -876,7 +876,7 @@ mod tests {
         // The output metadata from first step should be in messages
         assert!(
             exec.thread
-                .messages
+                .internal_messages
                 .iter()
                 .any(|m| m.content.contains("x = 30"))
         );
