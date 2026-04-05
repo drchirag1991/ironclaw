@@ -1166,11 +1166,44 @@ pub async fn is_authenticated(
     secrets: &Arc<dyn SecretsStore + Send + Sync>,
     user_id: &str,
 ) -> bool {
-    // Check if we have a stored token (from either pre-configured OAuth or DCR)
-    secrets
-        .exists(user_id, &server_config.token_secret_name())
+    match secrets
+        .get_decrypted(user_id, &server_config.token_secret_name())
         .await
-        .unwrap_or(false)
+    {
+        Ok(_) => true,
+        Err(crate::secrets::SecretError::NotFound(_)) => false,
+        Err(crate::secrets::SecretError::Expired) => {
+            tracing::info!(
+                server = %server_config.name,
+                "Access token expired, attempting refresh"
+            );
+            match refresh_access_token(server_config, secrets, user_id).await {
+                Ok(_) => {
+                    tracing::info!(
+                        server = %server_config.name,
+                        "Access token refreshed successfully"
+                    );
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        server = %server_config.name,
+                        "Token refresh failed: {}",
+                        error
+                    );
+                    false
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                server = %server_config.name,
+                "Failed to read access token: {}",
+                error
+            );
+            false
+        }
+    }
 }
 
 /// Refresh an access token using the refresh token.

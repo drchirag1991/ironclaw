@@ -17,6 +17,7 @@ use wasmtime::component::Linker;
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 use crate::context::JobContext;
+use crate::db::Database;
 use crate::llm::recording::{HttpExchangeRequest, HttpExchangeResponse, HttpInterceptor};
 use crate::secrets::{DecryptedSecret, SecretsStore};
 use crate::tools::tool::{Tool, ToolDiscoverySummary, ToolError, ToolOutput};
@@ -593,6 +594,8 @@ pub struct WasmToolWrapper {
     /// Secrets store for resolving host-based credential injection.
     /// Used in execute() to pre-decrypt secrets before WASM runs.
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    /// Database for role-aware legacy default-scope credential fallback.
+    db: Option<Arc<dyn Database>>,
     /// OAuth refresh configuration for auto-refreshing expired tokens.
     oauth_refresh: Option<OAuthRefreshConfig>,
     /// Optional HTTP interceptor for testing — returns canned responses
@@ -844,6 +847,7 @@ impl WasmToolWrapper {
             capabilities,
             credentials: HashMap::new(),
             secrets_store: None,
+            db: None,
             oauth_refresh: None,
             http_interceptor: None,
         }
@@ -904,6 +908,12 @@ impl WasmToolWrapper {
     /// on the target host (e.g., Bearer token for www.googleapis.com).
     pub fn with_secrets_store(mut self, store: Arc<dyn SecretsStore + Send + Sync>) -> Self {
         self.secrets_store = Some(store);
+        self
+    }
+
+    /// Set the database for role-aware legacy default-scope fallback.
+    pub fn with_database(mut self, db: Arc<dyn Database>) -> Self {
+        self.db = Some(db);
         self
     }
 
@@ -1153,6 +1163,7 @@ impl Tool for WasmToolWrapper {
             &self.capabilities,
             self.secrets_store.as_deref(),
             credential_user_id,
+            self.db.as_deref(),
             self.oauth_refresh.as_ref(),
         )
         .await;
@@ -1180,6 +1191,7 @@ impl Tool for WasmToolWrapper {
                 discovery_summary,
                 credentials,
                 secrets_store: None, // Not needed in blocking task
+                db: None,
                 oauth_refresh: None, // Already used above for pre-refresh
                 http_interceptor: self.http_interceptor.clone(),
             };
@@ -1475,6 +1487,7 @@ async fn resolve_host_credentials(
     capabilities: &Capabilities,
     store: Option<&(dyn SecretsStore + Send + Sync)>,
     user_id: &str,
+    db: Option<&dyn Database>,
     oauth_refresh: Option<&OAuthRefreshConfig>,
 ) -> Vec<ResolvedHostCredential> {
     let store = match store {
@@ -1530,6 +1543,7 @@ async fn resolve_host_credentials(
         return Vec::new();
     }
 
+    let can_fallback_to_default = can_use_default_credential_fallback(db, user_id).await;
     let mut resolved = Vec::new();
 
     for mapping in http_cap.credentials.values() {
@@ -1541,9 +1555,9 @@ async fn resolve_host_credentials(
             continue;
         }
 
-        // Try to get credential under the provided user_id first.
-        // If not found and user_id != "default", fallback to "default" (global credentials).
-        // This handles OAuth tokens stored globally under "default" but accessed from routine contexts.
+        // Try the tenant scope first. Legacy fallback to "default" is only
+        // permitted for admin users so member accounts cannot silently consume
+        // shared/global credentials in multi-tenant deployments.
         let secret = match store.get_decrypted(user_id, &mapping.secret_name).await {
             Ok(s) => Some(s),
             Err(e) => {
@@ -1554,13 +1568,12 @@ async fn resolve_host_credentials(
                     "No matching host credential resolved for WASM tool in the requested scope"
                 );
 
-                // If lookup fails and we're not already looking up "default", try "default" as fallback
-                if user_id != "default" {
+                if can_fallback_to_default {
                     tracing::debug!(
                         secret_name = %mapping.secret_name,
                         user_id = %user_id,
                         error = %e,
-                        "Credential not found for user, trying default global credentials"
+                        "Credential not found for user, trying admin-only default global credentials"
                     );
                     store
                         .get_decrypted("default", &mapping.secret_name)
@@ -1607,6 +1620,29 @@ async fn resolve_host_credentials(
     }
 
     resolved
+}
+
+async fn can_use_default_credential_fallback(db: Option<&dyn Database>, user_id: &str) -> bool {
+    if user_id == "default" {
+        return false;
+    }
+
+    let Some(db) = db else {
+        return false;
+    };
+
+    match db.get_user(user_id).await {
+        Ok(Some(user)) => user.role == "admin",
+        Ok(None) => false,
+        Err(e) => {
+            tracing::debug!(
+                user_id = %user_id,
+                error = %e,
+                "Failed to resolve user role for default credential fallback"
+            );
+            false
+        }
+    }
 }
 
 /// Extract the hostname from a URL string.
@@ -1821,6 +1857,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::context::JobContext;
+    #[cfg(feature = "libsql")]
+    use crate::db::{Database, UserRecord, UserStore};
     use crate::secrets::{
         CreateSecretParams, DecryptedSecret, InMemorySecretsStore, Secret, SecretError, SecretRef,
         SecretsStore,
@@ -1905,6 +1943,33 @@ mod tests {
                 .is_accessible(user_id, secret_name, allowed_secrets)
                 .await
         }
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn test_user_db(user_id: &str, role: &str) -> Arc<dyn Database> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("admin_fallback_test.db");
+        let db = crate::db::libsql::LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("local libsql db");
+        db.run_migrations().await.expect("run migrations");
+        db.create_user(&UserRecord {
+            id: user_id.to_string(),
+            email: None,
+            display_name: user_id.to_string(),
+            status: "active".to_string(),
+            role: role.to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_login_at: None,
+            created_by: None,
+            metadata: serde_json::Value::Null,
+        })
+        .await
+        .expect("create user");
+        std::mem::forget(dir);
+        let db: Arc<dyn Database> = Arc::new(db);
+        db
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2387,7 +2452,7 @@ mod tests {
         use crate::tools::wasm::wrapper::resolve_host_credentials;
 
         let caps = Capabilities::default();
-        let result = resolve_host_credentials(&caps, None, "user1", None).await;
+        let result = resolve_host_credentials(&caps, None, "user1", None, None).await;
         assert!(result.is_empty());
     }
 
@@ -2398,7 +2463,7 @@ mod tests {
         let store = test_secrets_store();
 
         let caps = Capabilities::default();
-        let result = resolve_host_credentials(&caps, Some(&store), "user1", None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "user1", None, None).await;
         assert!(result.is_empty());
     }
 
@@ -2438,7 +2503,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_host_credentials(&caps, Some(&store), "user1", None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "user1", None, None).await;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].host_patterns, vec!["www.googleapis.com"]);
         assert_eq!(
@@ -2484,7 +2549,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_host_credentials(&caps, Some(&store), &ctx.user_id, None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), &ctx.user_id, None, None).await;
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].headers.get("Authorization"),
@@ -2568,7 +2633,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_host_credentials(&caps, Some(&store), "user1", None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "user1", None, None).await;
         assert!(result.is_empty());
     }
 
@@ -2623,7 +2688,7 @@ mod tests {
 
         // Should resolve the existing fresh token without attempting refresh
         let result =
-            resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config)).await;
+            resolve_host_credentials(&caps, Some(&store), "user1", None, Some(&oauth_config)).await;
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].headers.get("Authorization"),
@@ -2670,7 +2735,7 @@ mod tests {
         };
 
         // No OAuth config, expired token can't be resolved (get_decrypted returns Expired)
-        let result = resolve_host_credentials(&caps, Some(&store), "user1", None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "user1", None, None).await;
         assert!(result.is_empty());
     }
 
@@ -2723,7 +2788,7 @@ mod tests {
 
         // Should use the legacy token directly without attempting refresh
         let result =
-            resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config)).await;
+            resolve_host_credentials(&caps, Some(&store), "user1", None, Some(&oauth_config)).await;
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].headers.get("Authorization"),
@@ -2788,7 +2853,7 @@ mod tests {
         };
 
         let resolved =
-            resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config)).await;
+            resolve_host_credentials(&caps, Some(&store), "user1", None, Some(&oauth_config)).await;
         assert_eq!(resolved.len(), 1);
         assert_eq!(
             resolved[0].headers.get("Authorization"),
@@ -2897,7 +2962,7 @@ mod tests {
         };
 
         let resolved =
-            resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config)).await;
+            resolve_host_credentials(&caps, Some(&store), "user1", None, Some(&oauth_config)).await;
         assert!(resolved.is_empty());
 
         let lookups = store.decrypted_lookups();
@@ -2964,7 +3029,7 @@ mod tests {
         };
 
         let resolved =
-            resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config)).await;
+            resolve_host_credentials(&caps, Some(&store), "user1", None, Some(&oauth_config)).await;
         assert!(resolved.is_empty());
 
         let lookups = store.decrypted_lookups();
@@ -3168,13 +3233,15 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn test_resolve_host_credentials_fallback_to_default_user() {
+    async fn test_resolve_host_credentials_fallback_to_default_for_admin_user() {
         use crate::secrets::{CredentialLocation, CredentialMapping, SecretsStore};
         use crate::tools::wasm::capabilities::HttpCapability;
         use crate::tools::wasm::wrapper::resolve_host_credentials;
 
         let store = test_secrets_store();
+        let db = test_user_db("routine_user_123", "admin").await;
 
         // Store a token under the "default" global user
         store
@@ -3209,10 +3276,50 @@ mod tests {
 
         // Resolve credentials for a different user (routine context)
         // Should fallback to "default" and find the token
-        let result = resolve_host_credentials(&caps, Some(&store), "routine_user_123", None).await;
+        let result = resolve_host_credentials(
+            &caps,
+            Some(&store),
+            "routine_user_123",
+            Some(db.as_ref()),
+            None,
+        )
+        .await;
 
         assert!(!result.is_empty(), "fallback to default"); // safety: test code only
         assert_eq!(result[0].secret_value, "global_token_value"); // safety: test code only
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_resolve_host_credentials_denies_default_fallback_for_member_user() {
+        use crate::secrets::SecretsStore;
+        use crate::tools::wasm::wrapper::resolve_host_credentials;
+
+        let store = test_secrets_store();
+        let db = test_user_db("member_user_123", "member").await;
+
+        store
+            .create(
+                "default",
+                crate::secrets::CreateSecretParams::new("google_oauth_token", "global_token"),
+            )
+            .await
+            .expect("Failed to store global token");
+
+        let caps = test_capabilities_with_google_oauth();
+        let result = resolve_host_credentials(
+            &caps,
+            Some(&store),
+            "member_user_123",
+            Some(db.as_ref()),
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_empty(),
+            "member users must not fallback to default"
+        );
     }
 
     fn test_capabilities_with_google_oauth() -> Capabilities {
@@ -3274,7 +3381,7 @@ mod tests {
 
         // Resolve credentials for user_123
         // Should prefer user_123's token over default
-        let result = resolve_host_credentials(&caps, Some(&store), "user_123", None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "user_123", None, None).await;
 
         assert!(!result.is_empty(), "has user credentials"); // safety: test code only
         assert_eq!(result[0].secret_value, "user_specific_token", "user token"); // safety: test code only
@@ -3301,7 +3408,7 @@ mod tests {
 
         // Resolve credentials for "default" user
         // Should NOT attempt fallback (already looking up default)
-        let result = resolve_host_credentials(&caps, Some(&store), "default", None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "default", None, None).await;
 
         assert!(!result.is_empty(), "Should find default token"); // safety: test code only
         assert_eq!(result[0].secret_value, "default_token"); // safety: test code only
@@ -3319,7 +3426,7 @@ mod tests {
         let caps = test_capabilities_with_google_oauth();
 
         // Resolve credentials when neither user nor default has the token
-        let result = resolve_host_credentials(&caps, Some(&store), "user_456", None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "user_456", None, None).await;
 
         // Should return empty since credential can't be found anywhere
         assert!(result.is_empty(), "no credentials found"); // safety: test code only

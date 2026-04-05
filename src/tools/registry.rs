@@ -89,6 +89,8 @@ pub struct ToolRegistry {
     credential_registry: Option<Arc<SharedCredentialRegistry>>,
     /// Secrets store for credential injection (shared with HTTP tool).
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    /// Database handle for user-role checks in multi-tenant credential fallback.
+    db: Option<Arc<dyn Database>>,
     /// Shared rate limiter for built-in tool invocations.
     rate_limiter: RateLimiter,
     /// Reference to the message tool for setting context per-turn.
@@ -112,6 +114,7 @@ impl ToolRegistry {
             builtin_names: RwLock::new(std::collections::HashSet::new()),
             credential_registry: None,
             secrets_store: None,
+            db: None,
             rate_limiter: RateLimiter::new(),
             message_tool: RwLock::new(None),
         }
@@ -125,6 +128,12 @@ impl ToolRegistry {
     ) -> Self {
         self.credential_registry = Some(credential_registry);
         self.secrets_store = Some(secrets_store);
+        self
+    }
+
+    /// Attach a database handle for user-role aware tool behavior.
+    pub fn with_database(mut self, db: Arc<dyn Database>) -> Self {
+        self.db = Some(db);
         self
     }
 
@@ -729,6 +738,9 @@ impl ToolRegistry {
         if let Some(store) = reg.secrets_store {
             wrapper = wrapper.with_secrets_store(store);
         }
+        if let Some(db) = reg.db {
+            wrapper = wrapper.with_database(db);
+        }
         if let Some(oauth) = reg.oauth_refresh {
             wrapper = wrapper.with_oauth_refresh(oauth);
         }
@@ -802,6 +814,7 @@ impl ToolRegistry {
             schema: Some(tool_with_binary.tool.parameters_schema.clone()),
             discovery_summary: None,
             secrets_store: self.secrets_store.clone(),
+            db: self.db.clone(),
             oauth_refresh: None,
         })
         .await
@@ -848,6 +861,8 @@ pub struct WasmToolRegistration<'a> {
     pub discovery_summary: Option<ToolDiscoverySummary>,
     /// Secrets store for credential injection at request time.
     pub secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    /// Database for user-role aware fallback decisions.
+    pub db: Option<Arc<dyn Database>>,
     /// OAuth refresh configuration for auto-refreshing expired tokens.
     pub oauth_refresh: Option<OAuthRefreshConfig>,
 }

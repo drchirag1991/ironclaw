@@ -1119,9 +1119,12 @@ impl WasmChannel {
             );
             let queue_path = websocket_queue_path(&channel_name);
             let processing_queue_path = websocket_processing_queue_path(&channel_name);
-            let identify_payload =
-                resolve_websocket_identify_message(&config, websocket_secrets_store.as_deref())
-                    .await;
+            let identify_payload = resolve_websocket_identify_message(
+                &config,
+                &owner_scope_id,
+                websocket_secrets_store.as_deref(),
+            )
+            .await;
             let mut session_state = WebsocketSessionState::new(identify_payload.as_deref());
 
             'reconnect: loop {
@@ -3071,12 +3074,16 @@ fn websocket_processing_queue_path(channel_name: &str) -> String {
 
 async fn resolve_websocket_identify_message(
     config: &WebsocketRuntimeConfig,
+    owner_scope_id: &str,
     store: Option<&(dyn SecretsStore + Send + Sync)>,
 ) -> Option<String> {
     let identify = config.identify.clone()?;
     let secret_name = config.identify_secret_name.as_ref()?;
     let store = store?;
-    let secret = store.get_decrypted("default", secret_name).await.ok()?;
+    let secret = store
+        .get_decrypted(owner_scope_id, secret_name)
+        .await
+        .ok()?;
     build_websocket_identify_message(&identify, secret.expose())
 }
 
@@ -4100,6 +4107,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use secrecy::SecretString;
+
     use crate::channels::Channel;
     use crate::channels::OutgoingResponse;
     use crate::channels::wasm::capabilities::ChannelCapabilities;
@@ -4112,11 +4121,13 @@ mod tests {
         build_discord_gateway_presence_update, build_websocket_identify_message,
         build_websocket_resume_message, discord_gateway_presence_status, drain_guest_logs,
         parse_websocket_invalid_session, parse_websocket_ready_session,
-        should_warn_on_heartbeat_interval, uses_owner_broadcast_target,
-        websocket_heartbeat_sleep_duration, websocket_reconnect_backoff,
+        resolve_websocket_identify_message, should_warn_on_heartbeat_interval,
+        uses_owner_broadcast_target, websocket_heartbeat_sleep_duration,
+        websocket_reconnect_backoff,
     };
     use crate::pairing::PairingStore;
-    use crate::testing::credentials::TEST_TELEGRAM_BOT_TOKEN;
+    use crate::secrets::{CreateSecretParams, InMemorySecretsStore, SecretsCrypto, SecretsStore};
+    use crate::testing::credentials::{TEST_CRYPTO_KEY, TEST_TELEGRAM_BOT_TOKEN};
     use crate::tools::wasm::{
         Capabilities as ToolCapabilities, EndpointPattern, HttpCapability, LogLevel, ResourceLimits,
     };
@@ -4222,6 +4233,58 @@ mod tests {
         assert_eq!(json["op"], serde_json::json!(2));
         assert_eq!(json["d"]["token"], serde_json::json!("bot-token"));
         assert_eq!(json["d"]["intents"], serde_json::json!(513));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_websocket_identify_message_uses_owner_scope() {
+        let crypto =
+            Arc::new(SecretsCrypto::new(SecretString::from(TEST_CRYPTO_KEY.to_string())).unwrap());
+        let store: Arc<dyn SecretsStore + Send + Sync> =
+            Arc::new(InMemorySecretsStore::new(crypto));
+        store
+            .create(
+                "owner-123",
+                CreateSecretParams {
+                    name: "discord_bot_token".to_string(),
+                    value: SecretString::from("owner-bot-token".to_string()),
+                    provider: None,
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .create(
+                "default",
+                CreateSecretParams {
+                    name: "discord_bot_token".to_string(),
+                    value: SecretString::from("default-bot-token".to_string()),
+                    provider: None,
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = WebsocketRuntimeConfig {
+            url: "wss://gateway.discord.gg/?v=10&encoding=json".to_string(),
+            connect_on_start: true,
+            identify: Some(serde_json::json!({
+                "intents": 513,
+                "properties": {
+                    "os": "linux",
+                    "browser": "ironclaw",
+                    "device": "ironclaw"
+                }
+            })),
+            identify_secret_name: Some("discord_bot_token".to_string()),
+        };
+
+        let payload =
+            resolve_websocket_identify_message(&config, "owner-123", Some(store.as_ref())).await;
+        let json: serde_json::Value = serde_json::from_str(&payload.unwrap()).unwrap();
+
+        assert_eq!(json["d"]["token"], serde_json::json!("owner-bot-token"));
     }
 
     #[test]

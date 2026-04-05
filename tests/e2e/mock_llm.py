@@ -65,7 +65,7 @@ TOOL_CALL_PATTERNS = [
     ),
     (
         re.compile(r"check mock mcp|mock mcp search", re.IGNORECASE),
-        "mock-mcp_mock_search",
+        "mock_mcp_mock_search",
         lambda _: {"query": "refresh-check"},
     ),
     (re.compile(r"what time|current time", re.IGNORECASE), "time", lambda _: {"operation": "now"}),
@@ -272,6 +272,30 @@ def _last_user_content(messages: list[dict]) -> str:
             return _message_text(msg)
     return ""
 
+
+def _extract_resumed_action_result(last_user: str) -> tuple[str, str] | None:
+    prefix = "The pending action '"
+    marker = "Continue from this result:\n"
+    if not last_user.startswith(prefix) or marker not in last_user:
+        return None
+    rest = last_user[len(prefix):]
+    action_name, _, tail = rest.partition("' has already been executed.")
+    if not action_name or not tail:
+        return None
+    _, _, rendered = last_user.partition(marker)
+    rendered = rendered.strip()
+    if not rendered:
+        return None
+    return action_name, rendered
+
+
+def _resumed_action_summary(messages: list[dict]) -> str | None:
+    resumed = _extract_resumed_action_result(_last_user_content(messages))
+    if not resumed:
+        return None
+    action_name, rendered = resumed
+    return f"The {action_name} tool returned: {rendered}"
+
 def _conversation_has_user_trigger(messages: list[dict], pattern: re.Pattern[str]) -> bool:
     for msg in messages:
         if msg.get("role") == "user" and pattern.search(_message_text(msg)):
@@ -379,6 +403,9 @@ def match_job_response(messages: list[dict], has_tools: bool) -> dict | None:
 
 def match_response(messages: list[dict]) -> str:
     content = _last_user_content(messages)
+    resumed = _resumed_action_summary(messages)
+    if resumed:
+        return resumed
     for pattern, response in CANNED_RESPONSES:
         if pattern.search(content):
             return response
@@ -551,6 +578,12 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
         if not stream:
             return _text_response(cid, text)
         return await _stream_text(request, cid, text)
+
+    resumed_text = _resumed_action_summary(messages)
+    if resumed_text:
+        if not stream:
+            return _text_response(cid, resumed_text)
+        return await _stream_text(request, cid, resumed_text)
 
     if special:
         return await _dispatch_special_response(request, cid, stream, special)

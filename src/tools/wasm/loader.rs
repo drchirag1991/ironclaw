@@ -185,6 +185,7 @@ impl WasmToolLoader {
                 schema: None,
                 discovery_summary,
                 secrets_store: self.secrets_store.clone(),
+                db: None,
                 oauth_refresh,
             })
             .await?;

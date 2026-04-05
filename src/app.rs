@@ -308,14 +308,15 @@ impl AppBuilder {
 
         // Initialize tool registry with credential injection support
         let credential_registry = Arc::new(SharedCredentialRegistry::new());
-        let tools = if let Some(ref ss) = self.secrets_store {
-            Arc::new(
-                ToolRegistry::new()
-                    .with_credentials(Arc::clone(&credential_registry), Arc::clone(ss)),
-            )
-        } else {
-            Arc::new(ToolRegistry::new())
-        };
+        let mut tools_builder = ToolRegistry::new();
+        if let Some(ref db) = self.db {
+            tools_builder = tools_builder.with_database(Arc::clone(db));
+        }
+        if let Some(ref ss) = self.secrets_store {
+            tools_builder =
+                tools_builder.with_credentials(Arc::clone(&credential_registry), Arc::clone(ss));
+        }
+        let tools = Arc::new(tools_builder);
         tools.register_builtin_tools();
         tools.register_tool_info();
 
