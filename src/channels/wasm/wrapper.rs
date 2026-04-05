@@ -5986,7 +5986,11 @@ mod tests {
 
     #[test]
     fn test_rewrite_slack_api_url_for_testing_uses_test_override() {
-        std::env::set_var(SLACK_TEST_API_BASE_ENV, "http://localhost:9999");
+        // SAFETY: test-only; tests run single-threaded with --test-threads=1
+        // when env mutation is involved.
+        unsafe {
+            std::env::set_var(SLACK_TEST_API_BASE_ENV, "http://localhost:9999");
+        }
         // slack.com API call
         let result = rewrite_slack_api_url_for_testing("https://slack.com/api/chat.postMessage");
         assert_eq!(
@@ -6004,6 +6008,9 @@ mod tests {
         // Non-Slack URL should not be rewritten
         let result = rewrite_slack_api_url_for_testing("https://api.telegram.org/bot123/getMe");
         assert!(result.is_none());
-        std::env::remove_var(SLACK_TEST_API_BASE_ENV);
+        // SAFETY: test-only cleanup
+        unsafe {
+            std::env::remove_var(SLACK_TEST_API_BASE_ENV);
+        }
     }
 }
