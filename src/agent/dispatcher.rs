@@ -1350,9 +1350,7 @@ pub(super) fn extract_auth_prompt(
     }
 
     let auth_data = parse_auth_result(result);
-    if auth_data.extension_name.is_none() {
-        return None;
-    }
+    auth_data.extension_name.as_ref()?;
 
     if auth_data.awaiting_token || auth_data.auth_url.is_some() || auth_data.setup_url.is_some() {
         Some(auth_data)
@@ -1381,6 +1379,7 @@ pub(super) fn capture_auth_prompt(
 ///
 /// Returns `Some((extension_name, instructions))` if the tool result contains
 /// `awaiting_token: true`, meaning the thread should enter auth mode.
+#[cfg(test)]
 pub(super) fn check_auth_required(
     tool_name: &str,
     result: &Result<String, Error>,
