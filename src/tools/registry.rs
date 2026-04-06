@@ -152,6 +152,10 @@ impl ToolRegistry {
         &self.rate_limiter
     }
 
+    pub fn database(&self) -> Option<&Arc<dyn Database>> {
+        self.db.as_ref()
+    }
+
     /// Register a tool. Rejects dynamic tools that try to shadow a protected built-in name.
     pub async fn register(&self, tool: Arc<dyn Tool>) {
         let name = tool.name().to_string();
