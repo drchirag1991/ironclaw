@@ -129,6 +129,28 @@ pub trait Store: Send + Sync {
         Ok(docs)
     }
 
+    /// List all skill docs owned by shared/admin owners across ALL projects.
+    ///
+    /// Unlike `list_shared_memory_docs`, this ignores `project_id` — it returns
+    /// every `DocType::Skill` with a shared owner regardless of which project it
+    /// lives in. Used by `__list_skills__` so that admin-installed skills
+    /// (migrated into the owner's default project) are visible to gateway users
+    /// whose threads run in a per-user project.
+    async fn list_skills_global(&self) -> Result<Vec<MemoryDoc>, EngineError> {
+        let mut docs = Vec::new();
+        for owner_id in shared_owner_candidates() {
+            docs.extend(self.list_memory_docs_by_owner(owner_id).await?);
+        }
+        docs.retain(|d| d.doc_type == crate::types::memory::DocType::Skill);
+        docs.sort_by_key(|doc| doc.id.0);
+        docs.dedup_by_key(|doc| doc.id);
+        Ok(docs)
+    }
+
+    /// List all memory docs owned by a specific user across ALL projects.
+    async fn list_memory_docs_by_owner(&self, user_id: &str)
+    -> Result<Vec<MemoryDoc>, EngineError>;
+
     // ── Capability lease operations ─────────────────────────
 
     async fn save_lease(&self, lease: &CapabilityLease) -> Result<(), EngineError>;

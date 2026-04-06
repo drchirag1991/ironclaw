@@ -1188,6 +1188,20 @@ impl Store for HybridStore {
             .collect())
     }
 
+    async fn list_memory_docs_by_owner(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<MemoryDoc>, EngineError> {
+        Ok(self
+            .docs
+            .read()
+            .await
+            .values()
+            .filter(|doc| doc.user_id == user_id)
+            .cloned()
+            .collect())
+    }
+
     async fn save_lease(&self, lease: &CapabilityLease) -> Result<(), EngineError> {
         self.leases.write().await.insert(lease.id, lease.clone());
         self.persist_json(lease_path(lease.id), lease).await;
