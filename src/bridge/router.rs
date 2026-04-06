@@ -102,19 +102,13 @@ fn resolved_call_id_for_pending_action(
         .unwrap_or_default()
 }
 
-async fn insert_and_notify_pending_gate(
+async fn notify_pending_gate(
     agent: &Agent,
     state: &EngineState,
     message: &IncomingMessage,
-    pending: PendingGate,
+    pending: &PendingGate,
 ) -> Result<Option<String>, Error> {
-    let display_parameters = gate_display_parameters(&pending);
-
-    state
-        .pending_gates
-        .insert(pending.clone())
-        .await
-        .map_err(|e| engine_err("pending gate insert", e))?;
+    let display_parameters = gate_display_parameters(pending);
 
     if let Some(ref sse) = state.sse {
         sse.broadcast_for_user(
@@ -190,6 +184,21 @@ async fn insert_and_notify_pending_gate(
             )))
         }
     }
+}
+
+async fn insert_and_notify_pending_gate(
+    agent: &Agent,
+    state: &EngineState,
+    message: &IncomingMessage,
+    pending: PendingGate,
+) -> Result<Option<String>, Error> {
+    state
+        .pending_gates
+        .insert(pending.clone())
+        .await
+        .map_err(|e| engine_err("pending gate insert", e))?;
+
+    notify_pending_gate(agent, state, message, &pending).await
 }
 
 async fn execute_pending_gate_action(
@@ -1924,33 +1933,41 @@ async fn handle_with_engine_inner(
     let thread_scope = message.conversation_scope();
     let scoped_thread_id = parse_engine_thread_id(thread_scope);
 
-    if let PendingGateResolution::Resolved(gate) =
-        resolve_pending_gate_for_user(&state.pending_gates, &message.user_id, thread_scope).await
-        && matches!(
-            gate.resume_kind,
-            ironclaw_engine::ResumeKind::Authentication { .. }
-        )
+    match resolve_pending_gate_for_user(&state.pending_gates, &message.user_id, thread_scope).await
     {
-        let request_id = gate.request_id;
-        let resolution =
-            if content.trim().is_empty() || content.trim().eq_ignore_ascii_case("cancel") {
-                ironclaw_engine::GateResolution::Cancelled
-            } else {
-                ironclaw_engine::GateResolution::CredentialProvided {
-                    token: content.trim().to_string(),
-                }
-            };
-        drop(guard);
-        return resolve_gate(agent, message, gate.thread_id, request_id, resolution).await;
-    }
-
-    if matches!(
-        resolve_pending_gate_for_user(&state.pending_gates, &message.user_id, thread_scope).await,
-        PendingGateResolution::Ambiguous
-    ) {
-        return Ok(Some(
-            "Multiple authentication prompts are waiting. Reply from the original thread.".into(),
-        ));
+        PendingGateResolution::Resolved(gate)
+            if matches!(
+                gate.resume_kind,
+                ironclaw_engine::ResumeKind::Authentication { .. }
+            ) =>
+        {
+            let request_id = gate.request_id;
+            let resolution =
+                if content.trim().is_empty() || content.trim().eq_ignore_ascii_case("cancel") {
+                    ironclaw_engine::GateResolution::Cancelled
+                } else {
+                    ironclaw_engine::GateResolution::CredentialProvided {
+                        token: content.trim().to_string(),
+                    }
+                };
+            drop(guard);
+            return resolve_gate(agent, message, gate.thread_id, request_id, resolution).await;
+        }
+        PendingGateResolution::Resolved(gate)
+            if matches!(
+                gate.resume_kind,
+                ironclaw_engine::ResumeKind::Approval { .. }
+            ) =>
+        {
+            let pending = gate.clone();
+            return notify_pending_gate(agent, state, message, &pending).await;
+        }
+        PendingGateResolution::Ambiguous => {
+            return Ok(Some(
+                "Multiple pending approval or authentication prompts are waiting. Reply from the original thread.".into(),
+            ));
+        }
+        PendingGateResolution::Resolved(_) | PendingGateResolution::None => {}
     }
 
     if let Some(thread_id) = scoped_thread_id
@@ -3306,6 +3323,11 @@ async fn migrate_legacy_user_ids(store: &Arc<dyn ironclaw_engine::Store>, owner_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::{
+        Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate,
+    };
+    use crate::error::ChannelError;
+    use futures::stream;
     use rust_decimal::Decimal;
     use std::sync::LazyLock;
     use std::time::Duration;
@@ -3325,6 +3347,44 @@ mod tests {
                 conversations: TokioRwLock::new(Vec::new()),
                 threads: TokioRwLock::new(HashMap::new()),
             }
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingStatusChannel {
+        name: String,
+        statuses: Arc<TokioMutex<Vec<StatusUpdate>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for RecordingStatusChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn start(&self) -> Result<MessageStream, ChannelError> {
+            Ok(Box::pin(stream::empty()))
+        }
+
+        async fn respond(
+            &self,
+            _msg: &IncomingMessage,
+            _response: OutgoingResponse,
+        ) -> Result<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn send_status(
+            &self,
+            status: StatusUpdate,
+            _metadata: &serde_json::Value,
+        ) -> Result<(), ChannelError> {
+            self.statuses.lock().await.push(status);
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<(), ChannelError> {
+            Ok(())
         }
     }
 
@@ -3531,7 +3591,9 @@ mod tests {
         }
     }
 
-    fn make_router_test_agent(sse: Option<Arc<SseManager>>) -> Agent {
+    async fn make_router_test_agent(
+        sse: Option<Arc<SseManager>>,
+    ) -> (Agent, Arc<TokioMutex<Vec<StatusUpdate>>>) {
         struct StaticLlmProvider;
 
         #[async_trait::async_trait]
@@ -3606,7 +3668,16 @@ mod tests {
             tenant_rates: Arc::new(crate::tenant::TenantRateRegistry::new(4, 3)),
         };
 
-        Agent::new(
+        let channels = Arc::new(crate::channels::ChannelManager::new());
+        let statuses = Arc::new(TokioMutex::new(Vec::new()));
+        channels
+            .add(Box::new(RecordingStatusChannel {
+                name: "web".to_string(),
+                statuses: Arc::clone(&statuses),
+            }))
+            .await;
+
+        let agent = Agent::new(
             crate::config::AgentConfig {
                 name: "router-test-agent".to_string(),
                 max_parallel_jobs: 1,
@@ -3631,13 +3702,15 @@ mod tests {
                 engine_v2: true,
             },
             deps,
-            Arc::new(crate::channels::ChannelManager::new()),
+            channels,
             None,
             None,
             None,
             Some(Arc::new(crate::context::ContextManager::new(1))),
             None,
-        )
+        );
+
+        (agent, statuses)
     }
 
     #[tokio::test]
@@ -3645,7 +3718,7 @@ mod tests {
         let store = Arc::new(TestStore::new());
         let sse = Arc::new(SseManager::new());
         let mut receiver = sse.sender().subscribe();
-        let agent = make_router_test_agent(Some(Arc::clone(&sse)));
+        let (agent, _statuses) = make_router_test_agent(Some(Arc::clone(&sse))).await;
         let mut state = make_expected_test_state(store);
         state.sse = Some(Arc::clone(&sse));
 
@@ -3692,6 +3765,72 @@ mod tests {
             receiver.try_recv().is_err(),
             "unexpected legacy auth SSE event"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_with_engine_re_emits_pending_approval_on_follow_up() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let sse = Arc::new(SseManager::new());
+        let mut receiver = sse.sender().subscribe();
+        let (agent, statuses) = make_router_test_agent(Some(Arc::clone(&sse))).await;
+        let mut state = make_expected_test_state(store);
+        state.sse = Some(Arc::clone(&sse));
+
+        let thread_id = ironclaw_engine::ThreadId::new();
+        let pending = sample_pending_gate(
+            "alice",
+            thread_id,
+            ironclaw_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let request_id = pending.request_id.to_string();
+        state.pending_gates.insert(pending).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = None;
+        *lock.write().await = Some(state);
+
+        let mut message =
+            crate::channels::IncomingMessage::new("web", "alice", "what's happening?");
+        message.thread_id = Some(thread_id.to_string());
+
+        let response = handle_with_engine(&agent, &message, &message.content)
+            .await
+            .expect("follow-up handled");
+
+        assert_eq!(
+            response.as_deref(),
+            Some("Tool 'shell' requires approval. Reply 'yes' to approve, 'no' to deny.")
+        );
+
+        let scoped = receiver.recv().await.expect("sse event");
+        match scoped.event {
+            AppEvent::GateRequired {
+                request_id: event_request_id,
+                gate_name,
+                tool_name,
+                thread_id: Some(event_thread_id),
+                ..
+            } => {
+                assert_eq!(event_request_id, request_id);
+                assert_eq!(gate_name, "approval");
+                assert_eq!(tool_name, "shell");
+                assert_eq!(event_thread_id, thread_id.to_string());
+            }
+            other => panic!("expected GateRequired event, got {other:?}"),
+        }
+
+        let statuses = statuses.lock().await.clone();
+        assert!(statuses.iter().any(|status| matches!(
+            status,
+            StatusUpdate::ApprovalNeeded {
+                request_id: status_request_id,
+                tool_name,
+                ..
+            } if status_request_id == &request_id && tool_name == "shell"
+        )));
+
+        *lock.write().await = None;
     }
 
     #[tokio::test]

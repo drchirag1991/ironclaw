@@ -41,6 +41,31 @@ fn turn_usage_from_result(result: &Result<AgenticLoopResult, Error>) -> Option<&
     }
 }
 
+fn pending_approval_status_update(pending: &PendingApproval) -> StatusUpdate {
+    StatusUpdate::ApprovalNeeded {
+        request_id: pending.request_id.to_string(),
+        tool_name: pending.tool_name.clone(),
+        description: pending.description.clone(),
+        parameters: pending.display_parameters.clone(),
+        allow_always: pending.allow_always,
+    }
+}
+
+fn pending_approval_message(pending: Option<&PendingApproval>) -> String {
+    let approval_context = pending.map(|approval| {
+        let desc_preview =
+            crate::agent::agent_loop::truncate_for_preview(&approval.description, 80);
+        (approval.tool_name.clone(), desc_preview)
+    });
+
+    match approval_context {
+        Some((tool_name, desc_preview)) => {
+            format!("Waiting for approval: {tool_name} — {desc_preview}. Use /interrupt to cancel.")
+        }
+        None => "Waiting for approval. Use /interrupt to cancel.".to_string(),
+    }
+}
+
 impl Agent {
     /// Hydrate a historical thread from DB into memory if not already present.
     ///
@@ -237,18 +262,13 @@ impl Agent {
         );
 
         // First check thread state without holding lock during I/O
-        let (thread_state, approval_context) = {
+        let (thread_state, pending_approval) = {
             let sess = session.lock().await;
             let thread = sess
                 .threads
                 .get(&thread_id)
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            let approval_context = thread.pending_approval.as_ref().map(|a| {
-                let desc_preview =
-                    crate::agent::agent_loop::truncate_for_preview(&a.description, 80);
-                (a.tool_name.clone(), desc_preview)
-            });
-            (thread.state, approval_context)
+            (thread.state, thread.pending_approval.clone())
         };
 
         tracing::debug!(
@@ -334,12 +354,17 @@ impl Agent {
                     thread_id = %thread_id,
                     "Thread awaiting approval, rejecting new input"
                 );
-                let msg = match approval_context {
-                    Some((tool_name, desc_preview)) => format!(
-                        "Waiting for approval: {tool_name} — {desc_preview}. Use /interrupt to cancel."
-                    ),
-                    None => "Waiting for approval. Use /interrupt to cancel.".to_string(),
-                };
+                if let Some(pending) = pending_approval.as_ref() {
+                    let _ = self
+                        .channels
+                        .send_status(
+                            &message.channel,
+                            pending_approval_status_update(pending),
+                            &message.metadata,
+                        )
+                        .await;
+                }
+                let msg = pending_approval_message(pending_approval.as_ref());
                 return Ok(SubmissionResult::pending(msg));
             }
             ThreadState::Completed => {
@@ -2081,7 +2106,169 @@ fn rebuild_chat_messages_from_db(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::{Channel, MessageStream, OutgoingResponse};
+    use crate::error::ChannelError;
+    use futures::stream;
     use rust_decimal::Decimal;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Mutex as TokioMutex;
+
+    #[derive(Clone)]
+    struct RecordingStatusChannel {
+        statuses: Arc<TokioMutex<Vec<StatusUpdate>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for RecordingStatusChannel {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        async fn start(&self) -> Result<MessageStream, ChannelError> {
+            Ok(Box::pin(stream::empty()))
+        }
+
+        async fn respond(
+            &self,
+            _msg: &IncomingMessage,
+            _response: OutgoingResponse,
+        ) -> Result<(), ChannelError> {
+            Ok(())
+        }
+
+        async fn send_status(
+            &self,
+            status: StatusUpdate,
+            _metadata: &serde_json::Value,
+        ) -> Result<(), ChannelError> {
+            self.statuses.lock().await.push(status);
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<(), ChannelError> {
+            Ok(())
+        }
+    }
+
+    async fn make_thread_ops_test_agent() -> (Agent, Arc<TokioMutex<Vec<StatusUpdate>>>) {
+        struct StaticLlmProvider;
+
+        #[async_trait::async_trait]
+        impl crate::llm::LlmProvider for StaticLlmProvider {
+            fn model_name(&self) -> &str {
+                "static-mock"
+            }
+
+            fn cost_per_token(&self) -> (Decimal, Decimal) {
+                (Decimal::ZERO, Decimal::ZERO)
+            }
+
+            async fn complete(
+                &self,
+                _request: crate::llm::CompletionRequest,
+            ) -> Result<crate::llm::CompletionResponse, crate::error::LlmError> {
+                Ok(crate::llm::CompletionResponse {
+                    content: "ok".to_string(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    finish_reason: crate::llm::FinishReason::Stop,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                })
+            }
+
+            async fn complete_with_tools(
+                &self,
+                _request: crate::llm::ToolCompletionRequest,
+            ) -> Result<crate::llm::ToolCompletionResponse, crate::error::LlmError> {
+                Ok(crate::llm::ToolCompletionResponse {
+                    content: Some("ok".to_string()),
+                    tool_calls: Vec::new(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    finish_reason: crate::llm::FinishReason::Stop,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                })
+            }
+        }
+
+        let statuses = Arc::new(TokioMutex::new(Vec::new()));
+        let channels = Arc::new(crate::channels::ChannelManager::new());
+        channels
+            .add(Box::new(RecordingStatusChannel {
+                statuses: Arc::clone(&statuses),
+            }))
+            .await;
+
+        let deps = crate::agent::AgentDeps {
+            owner_id: "default".to_string(),
+            store: None,
+            llm: Arc::new(StaticLlmProvider),
+            cheap_llm: None,
+            safety: Arc::new(ironclaw_safety::SafetyLayer::new(
+                &ironclaw_safety::SafetyConfig {
+                    max_output_length: 100_000,
+                    injection_check_enabled: true,
+                },
+            )),
+            tools: Arc::new(crate::tools::ToolRegistry::new()),
+            workspace: None,
+            extension_manager: None,
+            skill_registry: None,
+            skill_catalog: None,
+            skills_config: crate::config::SkillsConfig::default(),
+            hooks: Arc::new(crate::hooks::HookRegistry::new()),
+            auth_manager: None,
+            cost_guard: Arc::new(crate::agent::cost_guard::CostGuard::new(
+                crate::agent::cost_guard::CostGuardConfig::default(),
+            )),
+            sse_tx: None,
+            http_interceptor: None,
+            transcription: None,
+            document_extraction: None,
+            sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            builder: None,
+            llm_backend: "nearai".to_string(),
+            tenant_rates: Arc::new(crate::tenant::TenantRateRegistry::new(4, 3)),
+        };
+
+        let agent = Agent::new(
+            crate::config::AgentConfig {
+                name: "thread-ops-test-agent".to_string(),
+                max_parallel_jobs: 1,
+                job_timeout: Duration::from_secs(60),
+                stuck_threshold: Duration::from_secs(60),
+                repair_check_interval: Duration::from_secs(30),
+                max_repair_attempts: 1,
+                use_planning: false,
+                session_idle_timeout: Duration::from_secs(300),
+                allow_local_tools: false,
+                max_cost_per_day_cents: None,
+                max_actions_per_hour: None,
+                max_cost_per_user_per_day_cents: None,
+                max_tool_iterations: 50,
+                auto_approve_tools: false,
+                default_timezone: "UTC".to_string(),
+                max_jobs_per_user: None,
+                max_tokens_per_job: 0,
+                multi_tenant: false,
+                max_llm_concurrent_per_user: None,
+                max_jobs_concurrent_per_user: None,
+                engine_v2: false,
+            },
+            deps,
+            channels,
+            None,
+            None,
+            None,
+            Some(Arc::new(crate::context::ContextManager::new(1))),
+            None,
+        );
+
+        (agent, statuses)
+    }
 
     #[test]
     fn test_rebuild_chat_messages_user_assistant_only() {
@@ -2369,6 +2556,65 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_awaiting_approval_follow_up_re_emits_status() {
+        use crate::agent::session::{PendingApproval, Session, Thread};
+        use uuid::Uuid;
+
+        let (agent, statuses) = make_thread_ops_test_agent().await;
+        let session_id = Uuid::new_v4();
+        let thread_id = Uuid::new_v4();
+        let mut thread = Thread::with_id(thread_id, session_id, Some("test"));
+        let pending = PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: "shell".to_string(),
+            parameters: serde_json::json!({"command": "echo hello"}),
+            display_parameters: serde_json::json!({"command": "[REDACTED]"}),
+            description: "Execute: echo hello".to_string(),
+            tool_call_id: "call_0".to_string(),
+            context_messages: vec![],
+            deferred_tool_calls: vec![],
+            user_timezone: None,
+            allow_always: true,
+        };
+        let request_id = pending.request_id.to_string();
+        thread.await_approval(pending);
+
+        let mut sess = Session::new("test-user");
+        sess.threads.insert(thread_id, thread);
+        let session = Arc::new(TokioMutex::new(sess));
+        let message = IncomingMessage::new("test", "test-user", "still waiting?");
+
+        let result = agent
+            .process_user_input(
+                &message,
+                agent.tenant_ctx("test-user").await,
+                Arc::clone(&session),
+                thread_id,
+                "still waiting?",
+            )
+            .await
+            .expect("follow-up handled");
+
+        match result {
+            SubmissionResult::Ok { message: Some(msg) } => {
+                assert!(msg.contains("Waiting for approval"));
+                assert!(msg.contains("shell"));
+            }
+            other => panic!("expected pending Ok message, got {other:?}"),
+        }
+
+        let statuses = statuses.lock().await.clone();
+        assert!(statuses.iter().any(|status| matches!(
+            status,
+            StatusUpdate::ApprovalNeeded {
+                request_id: status_request_id,
+                tool_name,
+                ..
+            } if status_request_id == &request_id && tool_name == "shell"
+        )));
+    }
+
     #[test]
     fn test_queue_cap_rejects_at_capacity() {
         use crate::agent::session::{MAX_PENDING_MESSAGES, Thread, ThreadState};
@@ -2487,19 +2733,9 @@ mod tests {
         })?;
 
         if thread.state == ThreadState::AwaitingApproval {
-            let approval_context = thread.pending_approval.as_ref().map(|a| {
-                let desc_preview =
-                    crate::agent::agent_loop::truncate_for_preview(&a.description, 80);
-                (a.tool_name.clone(), desc_preview)
-            });
-
-            let msg = match approval_context {
-                Some((tool_name, desc_preview)) => format!(
-                    "Waiting for approval: {tool_name} — {desc_preview}. Use /interrupt to cancel."
-                ),
-                None => "Waiting for approval. Use /interrupt to cancel.".to_string(),
-            };
-            Ok(Some(msg))
+            Ok(Some(pending_approval_message(
+                thread.pending_approval.as_ref(),
+            )))
         } else {
             Ok(None)
         }
