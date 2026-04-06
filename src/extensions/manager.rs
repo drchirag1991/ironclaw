@@ -3423,7 +3423,12 @@ impl ExtensionManager {
         } else if let Some(ref oauth) = server.oauth {
             let metadata = metadata
                 .as_ref()
-                .expect("metadata for discovered MCP oauth");
+                .ok_or_else(|| {
+                    ExtensionError::AuthFailed(
+                        "discovered MCP OAuth metadata missing authorization endpoints"
+                            .to_string(),
+                    )
+                })?;
             (
                 metadata.authorization_endpoint.clone(),
                 metadata.token_endpoint.clone(),

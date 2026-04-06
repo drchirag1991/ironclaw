@@ -2585,13 +2585,12 @@ fn extension_phase_for_web(
         crate::extensions::ExtensionPhase::NeedsSetup
     } else if ext.has_auth && !ext.authenticated {
         crate::extensions::ExtensionPhase::NeedsAuth
-    } else if matches!(
+    } else if ext.active
+        || matches!(
         ext.kind,
         crate::extensions::ExtensionKind::WasmChannel
             | crate::extensions::ExtensionKind::ChannelRelay
     ) {
-        crate::extensions::ExtensionPhase::Ready
-    } else if ext.active {
         crate::extensions::ExtensionPhase::Ready
     } else {
         crate::extensions::ExtensionPhase::NeedsActivation

@@ -413,10 +413,12 @@ pub async fn execute_orchestrator(
                             args,
                             kwargs,
                             thread,
-                            llm,
-                            effects,
-                            leases,
-                            store,
+                            LlmCompleteDeps {
+                                llm,
+                                effects,
+                                leases,
+                                store,
+                            },
                             &mut total_tokens,
                         )
                         .await
@@ -543,6 +545,13 @@ pub async fn execute_orchestrator(
 
 // ── Host function handlers ──────────────────────────────────
 
+struct LlmCompleteDeps<'a> {
+    llm: &'a Arc<dyn LlmBackend>,
+    effects: &'a Arc<dyn EffectExecutor>,
+    leases: &'a Arc<LeaseManager>,
+    store: Option<&'a Arc<dyn Store>>,
+}
+
 /// Handle `__llm_complete__(messages, actions, config)`.
 ///
 /// Calls the LLM and returns the response as a dict:
@@ -552,10 +561,7 @@ async fn handle_llm_complete(
     args: &[MontyObject],
     _kwargs: &[(MontyObject, MontyObject)],
     thread: &mut Thread,
-    llm: &Arc<dyn LlmBackend>,
-    effects: &Arc<dyn EffectExecutor>,
-    leases: &Arc<LeaseManager>,
-    store: Option<&Arc<dyn Store>>,
+    deps: LlmCompleteDeps<'_>,
     total_tokens: &mut TokenUsage,
 ) -> ExtFunctionResult {
     use crate::types::step::LlmResponse;
@@ -568,14 +574,21 @@ async fn handle_llm_complete(
         .unwrap_or_else(|| thread.messages.clone());
 
     if let Err(e) =
-        reconcile_dynamic_tool_lease(thread, effects, leases, store, &crate::LeasePlanner::new())
-            .await
+        reconcile_dynamic_tool_lease(
+            thread,
+            deps.effects,
+            deps.leases,
+            deps.store,
+            &crate::LeasePlanner::new(),
+        )
+        .await
     {
         warn_on_lease_refresh_failure("llm_complete", &e);
     }
 
-    let active_leases = leases.active_for_thread(thread.id).await;
-    let actions = effects
+    let active_leases = deps.leases.active_for_thread(thread.id).await;
+    let actions = deps
+        .effects
         .available_actions(&active_leases)
         .await
         .unwrap_or_default();
@@ -600,7 +613,7 @@ async fn handle_llm_complete(
         metadata: HashMap::new(),
     };
 
-    match llm.complete(&messages, &actions, &config).await {
+    match deps.llm.complete(&messages, &actions, &config).await {
         Ok(output) => {
             total_tokens.input_tokens += output.usage.input_tokens;
             total_tokens.output_tokens += output.usage.output_tokens;

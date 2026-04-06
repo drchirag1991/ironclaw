@@ -373,7 +373,7 @@ impl AuthManager {
                     credential_name,
                     ..
                 }) => Ok(LatentActionExecution::NeedsAuth {
-                    credential_name: credential_name.unwrap_or_else(|| latent.provider_extension),
+                    credential_name: credential_name.unwrap_or(latent.provider_extension),
                     instructions: auth
                         .instructions()
                         .unwrap_or("Complete authentication to continue.")
