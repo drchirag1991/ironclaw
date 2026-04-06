@@ -473,7 +473,7 @@ const HEARTBEAT_SEED: &str = include_str!("seeds/HEARTBEAT.md");
 /// Default template seeded into TOOLS.md on first access.
 const TOOLS_SEED: &str = include_str!("seeds/TOOLS.md");
 
-/// Frontend customization guide seeded into frontend/README.md.
+/// Frontend customization guide seeded into `.system/gateway/README.md`.
 const FRONTEND_SEED: &str = include_str!("seeds/FRONTEND.md");
 
 /// First-run ritual seeded into BOOTSTRAP.md on initial workspace setup.
@@ -2012,7 +2012,7 @@ impl Workspace {
             (paths::USER, include_str!("seeds/USER.md")),
             (paths::HEARTBEAT, HEARTBEAT_SEED),
             (paths::TOOLS, TOOLS_SEED),
-            ("frontend/README.md", FRONTEND_SEED),
+            (".system/gateway/README.md", FRONTEND_SEED),
         ];
 
         // Check freshness BEFORE seeding identity files, otherwise the
@@ -2069,7 +2069,7 @@ impl Workspace {
                 }),
             ),
             (
-                "frontend/.config",
+                ".system/gateway/.config",
                 serde_json::json!({
                     "skip_indexing": true
                 }),

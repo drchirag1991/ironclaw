@@ -3689,7 +3689,7 @@ dependencies = [
  "insta",
  "ironclaw_common",
  "ironclaw_engine",
- "ironclaw_frontend",
+ "ironclaw_gateway",
  "ironclaw_safety",
  "ironclaw_skills",
  "json5",
@@ -3778,7 +3778,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ironclaw_frontend"
+name = "ironclaw_gateway"
 version = "0.1.0"
 dependencies = [
  "serde",

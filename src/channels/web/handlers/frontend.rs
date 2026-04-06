@@ -1,7 +1,9 @@
 //! Frontend extension API handlers.
 //!
 //! Provides endpoints for reading/writing layout configuration and
-//! discovering/serving widget files from the workspace.
+//! discovering/serving widget files from the workspace. All gateway state
+//! lives under `.system/gateway/` in the workspace, alongside other
+//! `.system/*` subsystems.
 
 use std::sync::Arc;
 
@@ -12,16 +14,23 @@ use axum::{
     response::IntoResponse,
 };
 
-use ironclaw_frontend::{LayoutConfig, ResolvedWidget, WidgetManifest};
+use ironclaw_gateway::{LayoutConfig, ResolvedWidget, WidgetManifest};
 
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::handlers::memory::resolve_workspace;
 use crate::channels::web::server::GatewayState;
 use crate::workspace::Workspace;
 
+/// Workspace path to the layout config document.
+const LAYOUT_PATH: &str = ".system/gateway/layout.json";
+
+/// Workspace directory containing widget subdirectories. Trailing slash is
+/// kept so it can be passed straight to `Workspace::list()`.
+const WIDGETS_DIR: &str = ".system/gateway/widgets/";
+
 /// `GET /api/frontend/layout` — return the current layout configuration.
 ///
-/// Reads `frontend/layout.json` from the workspace. Returns an empty
+/// Reads `.system/gateway/layout.json` from the workspace. Returns an empty
 /// default config if the file doesn't exist or is invalid (with a warning
 /// logged for the invalid case).
 pub async fn frontend_layout_handler(
@@ -30,13 +39,14 @@ pub async fn frontend_layout_handler(
 ) -> Result<Json<LayoutConfig>, (StatusCode, String)> {
     let workspace = resolve_workspace(&state, &user).await?;
 
-    let layout = match workspace.read("frontend/layout.json").await {
+    let layout = match workspace.read(LAYOUT_PATH).await {
         Ok(doc) => match serde_json::from_str(&doc.content) {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "frontend/layout.json is invalid — returning default layout"
+                    path = LAYOUT_PATH,
+                    "layout.json is invalid — returning default layout"
                 );
                 LayoutConfig::default()
             }
@@ -49,7 +59,7 @@ pub async fn frontend_layout_handler(
 
 /// `PUT /api/frontend/layout` — update the layout configuration.
 ///
-/// Writes the provided layout config to `frontend/layout.json` in workspace.
+/// Writes the provided layout config to `.system/gateway/layout.json`.
 pub async fn frontend_layout_update_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -64,24 +74,21 @@ pub async fn frontend_layout_update_handler(
         )
     })?;
 
-    workspace
-        .write("frontend/layout.json", &content)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to write layout config: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to write layout config".to_string(),
-            )
-        })?;
+    workspace.write(LAYOUT_PATH, &content).await.map_err(|e| {
+        tracing::error!("Failed to write layout config: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to write layout config".to_string(),
+        )
+    })?;
 
     Ok(StatusCode::OK)
 }
 
 /// `GET /api/frontend/widgets` — list all widget manifests.
 ///
-/// Scans `frontend/widgets/` in workspace for directories containing
-/// `manifest.json` and returns their parsed manifests.
+/// Scans `.system/gateway/widgets/` in the workspace for directories
+/// containing `manifest.json` and returns their parsed manifests.
 pub async fn frontend_widgets_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -91,13 +98,10 @@ pub async fn frontend_widgets_handler(
     Ok(Json(manifests))
 }
 
-/// Discover every widget in `frontend/widgets/` and return its parsed
+/// Discover every widget in `.system/gateway/widgets/` and return its parsed
 /// manifest. Malformed manifests are skipped with a `warn!` log.
 pub(crate) async fn load_widget_manifests(workspace: &Workspace) -> Vec<WidgetManifest> {
-    let entries = workspace
-        .list("frontend/widgets/")
-        .await
-        .unwrap_or_default();
+    let entries = workspace.list(WIDGETS_DIR).await.unwrap_or_default();
 
     let mut manifests = Vec::new();
     for entry in entries {
@@ -114,7 +118,7 @@ pub(crate) async fn load_widget_manifests(workspace: &Workspace) -> Vec<WidgetMa
 /// Read and parse a single widget's `manifest.json`. Returns `None` (with a
 /// `warn!`) for parse failures and `None` silently when the file is missing.
 async fn read_widget_manifest(workspace: &Workspace, widget_name: &str) -> Option<WidgetManifest> {
-    let manifest_path = format!("frontend/widgets/{}/manifest.json", widget_name);
+    let manifest_path = format!("{WIDGETS_DIR}{widget_name}/manifest.json");
     let doc = workspace.read(&manifest_path).await.ok()?;
     match serde_json::from_str::<WidgetManifest>(&doc.content) {
         Ok(manifest) => Some(manifest),
@@ -129,10 +133,10 @@ async fn read_widget_manifest(workspace: &Workspace, widget_name: &str) -> Optio
     }
 }
 
-/// Discover every widget in `frontend/widgets/` and return the fully-resolved
-/// set (manifest + `index.js` + optional `style.css`), filtered by the
-/// `enabled` flag in the supplied layout. Widgets missing `index.js` are
-/// skipped silently — they're assumed to be in-progress scaffolds.
+/// Discover every widget in `.system/gateway/widgets/` and return the
+/// fully-resolved set (manifest + `index.js` + optional `style.css`), filtered
+/// by the `enabled` flag in the supplied layout. Widgets missing `index.js`
+/// are skipped silently — they're assumed to be in-progress scaffolds.
 ///
 /// This is the single source of truth for widget loading; both the gateway's
 /// `/` handler and the `/api/frontend/widgets` handler delegate to it (the
@@ -141,10 +145,7 @@ pub(crate) async fn load_resolved_widgets(
     workspace: &Workspace,
     layout: &LayoutConfig,
 ) -> Vec<ResolvedWidget> {
-    let entries = workspace
-        .list("frontend/widgets/")
-        .await
-        .unwrap_or_default();
+    let entries = workspace.list(WIDGETS_DIR).await.unwrap_or_default();
 
     let mut widgets = Vec::new();
     for entry in entries {
@@ -157,14 +158,14 @@ pub(crate) async fn load_resolved_widgets(
         };
 
         // Widgets without `index.js` are incomplete — skip quietly.
-        let js_path = format!("frontend/widgets/{}/index.js", name);
+        let js_path = format!("{WIDGETS_DIR}{name}/index.js");
         let js = match workspace.read(&js_path).await {
             Ok(doc) => doc.content,
             Err(_) => continue,
         };
 
         let css = workspace
-            .read(&format!("frontend/widgets/{}/style.css", name))
+            .read(&format!("{WIDGETS_DIR}{name}/style.css"))
             .await
             .ok()
             .map(|doc| doc.content)
@@ -188,8 +189,8 @@ pub(crate) async fn load_resolved_widgets(
 
 /// `GET /api/frontend/widget/{id}/{*file}` — serve a widget file.
 ///
-/// Serves JS/CSS files from `frontend/widgets/{id}/{file}` in workspace
-/// with appropriate MIME types.
+/// Serves JS/CSS files from `.system/gateway/widgets/{id}/{file}` in the
+/// workspace with appropriate MIME types.
 pub async fn frontend_widget_file_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -211,7 +212,7 @@ pub async fn frontend_widget_file_handler(
     }
 
     let workspace = resolve_workspace(&state, &user).await?;
-    let path = format!("frontend/widgets/{}/{}", id, file);
+    let path = format!("{WIDGETS_DIR}{id}/{file}");
 
     let doc = workspace.read(&path).await.map_err(|_| {
         (

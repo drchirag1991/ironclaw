@@ -1,8 +1,8 @@
 //! Layout configuration types for frontend customization.
 //!
-//! A [`LayoutConfig`] is stored as `frontend/layout.json` in the workspace.
-//! It controls branding, tab visibility/order, chat features, and per-widget
-//! configuration. All fields are optional with sensible defaults.
+//! A [`LayoutConfig`] is stored as `.system/gateway/layout.json` in the
+//! workspace. It controls branding, tab visibility/order, chat features, and
+//! per-widget configuration. All fields are optional with sensible defaults.
 
 use std::collections::HashMap;
 

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Widget manifest — metadata about a widget component.
 ///
-/// Stored as `frontend/widgets/{id}/manifest.json` in the workspace.
+/// Stored as `.system/gateway/widgets/{id}/manifest.json` in the workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WidgetManifest {
     /// Unique widget identifier (must be a valid HTML attribute value).
@@ -73,7 +73,7 @@ pub enum WidgetSlot {
 /// # Example
 ///
 /// ```
-/// use ironclaw_frontend::scope_css;
+/// use ironclaw_gateway::scope_css;
 ///
 /// let scoped = scope_css(".title { color: red; }", "my-widget");
 /// assert!(scoped.contains("[data-widget=\"my-widget\"] .title"));
