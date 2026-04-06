@@ -504,4 +504,39 @@ impl JobStore for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
+
+    async fn create_system_job(&self, user_id: &str, source: &str) -> Result<Uuid, DatabaseError> {
+        let conn = self.connect().await?;
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+
+        conn.execute(
+            r#"
+            INSERT INTO agent_jobs (
+                id, title, description, category, status, source,
+                user_id, actual_cost, repair_attempts, max_tokens,
+                total_tokens_used, created_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "#,
+            params![
+                id.to_string(),
+                source,
+                format!("System operation: {source}"),
+                "system",
+                "Completed",
+                "system",
+                user_id,
+                "0",  // actual_cost as TEXT decimal
+                0i64, // repair_attempts
+                0i64, // max_tokens
+                0i64, // total_tokens_used
+                fmt_ts(&now),
+                fmt_ts(&now), // completed_at = created_at (instant completion)
+            ],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        Ok(id)
+    }
 }
