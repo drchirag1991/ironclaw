@@ -48,11 +48,15 @@ pub fn parse_skill_md(content: &str) -> Result<ParsedSkill, SkillParseError> {
     parse_skill_md_impl(content, true)
 }
 
-/// Parse a SKILL.md file without validating the `name` field.
+/// Parse a SKILL.md file for install recovery without validating the `name` field.
 ///
 /// Used by install paths that need to recover from invalid published names by
 /// rewriting them to a safe internal identifier before persisting to disk.
-pub(crate) fn parse_skill_md_without_name_validation(
+///
+/// This is intentionally crate-private and should remain limited to the
+/// install-recovery path. Normal discovery/loading must keep using
+/// [`parse_skill_md`] so invalid names are rejected.
+pub(crate) fn parse_skill_md_for_install_recovery(
     content: &str,
 ) -> Result<ParsedSkill, SkillParseError> {
     parse_skill_md_impl(content, false)

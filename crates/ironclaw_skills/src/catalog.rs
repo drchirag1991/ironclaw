@@ -87,6 +87,10 @@ fn normalize_catalog_identity(value: &str) -> String {
         .collect()
 }
 
+fn slug_suffix(slug: &str) -> &str {
+    slug.rsplit('/').next().unwrap_or(slug)
+}
+
 /// Resolve a display name or suffix-like query to a unique catalog slug.
 pub fn resolve_catalog_slug_for_name(
     name: &str,
@@ -123,9 +127,7 @@ pub fn resolve_catalog_slug_for_name(
 
     let matches = collect_matches(&|entry| {
         normalize_catalog_identity(&entry.name) == normalized_name
-            || normalize_catalog_identity(
-                entry.slug.rsplit('/').next().unwrap_or(entry.slug.as_str()),
-            ) == normalized_name
+            || normalize_catalog_identity(slug_suffix(&entry.slug)) == normalized_name
     });
 
     match matches.len() {
@@ -141,7 +143,7 @@ pub fn resolve_catalog_slug_for_name(
 /// Whether a catalog entry should be marked as installed for a set of local names.
 pub fn catalog_entry_is_installed(slug: &str, name: &str, installed_names: &[String]) -> bool {
     let normalized_slug_name = normalize_skill_identifier(slug);
-    let slug_suffix = slug.rsplit('/').next().unwrap_or(slug);
+    let slug_suffix = slug_suffix(slug);
     installed_names.iter().any(|installed| {
         slug.eq_ignore_ascii_case(installed)
             || slug_suffix.eq_ignore_ascii_case(installed)

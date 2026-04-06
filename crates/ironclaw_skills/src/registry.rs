@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use crate::gating;
-use crate::parser::{SkillParseError, parse_skill_md, parse_skill_md_without_name_validation};
+use crate::parser::{SkillParseError, parse_skill_md, parse_skill_md_for_install_recovery};
 use crate::types::{
     GatingRequirements, LoadedSkill, MAX_PROMPT_FILE_SIZE, SkillManifest, SkillSource, SkillTrust,
 };
@@ -78,7 +78,7 @@ fn normalize_install_content(
     match parse_skill_md(normalized_content) {
         Ok(parsed) => Ok((parsed.manifest.name, normalized_content.to_string())),
         Err(SkillParseError::InvalidName { .. }) => {
-            let mut parsed = parse_skill_md_without_name_validation(normalized_content)
+            let mut parsed = parse_skill_md_for_install_recovery(normalized_content)
                 .map_err(|e| parse_error_for_install("(install)", e))?;
             let original_name = parsed.manifest.name.clone();
             let normalized_name = requested_identifier

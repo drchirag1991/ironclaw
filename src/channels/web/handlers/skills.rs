@@ -206,7 +206,9 @@ pub async fn skills_install_handler(
         resolved_download_key = Some(download_key);
         let url = ironclaw_skills::catalog::skill_download_url(
             catalog.registry_url(),
-            resolved_download_key.as_deref().unwrap_or_default(),
+            resolved_download_key
+                .as_deref()
+                .expect("download key guaranteed Some above"),
         );
         crate::tools::builtin::skill_tools::fetch_skill_content(&url)
             .await
