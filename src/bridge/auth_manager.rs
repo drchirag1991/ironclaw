@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use crate::extensions::naming::canonicalize_extension_name;
+use crate::extensions::{ConfigureResult, ExtensionError};
 use crate::secrets::SecretsStore;
 use crate::tools::ToolRegistry;
 use crate::tools::builtin::extract_host_from_params;
@@ -382,6 +383,54 @@ impl AuthManager {
         }
     }
 
+    pub async fn submit_auth_token(
+        &self,
+        extension_name: &str,
+        token: &str,
+        user_id: &str,
+    ) -> Result<ConfigureResult, ExtensionError> {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return Err(ExtensionError::ValidationFailed(
+                "Credential cannot be empty.".to_string(),
+            ));
+        }
+
+        if let Some(ext_mgr) = self.extension_manager.as_ref() {
+            match ext_mgr
+                .configure_token(extension_name, trimmed, user_id)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(ExtensionError::NotInstalled(_)) => {}
+                Err(other) if other.to_string().contains("not found") => {}
+                Err(other) => return Err(other),
+            }
+        }
+
+        let Some(spec) = self.get_credential_spec(extension_name) else {
+            return Err(ExtensionError::NotInstalled(extension_name.to_string()));
+        };
+
+        let mut params = crate::secrets::CreateSecretParams::new(extension_name, trimmed);
+        if !spec.provider.is_empty() {
+            params = params.with_provider(spec.provider.clone());
+        }
+
+        self.secrets_store
+            .create(user_id, params)
+            .await
+            .map_err(|e| ExtensionError::Other(format!("Failed to store credential: {e}")))?;
+
+        Ok(ConfigureResult {
+            message: format!("Credential '{}' stored.", extension_name),
+            activated: true,
+            restart_required: false,
+            auth_url: None,
+            verification: None,
+        })
+    }
+
     async fn start_skill_oauth_if_supported(
         &self,
         credential_name: &str,
@@ -391,7 +440,33 @@ impl AuthManager {
 
         let spec = self.get_credential_spec(credential_name)?;
         let oauth = spec.oauth.as_ref()?;
-        let builtin = oauth_defaults::builtin_credentials(credential_name)?;
+        let builtin = oauth_defaults::builtin_credentials(credential_name);
+        let exchange_proxy_url = oauth_defaults::exchange_proxy_url();
+        let client_id = oauth
+            .client_id
+            .clone()
+            .or_else(|| {
+                oauth
+                    .client_id_env
+                    .as_ref()
+                    .and_then(|env| std::env::var(env).ok())
+            })
+            .or_else(|| builtin.as_ref().map(|c| c.client_id.to_string()))?;
+        let client_secret = oauth
+            .client_secret
+            .clone()
+            .or_else(|| {
+                oauth
+                    .client_secret_env
+                    .as_ref()
+                    .and_then(|env| std::env::var(env).ok())
+            })
+            .or_else(|| builtin.as_ref().map(|c| c.client_secret.to_string()));
+        let client_secret = oauth_defaults::hosted_proxy_client_secret(
+            &client_secret,
+            builtin.as_ref(),
+            exchange_proxy_url.is_some(),
+        );
         let ext_mgr = self.extension_manager.as_ref()?;
         let use_gateway = oauth_defaults::use_gateway_callback();
         let redirect_uri = if use_gateway {
@@ -401,7 +476,7 @@ impl AuthManager {
         };
         let oauth_result = oauth_defaults::build_oauth_url(
             &oauth.authorization_url,
-            builtin.client_id,
+            &client_id,
             &redirect_uri,
             &oauth.scopes,
             oauth.use_pkce,
@@ -423,8 +498,8 @@ impl AuthManager {
             extension_name: credential_name.to_string(),
             display_name: spec.provider.clone(),
             token_url: oauth.token_url.clone(),
-            client_id: builtin.client_id.to_string(),
-            client_secret: Some(builtin.client_secret.to_string()),
+            client_id,
+            client_secret,
             redirect_uri: redirect_uri.clone(),
             code_verifier: oauth_result.code_verifier.clone(),
             access_token_field: "access_token".to_string(),
@@ -669,6 +744,42 @@ Test skill
         Arc::new(std::sync::RwLock::new(registry))
     }
 
+    async fn make_skill_registry_with_custom_oauth(
+        dir: &Path,
+    ) -> Arc<std::sync::RwLock<ironclaw_skills::SkillRegistry>> {
+        std::fs::create_dir_all(dir.join("custom-skill")).expect("create skill dir");
+        std::fs::write(
+            dir.join("custom-skill").join("SKILL.md"),
+            r#"---
+name: custom
+version: "1.0.0"
+description: Custom OAuth test
+activation:
+  keywords: ["custom"]
+credentials:
+  - name: custom_oauth_token
+    provider: custom
+    location:
+      type: bearer
+    hosts: ["api.custom.test"]
+    oauth:
+      authorization_url: "https://auth.custom.test/authorize"
+      token_url: "https://auth.custom.test/token"
+      client_id: "custom-client-id"
+      client_secret: "custom-client-secret"
+      scopes: ["read"]
+    setup_instructions: "Sign in with Custom"
+---
+Test skill
+"#,
+        )
+        .expect("write skill");
+
+        let mut registry = ironclaw_skills::SkillRegistry::new(dir.to_path_buf());
+        registry.discover_all().await;
+        Arc::new(std::sync::RwLock::new(registry))
+    }
+
     fn test_store() -> Arc<dyn SecretsStore + Send + Sync> {
         Arc::new(test_secrets_store())
     }
@@ -780,6 +891,71 @@ Test skill
         };
         assert!(second_missing[0].auth_url.is_some());
         assert_eq!(ext_mgr.pending_oauth_flows().read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn submit_auth_token_stores_declared_skill_credential() {
+        let _env_guard = crate::config::helpers::lock_env();
+        let store = test_store();
+        let skills_dir = tempfile::tempdir().expect("skills dir");
+        let skill_registry = make_skill_registry_with_google_oauth(skills_dir.path()).await;
+        let mgr = AuthManager::new(Arc::clone(&store), Some(skill_registry), None, None);
+
+        let result = mgr
+            .submit_auth_token("google_oauth_token", "ya29.test-token", "user1")
+            .await
+            .expect("skill credential should store");
+
+        assert!(result.activated);
+        let stored = store
+            .get_decrypted("user1", "google_oauth_token")
+            .await
+            .expect("stored secret");
+        assert_eq!(stored.expose(), "ya29.test-token");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn check_http_missing_credential_starts_skill_oauth_flow_with_custom_client_config() {
+        let _env_guard = crate::config::helpers::lock_env();
+        let _callback_guard = set_test_env_var(
+            "IRONCLAW_OAUTH_CALLBACK_URL",
+            Some("https://example.com/oauth/callback"),
+        );
+
+        let store = test_store();
+        let skills_dir = tempfile::tempdir().expect("skills dir");
+        let skill_registry = make_skill_registry_with_custom_oauth(skills_dir.path()).await;
+        let wasm_tools_dir = tempfile::tempdir().expect("wasm tools dir");
+        let wasm_channels_dir = tempfile::tempdir().expect("wasm channels dir");
+        let ext_mgr = make_extension_manager(
+            Arc::clone(&store),
+            wasm_tools_dir.path(),
+            wasm_channels_dir.path(),
+        );
+        let mgr = AuthManager::new(
+            Arc::clone(&store),
+            Some(skill_registry),
+            Some(Arc::clone(&ext_mgr)),
+            None,
+        );
+        let registry = make_registry_with_mapping("custom_oauth_token", "api.custom.test");
+        let params = serde_json::json!({"url": "https://api.custom.test/v1/me"});
+
+        let result = mgr
+            .check_action_auth("http", &params, "user1", &registry)
+            .await;
+        let AuthCheckResult::MissingCredentials(missing) = result else {
+            panic!("expected missing credential");
+        };
+        let auth_url = missing[0].auth_url.as_ref().expect("oauth auth url");
+        assert!(auth_url.contains("client_id=custom-client-id"));
+
+        let flows = ext_mgr.pending_oauth_flows().read().await;
+        let flow = flows.values().next().expect("pending oauth flow");
+        assert_eq!(flow.client_id, "custom-client-id");
+        assert_eq!(flow.client_secret.as_deref(), Some("custom-client-secret"));
     }
 
     #[tokio::test]

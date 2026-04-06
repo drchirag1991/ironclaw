@@ -1313,27 +1313,79 @@ pub async fn resolve_gate(
                         },
                     );
                 }
-                if let Some(ref ss) = state.secrets_store {
+                if let Some(ref auth_manager) = state.auth_manager {
+                    match auth_manager
+                        .submit_auth_token(credential_name, &token, &message.user_id)
+                        .await
+                    {
+                        Ok(result) if result.activated => {
+                            let _ = agent
+                                .channels
+                                .send_status(
+                                    &message.channel,
+                                    StatusUpdate::AuthCompleted {
+                                        extension_name: credential_name.clone(),
+                                        success: true,
+                                        message: format!("{}. Resuming...", result.message),
+                                    },
+                                    &message.metadata,
+                                )
+                                .await;
+                        }
+                        Ok(result) => {
+                            let _ = agent
+                                .channels
+                                .send_status(
+                                    &message.channel,
+                                    StatusUpdate::AuthRequired {
+                                        extension_name: credential_name.clone(),
+                                        instructions: Some(result.message.clone()),
+                                        auth_url: result.auth_url.clone(),
+                                        setup_url: None,
+                                    },
+                                    &message.metadata,
+                                )
+                                .await;
+                            return Ok(Some(result.message));
+                        }
+                        Err(crate::extensions::ExtensionError::ValidationFailed(msg)) => {
+                            let _ = agent
+                                .channels
+                                .send_status(
+                                    &message.channel,
+                                    StatusUpdate::AuthRequired {
+                                        extension_name: credential_name.clone(),
+                                        instructions: Some(msg.clone()),
+                                        auth_url: None,
+                                        setup_url: None,
+                                    },
+                                    &message.metadata,
+                                )
+                                .await;
+                            return Ok(Some(msg));
+                        }
+                        Err(error) => {
+                            let msg = error.to_string();
+                            let _ = agent
+                                .channels
+                                .send_status(
+                                    &message.channel,
+                                    StatusUpdate::AuthCompleted {
+                                        extension_name: credential_name.clone(),
+                                        success: false,
+                                        message: msg.clone(),
+                                    },
+                                    &message.metadata,
+                                )
+                                .await;
+                            return Ok(Some(msg));
+                        }
+                    }
+                } else if let Some(ref ss) = state.secrets_store {
                     let params = crate::secrets::CreateSecretParams::new(credential_name, &token);
                     ss.create(&message.user_id, params)
                         .await
                         .map_err(|e| engine_err("secrets", e))?;
-
-                    let _ = agent
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::AuthCompleted {
-                                extension_name: credential_name.clone(),
-                                success: true,
-                                message: format!(
-                                    "Credential '{}' stored. Resuming...",
-                                    credential_name
-                                ),
-                            },
-                            &message.metadata,
-                        )
-                        .await;
                 }
 
                 if pending.action_name == "authentication_fallback"

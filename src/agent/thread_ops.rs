@@ -1716,15 +1716,28 @@ impl Agent {
             }
         }
 
-        let ext_mgr = match self.deps.extension_manager.as_ref() {
-            Some(mgr) => mgr,
-            None => return Ok(Some("Extension manager not available.".to_string())),
+        let auth_manager = self.tools().secrets_store().cloned().map(|secrets| {
+            crate::bridge::auth_manager::AuthManager::new(
+                secrets,
+                self.skill_registry().cloned(),
+                self.deps.extension_manager.clone(),
+                Some(self.tools().clone()),
+            )
+        });
+
+        let result = if let Some(auth_manager) = auth_manager {
+            auth_manager
+                .submit_auth_token(&pending.extension_name, token, &message.user_id)
+                .await
+        } else if let Some(ext_mgr) = self.deps.extension_manager.as_ref() {
+            ext_mgr
+                .configure_token(&pending.extension_name, token, &message.user_id)
+                .await
+        } else {
+            return Ok(Some("Extension manager not available.".to_string()));
         };
 
-        match ext_mgr
-            .configure_token(&pending.extension_name, token, &message.user_id)
-            .await
-        {
+        match result {
             Ok(result) if result.activated => {
                 // Ensure extension is actually activated
                 tracing::info!(
