@@ -11,7 +11,7 @@ use reqwest::Client;
 
 use crate::auth::resolve_secret_for_runtime;
 use crate::context::JobContext;
-use crate::db::Database;
+use crate::db::UserStore;
 use crate::secrets::SecretsStore;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
 use crate::tools::wasm::{InjectedCredentials, SharedCredentialRegistry, inject_credential};
@@ -59,7 +59,7 @@ const USER_AGENT: &str = concat!(
 pub struct HttpTool {
     credential_registry: Option<Arc<SharedCredentialRegistry>>,
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
-    db: Option<Arc<dyn Database>>,
+    role_lookup: Option<Arc<dyn UserStore>>,
 }
 
 impl HttpTool {
@@ -68,7 +68,7 @@ impl HttpTool {
         Self {
             credential_registry: None,
             secrets_store: None,
-            db: None,
+            role_lookup: None,
         }
     }
 
@@ -83,8 +83,8 @@ impl HttpTool {
         self
     }
 
-    pub fn with_database(mut self, db: Arc<dyn Database>) -> Self {
-        self.db = Some(db);
+    pub fn with_role_lookup(mut self, role_lookup: Arc<dyn UserStore>) -> Self {
+        self.role_lookup = Some(role_lookup);
         self
     }
 }
@@ -608,9 +608,9 @@ impl Tool for HttpTool {
                     store.as_ref(),
                     &ctx.user_id,
                     &mapping.secret_name,
-                    self.db.as_deref(),
+                    self.role_lookup.as_deref(),
                     oauth_refresh.as_ref(),
-                    true,
+                    crate::auth::DefaultFallback::AdminOnly,
                 )
                 .await
                 {

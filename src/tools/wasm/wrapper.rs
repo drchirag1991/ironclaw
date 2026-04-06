@@ -18,7 +18,7 @@ use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 use crate::auth::resolve_secret_for_runtime;
 use crate::context::JobContext;
-use crate::db::Database;
+use crate::db::UserStore;
 use crate::llm::recording::{HttpExchangeRequest, HttpExchangeResponse, HttpInterceptor};
 use crate::secrets::SecretsStore;
 use crate::tools::tool::{Tool, ToolDiscoverySummary, ToolError, ToolOutput};
@@ -597,7 +597,7 @@ pub struct WasmToolWrapper {
     /// Used in execute() to pre-decrypt secrets before WASM runs.
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     /// Database for role-aware legacy default-scope credential fallback.
-    db: Option<Arc<dyn Database>>,
+    role_lookup: Option<Arc<dyn UserStore>>,
     /// OAuth refresh configuration for auto-refreshing expired tokens.
     oauth_refresh: Option<OAuthRefreshConfig>,
     /// Optional HTTP interceptor for testing — returns canned responses
@@ -849,7 +849,7 @@ impl WasmToolWrapper {
             capabilities,
             credentials: HashMap::new(),
             secrets_store: None,
-            db: None,
+            role_lookup: None,
             oauth_refresh: None,
             http_interceptor: None,
         }
@@ -913,9 +913,9 @@ impl WasmToolWrapper {
         self
     }
 
-    /// Set the database for role-aware legacy default-scope fallback.
-    pub fn with_database(mut self, db: Arc<dyn Database>) -> Self {
-        self.db = Some(db);
+    /// Set the role lookup for admin-only legacy default-scope fallback.
+    pub fn with_role_lookup(mut self, role_lookup: Arc<dyn UserStore>) -> Self {
+        self.role_lookup = Some(role_lookup);
         self
     }
 
@@ -1165,7 +1165,7 @@ impl Tool for WasmToolWrapper {
             &self.capabilities,
             self.secrets_store.as_deref(),
             credential_user_id,
-            self.db.as_deref(),
+            self.role_lookup.as_deref(),
             self.oauth_refresh.as_ref(),
         )
         .await;
@@ -1193,7 +1193,7 @@ impl Tool for WasmToolWrapper {
                 discovery_summary,
                 credentials,
                 secrets_store: None, // Not needed in blocking task
-                db: None,
+                role_lookup: None,
                 oauth_refresh: None, // Already used above for pre-refresh
                 http_interceptor: self.http_interceptor.clone(),
             };
@@ -1270,7 +1270,7 @@ async fn resolve_host_credentials(
     capabilities: &Capabilities,
     store: Option<&(dyn SecretsStore + Send + Sync)>,
     user_id: &str,
-    db: Option<&dyn Database>,
+    role_lookup: Option<&dyn UserStore>,
     oauth_refresh: Option<&OAuthRefreshConfig>,
 ) -> Vec<ResolvedHostCredential> {
     let store = match store {
@@ -1313,9 +1313,9 @@ async fn resolve_host_credentials(
             store,
             user_id,
             &mapping.secret_name,
-            db,
+            role_lookup,
             oauth_refresh.filter(|config| config.secret_name == mapping.secret_name),
-            true,
+            crate::auth::DefaultFallback::AdminOnly,
         )
         .await
         {

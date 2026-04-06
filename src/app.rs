@@ -517,7 +517,8 @@ impl AppBuilder {
                         loader = loader.with_secrets_store(Arc::clone(secrets));
                     }
                     if let Some(ref db) = db {
-                        loader = loader.with_database(Arc::clone(db));
+                        loader = loader
+                            .with_role_lookup(Arc::clone(db) as Arc<dyn crate::db::UserStore>);
                     }
 
                     match loader.load_from_dir(&wasm_config.tools_dir).await {

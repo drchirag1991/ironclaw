@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::context::ContextManager;
-use crate::db::Database;
+use crate::db::{Database, UserStore};
 use crate::extensions::ExtensionManager;
 use crate::llm::{LlmProvider, ToolDefinition};
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -123,6 +123,8 @@ pub struct ToolRegistry {
     credential_registry: Option<Arc<SharedCredentialRegistry>>,
     /// Secrets store for credential injection (shared with HTTP tool).
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    /// Narrow role lookup used by runtime credential fallback.
+    role_lookup: Option<Arc<dyn UserStore>>,
     /// Database handle for user-role checks in multi-tenant credential fallback.
     db: Option<Arc<dyn Database>>,
     /// Shared rate limiter for built-in tool invocations.
@@ -148,6 +150,7 @@ impl ToolRegistry {
             builtin_names: RwLock::new(std::collections::HashSet::new()),
             credential_registry: None,
             secrets_store: None,
+            role_lookup: None,
             db: None,
             rate_limiter: RateLimiter::new(),
             message_tool: RwLock::new(None),
@@ -167,7 +170,13 @@ impl ToolRegistry {
 
     /// Attach a database handle for user-role aware tool behavior.
     pub fn with_database(mut self, db: Arc<dyn Database>) -> Self {
+        self.role_lookup = Some(Arc::clone(&db) as Arc<dyn UserStore>);
         self.db = Some(db);
+        self
+    }
+
+    pub fn with_role_lookup(mut self, role_lookup: Arc<dyn UserStore>) -> Self {
+        self.role_lookup = Some(role_lookup);
         self
     }
 
@@ -188,6 +197,10 @@ impl ToolRegistry {
 
     pub fn database(&self) -> Option<&Arc<dyn Database>> {
         self.db.as_ref()
+    }
+
+    pub fn role_lookup(&self) -> Option<&Arc<dyn UserStore>> {
+        self.role_lookup.as_ref()
     }
 
     /// Register a tool. Rejects dynamic tools that try to shadow a protected built-in name.
@@ -344,8 +357,8 @@ impl ToolRegistry {
         if let (Some(cr), Some(ss)) = (&self.credential_registry, &self.secrets_store) {
             http = http.with_credentials(Arc::clone(cr), Arc::clone(ss));
         }
-        if let Some(db) = &self.db {
-            http = http.with_database(Arc::clone(db));
+        if let Some(role_lookup) = &self.role_lookup {
+            http = http.with_role_lookup(Arc::clone(role_lookup));
         }
         self.register_sync(Arc::new(http));
 
@@ -828,8 +841,8 @@ impl ToolRegistry {
         if let Some(store) = reg.secrets_store {
             wrapper = wrapper.with_secrets_store(store);
         }
-        if let Some(db) = reg.db {
-            wrapper = wrapper.with_database(db);
+        if let Some(role_lookup) = reg.role_lookup {
+            wrapper = wrapper.with_role_lookup(role_lookup);
         }
         if let Some(oauth) = oauth_refresh.clone() {
             wrapper = wrapper.with_oauth_refresh(oauth);
@@ -907,7 +920,7 @@ impl ToolRegistry {
             schema: Some(tool_with_binary.tool.parameters_schema.clone()),
             discovery_summary: None,
             secrets_store: self.secrets_store.clone(),
-            db: self.db.clone(),
+            role_lookup: self.role_lookup.clone(),
             oauth_refresh: None,
         })
         .await
@@ -954,8 +967,8 @@ pub struct WasmToolRegistration<'a> {
     pub discovery_summary: Option<ToolDiscoverySummary>,
     /// Secrets store for credential injection at request time.
     pub secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
-    /// Database for user-role aware fallback decisions.
-    pub db: Option<Arc<dyn Database>>,
+    /// Narrow role lookup for user-role aware fallback decisions.
+    pub role_lookup: Option<Arc<dyn UserStore>>,
     /// OAuth refresh configuration for auto-refreshing expired tokens.
     pub oauth_refresh: Option<OAuthRefreshConfig>,
 }

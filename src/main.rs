@@ -980,6 +980,15 @@ async fn async_main() -> anyhow::Result<()> {
         .as_ref()
         .map(|db| Arc::clone(db) as Arc<dyn ironclaw::db::SettingsStore>);
 
+    let auth_manager = components.tools.secrets_store().cloned().map(|secrets| {
+        Arc::new(ironclaw::bridge::auth_manager::AuthManager::new(
+            secrets,
+            components.skill_registry.clone(),
+            components.extension_manager.clone(),
+            Some(Arc::clone(&components.tools)),
+        ))
+    });
+
     let deps = AgentDeps {
         owner_id: config.owner_id.clone(),
         store: components.db,
@@ -993,6 +1002,7 @@ async fn async_main() -> anyhow::Result<()> {
         skill_catalog: components.skill_catalog,
         skills_config: config.skills.clone(),
         hooks: components.hooks,
+        auth_manager,
         cost_guard: components.cost_guard,
         sse_tx: sse_manager,
         http_interceptor,

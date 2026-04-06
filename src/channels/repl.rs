@@ -15,6 +15,8 @@
 //! - `/compact` - Compact the context
 //! - `/new` - Start a new thread
 //! - `yes`/`no`/`always` - Respond to tool approval prompts
+//!   Approval prompts intentionally stay text-based for parity with other channels;
+//!   there is no arrow-key selector path.
 //! - `Esc` - Interrupt current operation
 
 use std::borrow::Cow;

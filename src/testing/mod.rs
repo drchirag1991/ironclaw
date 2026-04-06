@@ -557,6 +557,7 @@ impl TestHarnessBuilder {
             skill_catalog: None,
             skills_config: SkillsConfig::default(),
             hooks,
+            auth_manager: None,
             cost_guard,
             sse_tx: None,
             http_interceptor: None,

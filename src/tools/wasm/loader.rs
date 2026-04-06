@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use tokio::fs;
 
-use crate::db::Database;
+use crate::db::UserStore;
 use crate::secrets::SecretsStore;
 use crate::tools::registry::{ToolRegistry, WasmRegistrationError, WasmToolRegistration};
 use crate::tools::wasm::capabilities_schema::CapabilitiesFile;
@@ -83,7 +83,7 @@ pub struct WasmToolLoader {
     runtime: Arc<WasmToolRuntime>,
     registry: Arc<ToolRegistry>,
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
-    db: Option<Arc<dyn Database>>,
+    role_lookup: Option<Arc<dyn UserStore>>,
 }
 
 impl WasmToolLoader {
@@ -93,7 +93,7 @@ impl WasmToolLoader {
             runtime,
             registry,
             secrets_store: None,
-            db: None,
+            role_lookup: None,
         }
     }
 
@@ -103,8 +103,8 @@ impl WasmToolLoader {
         self
     }
 
-    pub fn with_database(mut self, db: Arc<dyn Database>) -> Self {
-        self.db = Some(db);
+    pub fn with_role_lookup(mut self, role_lookup: Arc<dyn UserStore>) -> Self {
+        self.role_lookup = Some(role_lookup);
         self
     }
 
@@ -193,7 +193,7 @@ impl WasmToolLoader {
                 schema: None,
                 discovery_summary,
                 secrets_store: self.secrets_store.clone(),
-                db: self.db.clone(),
+                role_lookup: self.role_lookup.clone(),
                 oauth_refresh,
             })
             .await?;
@@ -470,6 +470,8 @@ fn resolve_oauth_refresh_config(cap_file: &CapabilitiesFile) -> Option<OAuthRefr
         gateway_token: oauth_proxy_auth_token,
         secret_name: auth.secret_name.clone(),
         provider: auth.provider.clone(),
+        // TODO: extend WASM tool capabilities so auth.oauth can declare custom
+        // refresh endpoints/params like skills' ProviderRefreshStrategy::Custom.
         extra_refresh_params: HashMap::new(),
     })
 }

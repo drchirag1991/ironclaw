@@ -12,8 +12,9 @@
 use std::sync::Arc;
 
 use crate::auth::{
-    AuthDescriptor, AuthDescriptorKind, OAuthFlowDescriptor, PendingOAuthLaunchParams,
-    build_pending_oauth_launch, resolve_secret_for_runtime, upsert_auth_descriptor,
+    AuthDescriptor, AuthDescriptorKind, DefaultFallback, OAuthFlowDescriptor,
+    PendingOAuthLaunchParams, build_pending_oauth_launch, resolve_secret_for_runtime,
+    upsert_auth_descriptor,
 };
 use crate::extensions::naming::canonicalize_extension_name;
 use crate::extensions::{ConfigureResult, ExtensionError};
@@ -187,17 +188,17 @@ impl AuthManager {
         let mut missing = Vec::new();
         for mapping in &matched {
             let oauth_refresh = credential_registry.oauth_refresh_for_secret(&mapping.secret_name);
-            let db = self
+            let role_lookup = self
                 .tools
                 .as_ref()
-                .and_then(|tools| tools.database().map(Arc::as_ref));
+                .and_then(|tools| tools.role_lookup().map(Arc::as_ref));
             match resolve_secret_for_runtime(
                 self.secrets_store.as_ref(),
                 user_id,
                 &mapping.secret_name,
-                db,
+                role_lookup,
                 oauth_refresh.as_ref(),
-                true,
+                DefaultFallback::AdminOnly,
             )
             .await
             {

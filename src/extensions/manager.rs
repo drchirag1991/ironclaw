@@ -1700,6 +1700,10 @@ impl ExtensionManager {
     }
 
     pub async fn provider_action_names(&self, provider_extension: &str) -> Vec<String> {
+        // Active providers surface either a bare provider action (if one is
+        // actually registered) or concrete `{provider}_*` actions. The bare
+        // latent provider action itself is synthetic and is resolved before
+        // execution reaches this helper.
         let prefix = format!("{}_", provider_extension);
         let mut actions: Vec<String> = self
             .tool_registry
@@ -3763,6 +3767,9 @@ impl ExtensionManager {
             return true;
         }
 
+        // Metadata discovery uses the bounded MCP OAuth client timeouts in
+        // `discover_full_oauth_metadata()`, so this list-path probe cannot hang
+        // indefinitely on a hostile or slow server URL.
         match discover_full_oauth_metadata(&server.url).await {
             Ok(_) => true,
             Err(crate::tools::mcp::auth::AuthError::NotSupported) => false,
@@ -5074,7 +5081,7 @@ impl ExtensionManager {
         let mut loader = WasmToolLoader::new(Arc::clone(runtime), Arc::clone(&self.tool_registry))
             .with_secrets_store(Arc::clone(&self.secrets));
         if let Some(ref db) = self.store {
-            loader = loader.with_database(Arc::clone(db));
+            loader = loader.with_role_lookup(Arc::clone(db) as Arc<dyn crate::db::UserStore>);
         }
         loader
             .load_from_files(name, &wasm_path, cap_path_option)

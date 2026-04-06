@@ -884,6 +884,7 @@ impl TestRigBuilder {
             skill_catalog: components.skill_catalog,
             skills_config: components.config.skills.clone(),
             hooks: components.hooks,
+            auth_manager: None,
             cost_guard: components.cost_guard,
             sse_tx: None,
             http_interceptor,

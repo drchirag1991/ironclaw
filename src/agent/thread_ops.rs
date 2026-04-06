@@ -1806,13 +1806,15 @@ impl Agent {
             }
         }
 
-        let auth_manager = self.tools().secrets_store().cloned().map(|secrets| {
-            crate::bridge::auth_manager::AuthManager::new(
-                secrets,
-                self.skill_registry().cloned(),
-                self.deps.extension_manager.clone(),
-                Some(self.tools().clone()),
-            )
+        let auth_manager = self.deps.auth_manager.clone().or_else(|| {
+            self.tools().secrets_store().cloned().map(|secrets| {
+                Arc::new(crate::bridge::auth_manager::AuthManager::new(
+                    secrets,
+                    self.skill_registry().cloned(),
+                    self.deps.extension_manager.clone(),
+                    Some(self.tools().clone()),
+                ))
+            })
         });
 
         let result = if let Some(auth_manager) = auth_manager {

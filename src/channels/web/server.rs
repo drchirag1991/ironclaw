@@ -409,6 +409,8 @@ pub struct GatewayState {
     pub skill_registry: Option<Arc<std::sync::RwLock<ironclaw_skills::SkillRegistry>>>,
     /// Skill catalog for searching the ClawHub registry.
     pub skill_catalog: Option<Arc<ironclaw_skills::catalog::SkillCatalog>>,
+    /// Shared auth manager for gateway auth submission and readiness checks.
+    pub auth_manager: Option<Arc<crate::bridge::auth_manager::AuthManager>>,
     /// Scheduler for sending follow-up messages to running agent jobs.
     pub scheduler: Option<crate::tools::builtin::SchedulerSlot>,
     /// Per-user rate limiter for chat endpoints (30 messages per 60 seconds per user).
@@ -1859,23 +1861,28 @@ async fn chat_auth_token_handler(
     }
 
     let auth_manager = state
-        .tool_registry
-        .as_ref()
-        .and_then(|tr| tr.secrets_store().cloned())
-        .or_else(|| state.secrets_store.clone())
+        .auth_manager
+        .clone()
         .or_else(|| {
             state
-                .extension_manager
+                .tool_registry
                 .as_ref()
-                .map(|em| std::sync::Arc::clone(em.secrets()))
-        })
-        .map(|secrets| {
-            crate::bridge::auth_manager::AuthManager::new(
-                secrets,
-                state.skill_registry.clone(),
-                state.extension_manager.clone(),
-                state.tool_registry.clone(),
-            )
+                .and_then(|tr| tr.secrets_store().cloned())
+                .or_else(|| state.secrets_store.clone())
+                .or_else(|| {
+                    state
+                        .extension_manager
+                        .as_ref()
+                        .map(|em| std::sync::Arc::clone(em.secrets()))
+                })
+                .map(|secrets| {
+                    Arc::new(crate::bridge::auth_manager::AuthManager::new(
+                        secrets,
+                        state.skill_registry.clone(),
+                        state.extension_manager.clone(),
+                        state.tool_registry.clone(),
+                    ))
+                })
         })
         .ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3469,6 +3476,7 @@ mod tests {
             llm_provider: None,
             skill_registry: None,
             skill_catalog: None,
+            auth_manager: None,
             scheduler: None,
             chat_rate_limiter: PerUserRateLimiter::new(30, 60),
             oauth_rate_limiter: PerUserRateLimiter::new(20, 60),

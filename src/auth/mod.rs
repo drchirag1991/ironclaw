@@ -6,11 +6,19 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::oauth_defaults;
-use crate::db::{Database, SettingsStore};
+use crate::db::{SettingsStore, UserStore};
 use crate::secrets::{CreateSecretParams, DecryptedSecret, SecretError, SecretsStore};
 use crate::tools::wasm::OAuthRefreshConfig;
 
 const AUTH_DESCRIPTORS_SETTING_KEY: &str = "auth.descriptors_v1";
+
+fn auth_descriptor_cache()
+-> &'static tokio::sync::Mutex<HashMap<String, HashMap<String, AuthDescriptor>>> {
+    static CACHE: std::sync::OnceLock<
+        tokio::sync::Mutex<HashMap<String, HashMap<String, AuthDescriptor>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AuthDescriptorKind {
@@ -141,14 +149,30 @@ async fn load_auth_descriptors(
     store: &dyn SettingsStore,
     user_id: &str,
 ) -> Result<HashMap<String, AuthDescriptor>, crate::error::DatabaseError> {
-    match store
+    debug_assert_ne!(
+        user_id, "default",
+        "auth descriptors should remain user-scoped; global reads must stay explicit"
+    );
+
+    let cache = auth_descriptor_cache();
+    if let Some(descriptors) = cache.lock().await.get(user_id).cloned() {
+        return Ok(descriptors);
+    }
+
+    let descriptors = match store
         .get_setting(user_id, AUTH_DESCRIPTORS_SETTING_KEY)
         .await?
     {
         Some(value) => serde_json::from_value(value)
             .map_err(|error| crate::error::DatabaseError::Query(error.to_string())),
         None => Ok(HashMap::new()),
-    }
+    }?;
+
+    cache
+        .lock()
+        .await
+        .insert(user_id.to_string(), descriptors.clone());
+    Ok(descriptors)
 }
 
 pub async fn auth_descriptor_for_secret(
@@ -217,7 +241,13 @@ pub async fn upsert_auth_descriptor(
             error = %error,
             "Failed to persist auth descriptor"
         );
+        return;
     }
+
+    auth_descriptor_cache()
+        .lock()
+        .await
+        .insert(user_id.to_string(), descriptors);
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -240,13 +270,13 @@ async fn refresh_lock(secret_name: &str, user_id: &str) -> Arc<tokio::sync::Mute
 
     let registry = LOCKS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
     let mut locks = registry.lock().await;
-    locks.retain(|_, lock| lock.strong_count() > 0);
 
     let key = refresh_lock_key(secret_name, user_id);
     if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
         return lock;
     }
 
+    locks.retain(|_, lock| lock.strong_count() > 0);
     let lock = Arc::new(tokio::sync::Mutex::new(()));
     locks.insert(key, Arc::downgrade(&lock));
     lock
@@ -293,15 +323,18 @@ impl CredentialResolutionError {
     }
 }
 
-pub async fn can_use_default_credential_fallback(db: Option<&dyn Database>, user_id: &str) -> bool {
-    let Some(db) = db else {
+pub async fn can_use_default_credential_fallback(
+    role_lookup: Option<&dyn UserStore>,
+    user_id: &str,
+) -> bool {
+    let Some(role_lookup) = role_lookup else {
         return false;
     };
     if user_id == "default" {
         return false;
     }
 
-    match db.get_user(user_id).await {
+    match role_lookup.get_user(user_id).await {
         Ok(Some(user)) => user.role == "admin",
         Ok(None) => false,
         Err(error) => {
@@ -370,55 +403,13 @@ async fn persist_refreshed_oauth_tokens(
 }
 
 fn reject_private_ip(url: &str) -> Result<(), &'static str> {
-    let parsed = match reqwest::Url::parse(url) {
-        Ok(url) => url,
-        Err(_) => return Err("invalid URL"),
-    };
+    crate::tools::wasm::reject_private_ip(url).map_err(|_| "host resolves to private/internal IP")
+}
 
-    let Some(host) = parsed.host_str() else {
-        return Err("missing host");
-    };
-
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let dangerous = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_private()
-                    || v4.is_loopback()
-                    || v4.is_link_local()
-                    || v4.is_broadcast()
-                    || v4.is_unspecified()
-                    || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
-                    || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_unique_local()
-                    || v6.is_unicast_link_local()
-                    || v6.is_multicast()
-                    || v6
-                        .to_ipv4_mapped()
-                        .is_some_and(|v4| match std::net::IpAddr::V4(v4) {
-                            std::net::IpAddr::V4(v4) => {
-                                v4.is_private()
-                                    || v4.is_loopback()
-                                    || v4.is_link_local()
-                                    || v4.is_broadcast()
-                                    || v4.is_unspecified()
-                                    || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
-                                    || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-                            }
-                            std::net::IpAddr::V6(_) => false,
-                        })
-            }
-        };
-
-        if dangerous {
-            return Err("host resolves to private/internal IP");
-        }
-    }
-
-    Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultFallback {
+    Denied,
+    AdminOnly,
 }
 
 pub async fn refresh_oauth_access_token(
@@ -632,16 +623,16 @@ pub async fn resolve_secret_for_runtime(
     store: &(dyn SecretsStore + Send + Sync),
     user_id: &str,
     secret_name: &str,
-    db: Option<&dyn Database>,
+    role_lookup: Option<&dyn UserStore>,
     oauth_refresh: Option<&OAuthRefreshConfig>,
-    allow_admin_default_fallback: bool,
+    default_fallback: DefaultFallback,
 ) -> Result<DecryptedSecret, CredentialResolutionError> {
     match load_secret_for_scope(store, user_id, secret_name, oauth_refresh).await {
         Ok(secret) => return Ok(secret),
         Err(error)
             if error.requires_authentication()
-                && allow_admin_default_fallback
-                && can_use_default_credential_fallback(db, user_id).await =>
+                && default_fallback == DefaultFallback::AdminOnly
+                && can_use_default_credential_fallback(role_lookup, user_id).await =>
         {
             tracing::debug!(
                 secret_name = %secret_name,

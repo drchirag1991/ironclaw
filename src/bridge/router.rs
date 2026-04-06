@@ -533,7 +533,11 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         has_credential_registry = has_cred_reg,
         "engine v2: auth manager init check"
     );
-    let auth_manager = if let Some(ss) = agent.tools().secrets_store().cloned() {
+    let auth_manager = if let Some(mgr) = agent.deps.auth_manager.clone() {
+        effect_adapter.set_auth_manager(Arc::clone(&mgr)).await;
+        debug!("engine v2: auth manager set on effect adapter");
+        Some(mgr)
+    } else if let Some(ss) = agent.tools().secrets_store().cloned() {
         let mgr = Arc::new(AuthManager::new(
             ss,
             agent.deps.skill_registry.clone(),
@@ -3588,6 +3592,7 @@ mod tests {
             skill_catalog: None,
             skills_config: crate::config::SkillsConfig::default(),
             hooks: Arc::new(crate::hooks::HookRegistry::new()),
+            auth_manager: None,
             cost_guard: Arc::new(crate::agent::cost_guard::CostGuard::new(
                 crate::agent::cost_guard::CostGuardConfig::default(),
             )),
