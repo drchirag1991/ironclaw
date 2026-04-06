@@ -75,6 +75,8 @@ pub enum InputAction {
     ThreadPickerSelect,
     /// Close the thread picker.
     ThreadPickerClose,
+    /// Jump to the bottom of the conversation.
+    ScrollToBottom,
     /// No recognized action — pass to input box.
     Forward,
 }
@@ -135,6 +137,8 @@ pub fn map_key(
         // Ctrl+Up / Ctrl+Down for scroll
         (KeyCode::Up, KeyModifiers::CONTROL) => InputAction::ScrollUp,
         (KeyCode::Down, KeyModifiers::CONTROL) => InputAction::ScrollDown,
+        // End key jumps to bottom
+        (KeyCode::End, _) => InputAction::ScrollToBottom,
         // Ctrl+P / Ctrl+N for input history navigation
         (KeyCode::Char('p'), KeyModifiers::CONTROL) => InputAction::HistoryUp,
         (KeyCode::Char('n'), KeyModifiers::CONTROL) => InputAction::HistoryDown,

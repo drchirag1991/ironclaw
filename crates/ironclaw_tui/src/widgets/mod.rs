@@ -64,6 +64,15 @@ pub struct AppState {
     /// Scroll offset in the conversation (0 = bottom / most recent).
     pub scroll_offset: u16,
 
+    /// Whether the conversation auto-scrolls to follow new content.
+    pub pinned_to_bottom: bool,
+
+    /// Maximum valid scroll offset (set during render).
+    pub max_scroll_offset: u16,
+
+    /// Last known conversation area height in rows (set during render).
+    pub conversation_height: u16,
+
     /// Currently active tools (name -> started_at).
     pub active_tools: Vec<ToolActivity>,
 
@@ -215,6 +224,9 @@ impl Default for AppState {
             total_cost_usd: "$0.00".to_string(),
             messages: Vec::new(),
             scroll_offset: 0,
+            pinned_to_bottom: true,
+            max_scroll_offset: 0,
+            conversation_height: 0,
             active_tools: Vec::new(),
             recent_tools: Vec::new(),
             threads: Vec::new(),

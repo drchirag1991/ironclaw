@@ -183,7 +183,7 @@ async fn run_tui(
                     kind: MouseEventKind::ScrollUp,
                     ..
                 }))) => {
-                    if poll_tx.send(TuiEvent::MouseScroll(-3)).await.is_err() {
+                    if poll_tx.send(TuiEvent::MouseScroll(-1)).await.is_err() {
                         break;
                     }
                 }
@@ -191,7 +191,7 @@ async fn run_tui(
                     kind: MouseEventKind::ScrollDown,
                     ..
                 }))) => {
-                    if poll_tx.send(TuiEvent::MouseScroll(3)).await.is_err() {
+                    if poll_tx.send(TuiEvent::MouseScroll(1)).await.is_err() {
                         break;
                     }
                 }
@@ -434,6 +434,7 @@ async fn handle_event(
                             cost_summary: None,
                         });
                         state.scroll_offset = 0;
+                        state.pinned_to_bottom = true;
                         if let Some(model) = selected_model {
                             state.model = model;
                         }
@@ -466,7 +467,8 @@ async fn handle_event(
                 }
                 InputAction::ScrollUp => match state.active_tab {
                     ActiveTab::Conversation => {
-                        widgets.conversation.scroll(state, -5);
+                        let page = state.conversation_height.max(2).saturating_sub(2) as i16;
+                        widgets.conversation.scroll(state, -page);
                     }
                     ActiveTab::Logs => {
                         LogsWidget::scroll(state, -5);
@@ -474,12 +476,17 @@ async fn handle_event(
                 },
                 InputAction::ScrollDown => match state.active_tab {
                     ActiveTab::Conversation => {
-                        widgets.conversation.scroll(state, 5);
+                        let page = state.conversation_height.max(2).saturating_sub(2) as i16;
+                        widgets.conversation.scroll(state, page);
                     }
                     ActiveTab::Logs => {
                         LogsWidget::scroll(state, 5);
                     }
                 },
+                InputAction::ScrollToBottom => {
+                    state.scroll_offset = 0;
+                    state.pinned_to_bottom = true;
+                }
                 InputAction::Interrupt => {
                     let _ = msg_tx
                         .send(
@@ -625,6 +632,7 @@ async fn handle_event(
                                 cost_summary: None,
                             });
                             state.scroll_offset = 0;
+                            state.pinned_to_bottom = true;
 
                             if let Some(model) = command.strip_prefix("/model ") {
                                 state.model = model.to_string();
@@ -678,6 +686,7 @@ async fn handle_event(
                                         cost_summary: None,
                                     });
                                     state.scroll_offset = 0;
+                                    state.pinned_to_bottom = true;
 
                                     update_local_thread_scope_after_submit(state, &command);
                                     let thread_id = outgoing_thread_scope(
@@ -1033,6 +1042,7 @@ async fn handle_event(
                 });
             }
             state.scroll_offset = 0;
+            state.pinned_to_bottom = true;
         }
 
         TuiEvent::Status(msg) => {
@@ -1074,6 +1084,7 @@ async fn handle_event(
                 });
             }
             state.scroll_offset = 0;
+            state.pinned_to_bottom = true;
             state.active_tools.clear();
 
             if let Some((active_model, models)) = parsed_model_response {
@@ -1407,6 +1418,7 @@ async fn handle_event(
             }
 
             state.scroll_offset = 0;
+            state.pinned_to_bottom = true;
             state.toasts.push(Toast {
                 message: format!("Resumed conversation ({} messages)", state.messages.len()),
                 kind: ToastKind::Info,
@@ -2069,6 +2081,9 @@ fn render_frame(
     widgets
         .tab_bar
         .render(tab_bar_area, frame.buffer_mut(), state);
+
+    // Track conversation area height for page-scroll calculations
+    state.conversation_height = main_area.height;
 
     // Main area: conversation/logs | sidebar
     match state.active_tab {

@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Widget;
+use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
 
 use crate::layout::TuiSlot;
 use unicode_width::UnicodeWidthStr;
@@ -34,6 +34,10 @@ const BANNER_TAGLINE: &str = "Secure AI Assistant";
 struct ConversationRenderCache {
     usable_width: usize,
     messages: Vec<CachedRenderedMessage>,
+    /// Total content lines computed during last render (used for scroll clamping).
+    total_lines: usize,
+    /// Visible height during last render (used for scroll clamping).
+    visible_height: usize,
 }
 
 struct CachedRenderedMessage {
@@ -230,7 +234,17 @@ impl TuiWidget for ConversationWidget {
         // Compute visible window (scroll from bottom)
         let visible_height = area.height as usize;
         let total_lines = all_lines.len();
-        let scroll = state.scroll_offset as usize;
+
+        // Store for scroll clamping in scroll()
+        if let Ok(mut cache) = self.render_cache.write() {
+            cache.total_lines = total_lines;
+            cache.visible_height = visible_height;
+        }
+
+        // Clamp scroll offset to valid range
+        let max_scroll = total_lines.saturating_sub(visible_height);
+        let scroll = (state.scroll_offset as usize).min(max_scroll);
+
         let start = total_lines.saturating_sub(visible_height + scroll);
         let end = total_lines.saturating_sub(scroll).min(total_lines);
 
@@ -257,7 +271,6 @@ impl TuiWidget for ConversationWidget {
                 Span::styled(match_info, self.theme.dim_style()),
             ]);
             visible.insert(0, search_line);
-            // Remove the last line to keep the total count consistent
             if visible.len() > visible_height {
                 visible.pop();
             }
@@ -277,8 +290,33 @@ impl TuiWidget for ConversationWidget {
             }
         }
 
+        // "↓ N more" indicator at bottom when scrolled up
+        if scroll > 0 {
+            let indicator = format!("\u{2193} {scroll} more \u{2193} End to return ");
+            if let Some(last) = visible.last_mut() {
+                let pad_len = (area.width as usize).saturating_sub(indicator.len() + 1);
+                *last = Line::from(vec![
+                    Span::styled(" ".repeat(pad_len), self.theme.dim_style()),
+                    Span::styled(indicator, self.theme.accent_style()),
+                ]);
+            }
+        }
+
         let paragraph = ratatui::widgets::Paragraph::new(visible);
         paragraph.render(area, buf);
+
+        // Render scrollbar when content exceeds viewport
+        if total_lines > visible_height {
+            let position = total_lines.saturating_sub(visible_height + scroll);
+            let mut scrollbar_state =
+                ScrollbarState::new(total_lines.saturating_sub(visible_height)).position(position);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("\u{2502}"))
+                .thumb_symbol("\u{2503}");
+            scrollbar.render(area, buf, &mut scrollbar_state);
+        }
     }
 }
 
@@ -831,12 +869,29 @@ impl ConversationWidget {
         ])
     }
 
-    /// Handle scroll up/down. Returns true if scrolling occurred.
+    /// Handle scroll up/down with clamping and auto-follow management.
     pub fn scroll(&self, state: &mut AppState, delta: i16) {
+        let max_scroll = {
+            let cache = match self.render_cache.read() {
+                Ok(c) => c,
+                Err(p) => p.into_inner(),
+            };
+            cache.total_lines.saturating_sub(cache.visible_height) as u16
+        };
+
         if delta < 0 {
-            state.scroll_offset = state.scroll_offset.saturating_add(delta.unsigned_abs());
+            // Scrolling up
+            state.scroll_offset = state
+                .scroll_offset
+                .saturating_add(delta.unsigned_abs())
+                .min(max_scroll);
+            state.pinned_to_bottom = false;
         } else {
+            // Scrolling down
             state.scroll_offset = state.scroll_offset.saturating_sub(delta as u16);
+            if state.scroll_offset == 0 {
+                state.pinned_to_bottom = true;
+            }
         }
     }
 }
