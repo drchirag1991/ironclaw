@@ -62,6 +62,7 @@ use crate::tools::wasm::{
 };
 use ironclaw_safety::LeakDetector;
 
+#[cfg(any(test, debug_assertions))]
 const TEST_HTTP_REWRITE_MAP_ENV: &str = "IRONCLAW_TEST_HTTP_REWRITE_MAP";
 
 const WEBSOCKET_EVENT_QUEUE_RELATIVE_PATH: &str = "state/gateway_event_queue";
@@ -3984,6 +3985,7 @@ fn extract_host_from_url(url: &str) -> Option<String> {
 ///
 /// The replacement preserves the original path and query string so tests can
 /// point production hosts at local fakes without adding channel-specific code.
+#[cfg(any(test, debug_assertions))]
 fn rewrite_http_url_for_testing(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -4004,6 +4006,12 @@ fn rewrite_http_url_for_testing(url: &str) -> Option<String> {
     Some(rewritten)
 }
 
+#[cfg(not(any(test, debug_assertions)))]
+fn rewrite_http_url_for_testing(_url: &str) -> Option<String> {
+    None
+}
+
+#[cfg(any(test, debug_assertions))]
 fn parse_test_http_rewrite_map(raw: &str) -> HashMap<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
