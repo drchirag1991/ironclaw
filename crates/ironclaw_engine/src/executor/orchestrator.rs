@@ -1695,7 +1695,7 @@ async fn handle_list_skills(
     };
 
     // Use shared listing: user's own skills + system/admin-installed skills.
-    let docs = match store
+    let mut docs = match store
         .list_memory_docs_with_shared(thread.project_id, &thread.user_id)
         .await
     {
@@ -1705,6 +1705,21 @@ async fn handle_list_skills(
             return ExtFunctionResult::Return(json_to_monty(&serde_json::json!([])));
         }
     };
+
+    // Fallback: if no skills in user's project, check the owner's project.
+    // Gateway users get their own per-user project which doesn't contain
+    // admin-installed skills — those live in the owner's default project.
+    let has_skills = docs
+        .iter()
+        .any(|d| d.doc_type == crate::types::memory::DocType::Skill);
+    if !has_skills
+        && let Some(fallback_project) = thread.config.skill_project_id
+        && let Ok(fallback_docs) = store
+            .list_memory_docs_with_shared(fallback_project, &thread.user_id)
+            .await
+    {
+        docs.extend(fallback_docs);
+    }
 
     let skills: Vec<serde_json::Value> = docs
         .into_iter()
