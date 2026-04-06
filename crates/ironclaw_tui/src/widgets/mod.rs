@@ -263,11 +263,21 @@ impl Default for AppState {
     }
 }
 
-/// Last rendered terminal contents, one symbol per cell.
-#[derive(Debug, Clone, Default)]
+/// Last rendered terminal contents.
+#[derive(Debug, Clone)]
 pub struct ScreenSnapshot {
     pub area: Rect,
-    pub rows: Vec<Vec<String>>,
+    pub buffer: Buffer,
+}
+
+impl Default for ScreenSnapshot {
+    fn default() -> Self {
+        let area = Rect::default();
+        Self {
+            area,
+            buffer: Buffer::empty(area),
+        }
+    }
 }
 
 /// A single terminal-cell coordinate.
@@ -286,7 +296,7 @@ pub struct TextSelection {
 }
 
 /// A message in the conversation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: MessageRole,
     pub content: String,
@@ -296,7 +306,7 @@ pub struct ChatMessage {
 }
 
 /// Per-turn token usage and cost information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnCostSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -423,8 +433,8 @@ pub struct EngineThreadInfo {
     pub status: ThreadStatus,
     pub step_count: usize,
     pub total_tokens: u64,
-    pub started_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Context pressure status for the status bar.

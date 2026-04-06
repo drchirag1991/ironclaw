@@ -101,17 +101,6 @@ fn infer_context_window(model_id: &str) -> u64 {
         .unwrap_or(model_id)
         .to_string();
 
-    if normalized.starts_with("gpt-5") {
-        if normalized.contains("-chat") {
-            return 128_000;
-        }
-        return 400_000;
-    }
-
-    if normalized.starts_with("gpt-4.1") {
-        return 1_047_576;
-    }
-
     if normalized.contains("claude-opus-4-6") || normalized.contains("claude-sonnet-4-6") {
         return 1_000_000;
     }
@@ -168,6 +157,7 @@ pub struct TuiChannel {
     started: AtomicBool,
     version: String,
     model: String,
+    context_window: u64,
     layout: TuiLayout,
     log_broadcaster: Option<Arc<LogBroadcaster>>,
     tools: Vec<ToolCategory>,
@@ -185,12 +175,14 @@ impl TuiChannel {
         version: impl Into<String>,
         model: impl Into<String>,
     ) -> Self {
+        let model = model.into();
         Self {
             user_id: user_id.into(),
             event_tx: Arc::new(Mutex::new(None)),
             started: AtomicBool::new(false),
             version: version.into(),
-            model: model.into(),
+            context_window: infer_context_window(&model),
+            model,
             layout: TuiLayout::default(),
             log_broadcaster: None,
             tools: Vec::new(),
@@ -200,6 +192,12 @@ impl TuiChannel {
             identity_files: Vec::new(),
             available_models: Vec::new(),
         }
+    }
+
+    /// Override the initial context window shown in the TUI.
+    pub fn with_context_window(mut self, context_window: u64) -> Self {
+        self.context_window = context_window;
+        self
     }
 
     /// Set the layout configuration.
@@ -269,7 +267,7 @@ impl Channel for TuiChannel {
             version: self.version.clone(),
             model: self.model.clone(),
             layout: self.layout.clone(),
-            context_window: infer_context_window(&self.model),
+            context_window: self.context_window,
             tools: self.tools.clone(),
             skills: self.skills.clone(),
             workspace_path: self.workspace_path.clone(),

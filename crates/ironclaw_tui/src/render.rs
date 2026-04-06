@@ -3,12 +3,12 @@
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::Theme;
 
 /// Convert a plain text string into wrapped `Line`s that fit within `max_width`.
-pub fn wrap_text<'a>(text: &'a str, max_width: usize, style: Style) -> Vec<Line<'a>> {
+pub fn wrap_text(text: &str, max_width: usize, style: Style) -> Vec<Line<'static>> {
     if max_width == 0 {
         return vec![];
     }
@@ -19,28 +19,7 @@ pub fn wrap_text<'a>(text: &'a str, max_width: usize, style: Style) -> Vec<Line<
             lines.push(Line::from(""));
             continue;
         }
-        // Simple word-wrap
-        let words: Vec<&str> = raw_line.split_whitespace().collect();
-        if words.is_empty() {
-            lines.push(Line::from(""));
-            continue;
-        }
-
-        let mut current = String::new();
-        for word in words {
-            if current.is_empty() {
-                current = word.to_string();
-            } else if current.len() + 1 + word.len() <= max_width {
-                current.push(' ');
-                current.push_str(word);
-            } else {
-                lines.push(Line::from(Span::styled(current, style)));
-                current = word.to_string();
-            }
-        }
-        if !current.is_empty() {
-            lines.push(Line::from(Span::styled(current, style)));
-        }
+        lines.extend(wrap_plain_line(raw_line, max_width, style));
     }
 
     if lines.is_empty() {
@@ -48,6 +27,98 @@ pub fn wrap_text<'a>(text: &'a str, max_width: usize, style: Style) -> Vec<Line<
     }
 
     lines
+}
+
+fn wrap_plain_line(raw_line: &str, max_width: usize, style: Style) -> Vec<Line<'static>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_is_whitespace = None;
+
+    for ch in raw_line.chars() {
+        let is_whitespace = ch.is_whitespace();
+        if current_is_whitespace == Some(is_whitespace) || current.is_empty() {
+            push_wrapped_char(&mut current, ch);
+            current_is_whitespace = Some(is_whitespace);
+            continue;
+        }
+
+        tokens.push(std::mem::take(&mut current));
+        push_wrapped_char(&mut current, ch);
+        current_is_whitespace = Some(is_whitespace);
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width = 0usize;
+
+    for token in tokens {
+        let token_width = UnicodeWidthStr::width(token.as_str());
+        if current_width + token_width <= max_width {
+            current_line.push_str(&token);
+            current_width += token_width;
+            continue;
+        }
+
+        if !current_line.is_empty() {
+            lines.push(Line::from(Span::styled(
+                std::mem::take(&mut current_line),
+                style,
+            )));
+            current_width = 0;
+        }
+
+        if token_width <= max_width {
+            current_width = token_width;
+            current_line = token;
+            continue;
+        }
+
+        for ch in token.chars() {
+            let rendered = render_wrapped_char(ch);
+            let rendered_width = wrapped_char_width(ch);
+            if current_width + rendered_width > max_width && !current_line.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    std::mem::take(&mut current_line),
+                    style,
+                )));
+                current_width = 0;
+            }
+            current_line.push_str(&rendered);
+            current_width += rendered_width;
+        }
+    }
+
+    if !current_line.is_empty() {
+        lines.push(Line::from(Span::styled(current_line, style)));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    lines
+}
+
+fn push_wrapped_char(target: &mut String, ch: char) {
+    target.push_str(&render_wrapped_char(ch));
+}
+
+fn render_wrapped_char(ch: char) -> String {
+    match ch {
+        '\t' => "    ".to_string(),
+        _ => ch.to_string(),
+    }
+}
+
+fn wrapped_char_width(ch: char) -> usize {
+    match ch {
+        '\t' => 4,
+        _ => UnicodeWidthChar::width(ch).unwrap_or(0),
+    }
 }
 
 // ── Markdown rendering ────────────────────────────────────────────────
@@ -617,6 +688,13 @@ mod tests {
     use super::*;
     use crate::theme::Theme;
 
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
     // ── wrap_text tests ─────────────────────────────────────────
 
     #[test]
@@ -630,6 +708,12 @@ mod tests {
         let text = "the quick brown fox jumps over the lazy dog";
         let lines = wrap_text(text, 20, Style::default());
         assert!(lines.len() > 1);
+    }
+
+    #[test]
+    fn wrap_text_preserves_consecutive_spaces() {
+        let lines = wrap_text("keep  double   spaces", 80, Style::default());
+        assert_eq!(line_text(&lines[0]), "keep  double   spaces");
     }
 
     #[test]

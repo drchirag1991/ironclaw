@@ -456,6 +456,23 @@ async fn async_main() -> anyhow::Result<()> {
         };
 
         let current_model = components.llm.model_name().to_string();
+        let context_window =
+            match tokio::time::timeout(Duration::from_secs(5), components.llm.model_metadata())
+                .await
+            {
+                Ok(Ok(metadata)) => metadata.context_length.map(u64::from),
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        "TUI context metadata unavailable: could not fetch model metadata: {}",
+                        e
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!("TUI context metadata unavailable: model metadata timed out");
+                    None
+                }
+            };
         let available_models = match tokio::time::timeout(
             Duration::from_secs(5),
             components.llm.list_models(),
@@ -489,6 +506,7 @@ async fn async_main() -> anyhow::Result<()> {
             env!("CARGO_PKG_VERSION"),
             current_model,
         )
+        .with_context_window(context_window.unwrap_or(128_000))
         .with_layout(layout)
         .with_log_broadcaster(Arc::clone(&log_broadcaster))
         .with_tools(tool_categories)

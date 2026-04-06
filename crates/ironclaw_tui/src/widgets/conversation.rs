@@ -1,5 +1,7 @@
 //! Conversation widget: renders chat messages with basic markdown.
 
+use std::sync::RwLock;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -14,7 +16,7 @@ use crate::render::{
 };
 use crate::theme::Theme;
 
-use super::{AppState, MessageRole, ToolActivity, ToolStatus, TuiWidget};
+use super::{AppState, ChatMessage, MessageRole, ToolActivity, ToolStatus, TuiWidget};
 
 /// ASCII art startup banner displayed when the conversation is empty.
 const BANNER: &[&str] = &[
@@ -28,13 +30,35 @@ const BANNER: &[&str] = &[
 /// Tagline shown beneath the ASCII art banner.
 const BANNER_TAGLINE: &str = "Secure AI Assistant";
 
+#[derive(Default)]
+struct ConversationRenderCache {
+    usable_width: usize,
+    messages: Vec<CachedRenderedMessage>,
+}
+
+struct CachedRenderedMessage {
+    message: ChatMessage,
+    is_first_message: bool,
+    lines: Vec<Line<'static>>,
+}
+
+impl CachedRenderedMessage {
+    fn matches(&self, message: &ChatMessage, is_first_message: bool) -> bool {
+        self.is_first_message == is_first_message && self.message == *message
+    }
+}
+
 pub struct ConversationWidget {
     theme: Theme,
+    render_cache: RwLock<ConversationRenderCache>,
 }
 
 impl ConversationWidget {
     pub fn new(theme: Theme) -> Self {
-        Self { theme }
+        Self {
+            theme,
+            render_cache: RwLock::new(ConversationRenderCache::default()),
+        }
     }
 }
 
@@ -53,97 +77,14 @@ impl TuiWidget for ConversationWidget {
         }
 
         let usable_width = (area.width as usize).saturating_sub(4);
-        let mut all_lines: Vec<Line<'_>> = Vec::new();
+        let mut all_lines: Vec<Line<'static>> = Vec::new();
 
         // Welcome block when the conversation is empty
         if state.messages.is_empty() {
             self.render_welcome_screen(state, usable_width, &mut all_lines);
         }
 
-        for msg in &state.messages {
-            let (prefix, style) = match msg.role {
-                MessageRole::User => ("\u{25CF} ", self.theme.accent_style()),
-                MessageRole::Assistant => ("", Style::default().fg(self.theme.fg.to_color())),
-                MessageRole::System => ("\u{25CB} ", self.theme.dim_style()),
-            };
-
-            if msg.role == MessageRole::User {
-                // Blank line before user messages (except first)
-                if !all_lines.is_empty() {
-                    all_lines.push(Line::from(""));
-                }
-                let time_str = msg.timestamp.format("%H:%M").to_string();
-                let user_line = Line::from(vec![
-                    Span::styled(prefix.to_string(), self.theme.accent_style()),
-                    Span::styled(msg.content.clone(), self.theme.bold_style()),
-                    Span::styled(format!("  {time_str}"), self.theme.dim_style()),
-                ]);
-                all_lines.push(user_line);
-                all_lines.push(Line::from(""));
-            } else if msg.role == MessageRole::Assistant {
-                // Separator with label and timestamp before assistant response
-                let time_str = msg.timestamp.format("%H:%M").to_string();
-                let turn_label = " ironclaw ";
-                let time_label = format!(" {time_str} ");
-                let sep_left_len = 2usize;
-                let sep_right_len = usable_width
-                    .min(60)
-                    .saturating_sub(sep_left_len + turn_label.len() + time_label.len());
-                let sep_left = "\u{2500}".repeat(sep_left_len);
-                let sep_right = "\u{2500}".repeat(sep_right_len);
-                all_lines.push(Line::from(vec![
-                    Span::styled(format!("  {sep_left}"), self.theme.dim_style()),
-                    Span::styled(turn_label, self.theme.accent_style()),
-                    Span::styled(sep_right, self.theme.dim_style()),
-                    Span::styled(time_label, self.theme.dim_style()),
-                ]));
-
-                let wrapped =
-                    render_markdown(&msg.content, usable_width.saturating_sub(2), &self.theme);
-                for line in wrapped {
-                    let mut padded = vec![Span::raw("  ".to_string())];
-                    padded.extend(
-                        line.spans
-                            .into_iter()
-                            .map(|s| Span::styled(s.content.to_string(), s.style)),
-                    );
-                    all_lines.push(Line::from(padded));
-                }
-
-                // Per-turn cost summary
-                if let Some(ref cost) = msg.cost_summary {
-                    let cost_line = format!(
-                        "  \u{25CB} {}in + {}out  {}",
-                        format_tokens(cost.input_tokens),
-                        format_tokens(cost.output_tokens),
-                        cost.cost_usd,
-                    );
-                    all_lines.push(Line::from(Span::styled(cost_line, self.theme.dim_style())));
-                }
-
-                all_lines.push(Line::from(""));
-            } else {
-                // System messages with timestamp
-                let time_str = msg.timestamp.format("%H:%M").to_string();
-                let wrapped = wrap_text(&msg.content, usable_width.saturating_sub(8), style);
-                for (i, line) in wrapped.into_iter().enumerate() {
-                    if i == 0 {
-                        let mut spans: Vec<Span<'_>> = line
-                            .spans
-                            .into_iter()
-                            .map(|s| Span::styled(s.content.to_string(), s.style))
-                            .collect();
-                        spans.push(Span::styled(
-                            format!("  {time_str}"),
-                            self.theme.dim_style(),
-                        ));
-                        all_lines.push(Line::from(spans));
-                    } else {
-                        all_lines.push(line);
-                    }
-                }
-            }
-        }
+        self.append_cached_message_lines(state, usable_width, &mut all_lines);
 
         // Inline tool calls (current turn only: tools started after last assistant message)
         let last_assistant_ts = state
@@ -248,7 +189,7 @@ impl TuiWidget for ConversationWidget {
             all_lines = all_lines
                 .into_iter()
                 .map(|line| {
-                    let mut new_spans: Vec<Span<'_>> = Vec::new();
+                    let mut new_spans: Vec<Span<'static>> = Vec::new();
 
                     for span in line.spans {
                         let text = span.content.to_string();
@@ -293,7 +234,7 @@ impl TuiWidget for ConversationWidget {
         let start = total_lines.saturating_sub(visible_height + scroll);
         let end = total_lines.saturating_sub(scroll).min(total_lines);
 
-        let mut visible: Vec<Line<'_>> = all_lines
+        let mut visible: Vec<Line<'static>> = all_lines
             .into_iter()
             .skip(start)
             .take(end.saturating_sub(start))
@@ -342,6 +283,144 @@ impl TuiWidget for ConversationWidget {
 }
 
 impl ConversationWidget {
+    fn append_cached_message_lines(
+        &self,
+        state: &AppState,
+        usable_width: usize,
+        all_lines: &mut Vec<Line<'static>>,
+    ) {
+        let mut cache = match self.render_cache.write() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                tracing::debug!("conversation render cache lock poisoned; continuing");
+                poisoned.into_inner()
+            }
+        };
+        if cache.usable_width != usable_width {
+            cache.usable_width = usable_width;
+            cache.messages.clear();
+        }
+
+        cache.messages.truncate(state.messages.len());
+
+        for (index, message) in state.messages.iter().enumerate() {
+            let is_first_message = index == 0;
+            let needs_refresh = match cache.messages.get(index) {
+                Some(entry) => !entry.matches(message, is_first_message),
+                None => true,
+            };
+
+            if needs_refresh {
+                let rendered = CachedRenderedMessage {
+                    message: message.clone(),
+                    is_first_message,
+                    lines: self.render_message_lines(message, usable_width, is_first_message),
+                };
+
+                if index < cache.messages.len() {
+                    cache.messages[index] = rendered;
+                } else {
+                    cache.messages.push(rendered);
+                }
+            }
+
+            if let Some(entry) = cache.messages.get(index) {
+                all_lines.extend(entry.lines.iter().cloned());
+            }
+        }
+    }
+
+    fn render_message_lines(
+        &self,
+        message: &ChatMessage,
+        usable_width: usize,
+        is_first_message: bool,
+    ) -> Vec<Line<'static>> {
+        match message.role {
+            MessageRole::User => {
+                let mut lines = Vec::new();
+                if !is_first_message {
+                    lines.push(Line::from(""));
+                }
+
+                let time_str = message.timestamp.format("%H:%M").to_string();
+                lines.push(Line::from(vec![
+                    Span::styled("\u{25CF} ".to_string(), self.theme.accent_style()),
+                    Span::styled(message.content.clone(), self.theme.bold_style()),
+                    Span::styled(format!("  {time_str}"), self.theme.dim_style()),
+                ]));
+                lines.push(Line::from(""));
+                lines
+            }
+            MessageRole::Assistant => {
+                let time_str = message.timestamp.format("%H:%M").to_string();
+                let turn_label = " ironclaw ";
+                let time_label = format!(" {time_str} ");
+                let sep_left_len = 2usize;
+                let sep_right_len = usable_width
+                    .min(60)
+                    .saturating_sub(sep_left_len + turn_label.len() + time_label.len());
+                let sep_left = "\u{2500}".repeat(sep_left_len);
+                let sep_right = "\u{2500}".repeat(sep_right_len);
+                let mut lines = vec![Line::from(vec![
+                    Span::styled(format!("  {sep_left}"), self.theme.dim_style()),
+                    Span::styled(turn_label, self.theme.accent_style()),
+                    Span::styled(sep_right, self.theme.dim_style()),
+                    Span::styled(time_label, self.theme.dim_style()),
+                ])];
+
+                for line in render_markdown(
+                    &message.content,
+                    usable_width.saturating_sub(2),
+                    &self.theme,
+                ) {
+                    let mut padded = vec![Span::raw("  ".to_string())];
+                    padded.extend(line.spans);
+                    lines.push(Line::from(padded));
+                }
+
+                if let Some(ref cost) = message.cost_summary {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  \u{25CB} {}in + {}out  {}",
+                            format_tokens(cost.input_tokens),
+                            format_tokens(cost.output_tokens),
+                            cost.cost_usd,
+                        ),
+                        self.theme.dim_style(),
+                    )));
+                }
+
+                lines.push(Line::from(""));
+                lines
+            }
+            MessageRole::System => {
+                let time_str = message.timestamp.format("%H:%M").to_string();
+                let mut lines = Vec::new();
+                for (index, line) in wrap_text(
+                    &message.content,
+                    usable_width.saturating_sub(8),
+                    self.theme.dim_style(),
+                )
+                .into_iter()
+                .enumerate()
+                {
+                    if index == 0 {
+                        let mut spans = line.spans;
+                        spans.push(Span::styled(
+                            format!("  {time_str}"),
+                            self.theme.dim_style(),
+                        ));
+                        lines.push(Line::from(spans));
+                    } else {
+                        lines.push(line);
+                    }
+                }
+                lines
+            }
+        }
+    }
+
     /// Return a category-specific icon and style for the given tool name.
     ///
     /// Categories are detected by simple substring matching on the tool name:
@@ -456,7 +535,7 @@ impl ConversationWidget {
         &self,
         state: &AppState,
         _usable_width: usize,
-        all_lines: &mut Vec<Line<'_>>,
+        all_lines: &mut Vec<Line<'static>>,
     ) {
         let has_tools = !state.welcome_tools.is_empty();
         let has_skills = !state.welcome_skills.is_empty();
@@ -468,7 +547,7 @@ impl ConversationWidget {
         }
 
         // Build left-column lines (banner + metadata)
-        let mut left_lines: Vec<Line<'_>> = Vec::new();
+        let mut left_lines: Vec<Line<'static>> = Vec::new();
 
         // ASCII banner
         for banner_line in BANNER {
@@ -551,7 +630,7 @@ impl ConversationWidget {
         }
 
         // Build right-column lines (tools + skills)
-        let mut right_lines: Vec<Line<'_>> = Vec::new();
+        let mut right_lines: Vec<Line<'static>> = Vec::new();
 
         // Available Tools heading
         if has_tools {
@@ -654,7 +733,7 @@ impl ConversationWidget {
                         .sum();
                     let padding_needed = left_col_width.saturating_sub(left_visual);
 
-                    let mut spans: Vec<Span<'_>> = Vec::new();
+                    let mut spans: Vec<Span<'static>> = Vec::new();
                     for s in &l.spans {
                         spans.push(Span::styled(s.content.to_string(), s.style));
                     }
@@ -665,7 +744,7 @@ impl ConversationWidget {
                     all_lines.push(Line::from(spans));
                 }
                 (Some(l), None) => {
-                    let spans: Vec<Span<'_>> = l
+                    let spans: Vec<Span<'static>> = l
                         .spans
                         .iter()
                         .map(|s| Span::styled(s.content.to_string(), s.style))
@@ -688,7 +767,7 @@ impl ConversationWidget {
     }
 
     /// Simple welcome screen (no tools/skills data).
-    fn render_welcome_simple(&self, state: &AppState, all_lines: &mut Vec<Line<'_>>) {
+    fn render_welcome_simple(&self, state: &AppState, all_lines: &mut Vec<Line<'static>>) {
         for banner_line in BANNER {
             all_lines.push(Line::from(Span::styled(
                 (*banner_line).to_string(),
@@ -727,12 +806,12 @@ impl ConversationWidget {
     }
 
     /// Format a "category: item1, item2, item3, ..." line.
-    fn format_category_line<'a>(
+    fn format_category_line(
         name: &str,
         items: &[String],
         theme: &Theme,
         is_tool: bool,
-    ) -> Line<'a> {
+    ) -> Line<'static> {
         let label_style = if is_tool {
             theme.warning_style()
         } else {

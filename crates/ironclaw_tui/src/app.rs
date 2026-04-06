@@ -325,6 +325,31 @@ fn update_local_thread_scope_after_submit(state: &mut AppState, text: &str) {
     }
 }
 
+fn parse_engine_thread_timestamp(
+    raw: &str,
+    field: &'static str,
+    thread_id: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(parsed.with_timezone(&chrono::Utc));
+    }
+
+    if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M") {
+        return Some(chrono::DateTime::from_naive_utc_and_offset(
+            parsed,
+            chrono::Utc,
+        ));
+    }
+
+    tracing::debug!(
+        thread_id,
+        field,
+        raw,
+        "Failed to parse engine thread timestamp"
+    );
+    None
+}
+
 /// Handle a single TUI event.
 async fn handle_event(
     event: TuiEvent,
@@ -1320,12 +1345,8 @@ async fn handle_event(
                     },
                     step_count: t.step_count,
                     total_tokens: t.total_tokens,
-                    started_at: chrono::DateTime::parse_from_rfc3339(&t.created_at)
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .unwrap_or_else(|_| chrono::Utc::now()),
-                    updated_at: chrono::DateTime::parse_from_rfc3339(&t.updated_at)
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .unwrap_or_else(|_| chrono::Utc::now()),
+                    started_at: parse_engine_thread_timestamp(&t.created_at, "created_at", &t.id),
+                    updated_at: parse_engine_thread_timestamp(&t.updated_at, "updated_at", &t.id),
                 })
                 .collect();
         }
@@ -1896,13 +1917,11 @@ fn extract_selected_text(snapshot: &ScreenSnapshot, selection: &TextSelection) -
 }
 
 fn snapshot_symbol(snapshot: &ScreenSnapshot, column: u16, row: u16) -> Option<&str> {
-    let local_row = row.checked_sub(snapshot.area.y)? as usize;
-    let local_col = column.checked_sub(snapshot.area.x)? as usize;
-    snapshot
-        .rows
-        .get(local_row)?
-        .get(local_col)
-        .map(String::as_str)
+    if !rect_contains(snapshot.area, column, row) {
+        return None;
+    }
+
+    Some(snapshot.buffer[(column, row)].symbol())
 }
 
 /// Render a single frame.
@@ -2283,18 +2302,10 @@ fn render_text_selection(frame: &mut ratatui::Frame<'_>, state: &AppState, layou
 }
 
 fn capture_screen_snapshot(frame: &mut ratatui::Frame<'_>, state: &mut AppState) {
-    let area = frame.area();
-    let mut rows = Vec::with_capacity(area.height as usize);
-
-    for row in area.y..area.y + area.height {
-        let mut cells = Vec::with_capacity(area.width as usize);
-        for column in area.x..area.x + area.width {
-            cells.push(frame.buffer_mut()[(column, row)].symbol().to_string());
-        }
-        rows.push(cells);
-    }
-
-    state.screen_snapshot = ScreenSnapshot { area, rows };
+    state.screen_snapshot = ScreenSnapshot {
+        area: frame.area(),
+        buffer: frame.buffer_mut().clone(),
+    };
 }
 
 /// Try to read an image from the system clipboard and return it as a PNG-encoded
@@ -2371,17 +2382,16 @@ mod tests {
     }
 
     fn make_snapshot(width: u16, height: u16) -> ScreenSnapshot {
+        let area = Rect::new(0, 0, width, height);
         ScreenSnapshot {
-            area: Rect::new(0, 0, width, height),
-            rows: (0..height)
-                .map(|_| (0..width).map(|_| " ".to_string()).collect::<Vec<String>>())
-                .collect(),
+            area,
+            buffer: ratatui::buffer::Buffer::empty(area),
         }
     }
 
     fn write_snapshot_text(snapshot: &mut ScreenSnapshot, column: u16, row: u16, text: &str) {
         for (offset, ch) in text.chars().enumerate() {
-            snapshot.rows[row as usize][column as usize + offset] = ch.to_string();
+            snapshot.buffer[(column + offset as u16, row)].set_symbol(&ch.to_string());
         }
     }
 
@@ -2746,6 +2756,38 @@ mod tests {
         assert_eq!(
             extract_selected_text(&snapshot, &selection),
             "rst line\nsecond"
+        );
+    }
+
+    #[test]
+    fn parse_engine_thread_timestamp_accepts_rfc3339_and_legacy_format() {
+        let rfc3339 =
+            parse_engine_thread_timestamp("2026-04-06T05:56:16Z", "created_at", "thread-1");
+        let legacy = parse_engine_thread_timestamp("2026-04-06 05:56", "created_at", "thread-1");
+
+        assert_eq!(
+            rfc3339,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-04-06T05:56:16Z")
+                    .expect("valid rfc3339")
+                    .with_timezone(&chrono::Utc)
+            )
+        );
+        assert_eq!(
+            legacy,
+            Some(
+                chrono::NaiveDateTime::parse_from_str("2026-04-06 05:56", "%Y-%m-%d %H:%M")
+                    .expect("valid legacy timestamp")
+                    .and_utc()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_engine_thread_timestamp_returns_none_for_invalid_input() {
+        assert_eq!(
+            parse_engine_thread_timestamp("not-a-timestamp", "created_at", "thread-1"),
+            None
         );
     }
 

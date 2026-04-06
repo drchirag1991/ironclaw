@@ -307,11 +307,13 @@ impl TuiWidget for ThreadListWidget {
             let style = self.thread_status_style(thread.status);
             let icon = thread_icon(thread.status);
 
-            let uptime_secs = now
-                .signed_duration_since(thread.started_at)
-                .num_seconds()
-                .max(0) as u64;
-            let uptime = format_uptime(uptime_secs);
+            let uptime = thread
+                .started_at
+                .map(|started_at| {
+                    let uptime_secs = now.signed_duration_since(started_at).num_seconds().max(0);
+                    format_uptime(uptime_secs as u64)
+                })
+                .unwrap_or_else(|| "?".to_string());
 
             let tag = thread_type_tag(&thread.thread_type);
             let goal = truncate(&thread.goal, thread_name_len);
@@ -458,8 +460,8 @@ mod tests {
             status: ThreadStatus::Active,
             step_count: 5,
             total_tokens: 1200,
-            started_at: chrono::Utc::now() - chrono::Duration::seconds(120),
-            updated_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now() - chrono::Duration::seconds(120)),
+            updated_at: Some(chrono::Utc::now()),
         }];
         let buf = render_to_buffer(&widget, &state, 50, 12);
         let text = buffer_text(&buf);
@@ -497,8 +499,8 @@ mod tests {
             status: ThreadStatus::Active,
             step_count: 2,
             total_tokens: 500,
-            started_at: now - chrono::Duration::seconds(30),
-            updated_at: now,
+            started_at: Some(now - chrono::Duration::seconds(30)),
+            updated_at: Some(now),
         }];
         let buf = render_to_buffer(&widget, &state, 50, 15);
         let text = buffer_text(&buf);
@@ -584,8 +586,8 @@ mod tests {
             status: ThreadStatus::Idle,
             step_count: 0,
             total_tokens: 0,
-            started_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
         }];
         let buf = render_to_buffer(&widget, &state, 50, 12);
         let text = buffer_text(&buf);
