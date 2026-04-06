@@ -29,6 +29,8 @@ pub use registry::ExtensionRegistry;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 
+pub use crate::code_challenge::VerificationChallenge;
+
 /// The kind of extension, determining how it's installed, authenticated, and activated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -539,22 +541,6 @@ pub struct LatentProviderAction {
     pub description: String,
     pub parameters_schema: serde_json::Value,
 }
-
-/// Result of configuring secrets for an extension.
-///
-/// Returned by `ExtensionManager::configure()`, the single entrypoint
-/// for providing secrets to any extension (chat auth, gateway setup, etc.).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerificationChallenge {
-    /// One-time code the user must send back to the integration.
-    pub code: String,
-    /// Human-readable instructions for completing verification.
-    pub instructions: String,
-    /// Deep-link or shortcut URL that prefills the verification payload when supported.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deep_link: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ConfigureResult {
     /// Human-readable status message.
