@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1](https://github.com/nearai/ironclaw/compare/ironclaw-v0.24.0...ironclaw-v0.24.1) - 2026-04-06
+
+### Other
+
+- [codex] Label migration PRs with DB MIGRATION ([#1967](https://github.com/nearai/ironclaw/pull/1967))
+- update WASM artifact SHA256 checksums [skip ci] ([#1831](https://github.com/nearai/ironclaw/pull/1831))
+
 ## [0.24.0](https://github.com/nearai/ironclaw/compare/ironclaw-v0.23.0...ironclaw-v0.24.0) - 2026-03-31
 
 ### Added
