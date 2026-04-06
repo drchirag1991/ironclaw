@@ -29,6 +29,7 @@ pub mod session;
 mod session_manager;
 pub mod submission;
 pub mod task;
+pub(crate) mod text_util;
 mod thread_ops;
 pub mod undo;
 

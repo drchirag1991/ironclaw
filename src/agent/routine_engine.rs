@@ -26,6 +26,7 @@ use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineRun, RunStatus, Trigger,
     apply_routine_verification_result, next_cron_fire, routine_verification_fingerprint,
 };
+use crate::agent::text_util::strip_internal_tool_call_text;
 use crate::channels::{IncomingMessage, OutgoingResponse};
 use crate::config::RoutineConfig;
 use crate::context::{JobContext, JobState};
@@ -1722,7 +1723,10 @@ fn handle_text_response(
     total_input_tokens: u32,
     total_output_tokens: u32,
 ) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
-    let content = strip_internal_tool_call_text(content);
+    let content = strip_internal_tool_call_text(
+        content,
+        "I wasn't able to produce a user-facing routine summary.",
+    );
     let content = content.trim();
 
     // Empty content guard — carry consumed tokens so the retry loop can
@@ -1752,34 +1756,6 @@ fn handle_text_response(
         Some(content.to_string()),
         total_tokens,
     ))
-}
-
-/// Strip internal `[Called tool ...]` and `[Tool ... returned: ...]` markers
-/// from routine summaries before they are persisted or delivered to channels.
-fn strip_internal_tool_call_text(text: &str) -> String {
-    let result = text
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !((trimmed.starts_with("[Called tool ") && trimmed.ends_with(']'))
-                || (trimmed.starts_with("[Tool ")
-                    && trimmed.contains(" returned:")
-                    && trimmed.ends_with(']')))
-        })
-        .fold(String::new(), |mut acc, s| {
-            if !acc.is_empty() {
-                acc.push('\n');
-            }
-            acc.push_str(s);
-            acc
-        });
-
-    let result = result.trim();
-    if result.is_empty() {
-        "I wasn't able to produce a user-facing routine summary.".to_string()
-    } else {
-        result.to_string()
-    }
 }
 
 /// Execute a lightweight routine with tool execution support (agentic loop).
