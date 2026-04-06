@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use tracing::debug;
 
 use crate::db::{Database, SettingsStore};
@@ -78,14 +77,24 @@ impl WorkspaceSettingsAdapter {
         let content = serde_json::to_string_pretty(value)
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-        // Write the content first
+        // Validate against the known schema BEFORE the first write so the
+        // initial document creation cannot bypass schema enforcement. Once
+        // metadata is set below, subsequent writes are validated by the
+        // workspace itself via the resolved metadata chain.
+        if let Some(schema) = schema_for_key(key) {
+            crate::workspace::schema::validate_content_against_schema(&path, &content, &schema)
+                .map_err(|e| DatabaseError::Query(format!("schema validation failed: {e}")))?;
+        }
+
+        // Write the content
         let doc = self
             .workspace
             .write(&path, &content)
             .await
             .map_err(|e| DatabaseError::Query(format!("workspace write failed: {e}")))?;
 
-        // Set schema in metadata if this is a known key
+        // Persist the schema in metadata so future writes are validated
+        // automatically by the workspace write path.
         if let Some(schema) = schema_for_key(key) {
             let _ = self
                 .workspace
@@ -144,16 +153,16 @@ impl SettingsStore for WorkspaceSettingsAdapter {
     ) -> Result<Option<SettingRow>, DatabaseError> {
         // Try workspace first
         let path = settings_path(key);
-        if let Ok(doc) = self.workspace.read(&path).await {
-            if !doc.content.is_empty() {
-                let value: serde_json::Value = serde_json::from_str(&doc.content)
-                    .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
-                return Ok(Some(SettingRow {
-                    key: key.to_string(),
-                    value,
-                    updated_at: doc.updated_at,
-                }));
-            }
+        if let Ok(doc) = self.workspace.read(&path).await
+            && !doc.content.is_empty()
+        {
+            let value: serde_json::Value = serde_json::from_str(&doc.content)
+                .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
+            return Ok(Some(SettingRow {
+                key: key.to_string(),
+                value,
+                updated_at: doc.updated_at,
+            }));
         }
         // Fall back to legacy table
         self.legacy_store.get_setting_full(user_id, key).await

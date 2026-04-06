@@ -45,8 +45,10 @@ pub mod paths {
 /// by hygiene. They ARE versioned for audit trail.
 pub mod system_paths {
     /// Root prefix for all system state.
+    #[allow(dead_code)] // Used by extension/skill state migration in follow-up PRs
     pub const SYSTEM_PREFIX: &str = "_system/";
     /// Settings documents directory.
+    #[allow(dead_code)] // Used by settings_schemas helper
     pub const SETTINGS_PREFIX: &str = "_system/settings/";
     /// Extension state directory.
     pub const EXTENSIONS_PREFIX: &str = "_system/extensions/";

@@ -1,20 +1,23 @@
 //! Channel-agnostic tool dispatch with audit trail.
 //!
 //! `ToolDispatcher` is the universal entry point for executing tools from
-//! any caller — gateway handlers, CLI commands, routine engines, or other
-//! channels. It creates a system job for FK integrity, executes the tool,
-//! records an `ActionRecord`, and returns the result.
+//! any non-agent caller — gateway handlers, CLI commands, routine engines,
+//! or other channels. It creates a fresh system job for FK integrity,
+//! executes the tool, records an `ActionRecord`, and returns the result.
 //!
 //! This is a third entry point alongside:
-//! - v1: `Worker::execute_tool()` (agent agentic loop)
+//! - v1: `Worker::execute_tool()` (agent agentic loop — has its own sequence tracking)
 //! - v2: `EffectBridgeAdapter::execute_action()` (engine Python orchestrator)
 //!
-//! All three converge on the same `ToolRegistry`.
+//! All three converge on the same `ToolRegistry`. Agent-initiated tool calls
+//! must go through the agent's worker (which manages action sequence numbers
+//! atomically); the dispatcher is only for callers that don't have an
+//! existing agent job context.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::context::{ActionRecord, JobContext};
@@ -26,13 +29,14 @@ use crate::tools::tool::{ToolError, ToolOutput};
 ///
 /// `Channel` is intentionally a `String`, not an enum — channels are
 /// extensions that can appear at runtime (gateway, CLI, telegram, slack,
-/// WASM channels, future custom channels).
+/// WASM channels, future custom channels). Each dispatch creates a fresh
+/// system job for audit trail purposes; agent-initiated tool calls must
+/// use `Worker::execute_tool()` instead, which manages sequence numbers
+/// against the agent's existing job.
 #[derive(Debug, Clone)]
 pub enum DispatchSource {
     /// A channel-initiated operation (gateway, CLI, telegram, etc.).
     Channel(String),
-    /// An agent job reusing its existing job_id for the audit trail.
-    Agent { job_id: Uuid },
     /// A routine engine operation.
     Routine { routine_id: Uuid },
     /// An internal system operation.
@@ -43,7 +47,6 @@ impl std::fmt::Display for DispatchSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Channel(name) => write!(f, "channel:{name}"),
-            Self::Agent { job_id } => write!(f, "agent:{job_id}"),
             Self::Routine { routine_id } => write!(f, "routine:{routine_id}"),
             Self::System => write!(f, "system"),
         }
@@ -88,19 +91,15 @@ impl ToolDispatcher {
                 ToolError::ExecutionFailed(format!("tool not found: {tool_name}"))
             })?;
 
-        // Resolve or create job_id for the audit trail.
-        let job_id = match &source {
-            DispatchSource::Agent { job_id } => *job_id,
-            other => {
-                let source_label = other.to_string();
-                self.store
-                    .create_system_job(user_id, &source_label)
-                    .await
-                    .map_err(|e| {
-                        ToolError::ExecutionFailed(format!("failed to create system job: {e}"))
-                    })?
-            }
-        };
+        // Always create a fresh system job for audit trail. Each dispatch
+        // becomes its own group of actions — sequence_num starts at 0 with
+        // no risk of UNIQUE(job_id, sequence_num) collision.
+        let source_label = source.to_string();
+        let job_id = self
+            .store
+            .create_system_job(user_id, &source_label)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("failed to create system job: {e}")))?;
 
         let ctx = JobContext::system(user_id, job_id);
         let start = Instant::now();
@@ -115,7 +114,10 @@ impl ToolDispatcher {
         let result = tool.execute(params.clone(), &ctx).await;
         let elapsed = start.elapsed();
 
-        // Build and persist the ActionRecord (fire-and-forget).
+        // Build and persist the ActionRecord. Awaited (not spawned) so that
+        // short-lived callers (CLI commands) cannot terminate before the
+        // audit row is written. Persistence failures are logged but do not
+        // mask the tool result, which is the more important signal.
         let action = ActionRecord::new(0, &resolved_name, params);
         let action = match &result {
             Ok(output) => {
@@ -124,13 +126,14 @@ impl ToolDispatcher {
             }
             Err(e) => action.fail(e.to_string(), elapsed),
         };
-
-        let store = Arc::clone(&self.store);
-        tokio::spawn(async move {
-            if let Err(e) = store.save_action(job_id, &action).await {
-                debug!(error = %e, "failed to persist dispatch ActionRecord");
-            }
-        });
+        if let Err(e) = self.store.save_action(job_id, &action).await {
+            warn!(
+                error = %e,
+                tool = %resolved_name,
+                job_id = %job_id,
+                "failed to persist dispatch ActionRecord"
+            );
+        }
 
         result
     }
@@ -153,8 +156,8 @@ mod tests {
         );
         let id = Uuid::nil();
         assert_eq!(
-            DispatchSource::Agent { job_id: id }.to_string(),
-            format!("agent:{id}")
+            DispatchSource::Routine { routine_id: id }.to_string(),
+            format!("routine:{id}")
         );
         assert_eq!(DispatchSource::System.to_string(), "system");
     }
