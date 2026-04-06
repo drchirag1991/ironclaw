@@ -16,6 +16,9 @@
 #   __retrieve_docs__(goal, max_docs)            -> list of doc dicts
 #   __check_budget__()                           -> budget dict
 #   __get_actions__()                            -> list of action dicts
+#   __list_skills__()                            -> list of skill dicts
+#   __record_skill_usage__(doc_id, success)      -> None
+#   __regex_match__(pattern, text)               -> bool
 #
 # Context variables (injected by Rust before execution):
 #   context  - list of prior messages [{role, content}]
@@ -268,8 +271,15 @@ def compact_if_needed(state, config):
 # ── Skill selection and injection (self-modifiable) ────────
 
 
-def score_skill(skill, message_lower):
-    """Score a skill against a user message. Returns 0 if vetoed."""
+def score_skill(skill, message_lower, message_original):
+    """Score a skill against a user message. Returns 0 if vetoed.
+
+    Scoring mirrors the v1 `ironclaw_skills::selector::score_skill`:
+      - exclude_keyword veto: any match => score 0
+      - keyword: exact word = 10, substring = 5 (cap 30)
+      - tag: substring = 3 (cap 15)
+      - regex pattern: each match = 20 (cap 40)
+    """
     meta = skill.get("metadata", {})
     activation = meta.get("activation", {})
 
@@ -298,6 +308,14 @@ def score_skill(skill, message_lower):
             tag_score += 3
     score += min(tag_score, 15)
 
+    # Regex pattern scoring: each match = 20 (cap 40). Monty has no `re`
+    # module, so we call out to a host function that uses Rust's regex crate.
+    rx_score = 0
+    for pat in activation.get("patterns", []):
+        if __regex_match__(str(pat), message_original):
+            rx_score += 20
+    score += min(rx_score, 40)
+
     # Confidence factor for extracted skills
     source = meta.get("source", "authored")
     if source == "extracted":
@@ -316,9 +334,10 @@ def select_skills(skills, goal, max_candidates=3, max_tokens=4000):
         return []
 
     message_lower = goal.lower()
+    message_original = goal
     scored = []
     for skill in skills:
-        s = score_skill(skill, message_lower)
+        s = score_skill(skill, message_lower, message_original)
         if s > 0:
             scored.append((s, skill))
 

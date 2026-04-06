@@ -58,6 +58,9 @@ pub struct TestRig {
     /// Extension manager for direct extension operations in tests.
     #[cfg(feature = "libsql")]
     extension_manager: Option<Arc<ironclaw::extensions::ExtensionManager>>,
+    /// Skill registry (if skills are enabled) for direct inspection in tests.
+    #[cfg(feature = "libsql")]
+    skill_registry: Option<Arc<std::sync::RwLock<ironclaw_skills::SkillRegistry>>>,
     /// Session manager for direct session/thread access in tests.
     #[cfg(feature = "libsql")]
     session_manager: Arc<ironclaw::agent::SessionManager>,
@@ -169,6 +172,38 @@ impl TestRig {
     /// Return a snapshot of all captured status events.
     pub fn captured_status_events(&self) -> Vec<StatusUpdate> {
         self.channel.captured_status_events()
+    }
+
+    /// Return the names of skills loaded into the registry, if skills are
+    /// enabled. Useful for verifying the registry discovered the SKILL.md
+    /// files from `with_skills_dir()`.
+    pub fn loaded_skill_names(&self) -> Vec<String> {
+        self.skill_registry
+            .as_ref()
+            .and_then(|r| {
+                r.read()
+                    .ok()
+                    .map(|g| g.skills().iter().map(|s| s.name().to_string()).collect())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Return the flattened list of skill names activated across the session.
+    ///
+    /// Extracted from `StatusUpdate::SkillActivated` events — each turn may
+    /// emit a separate event with the skills selected for that turn, so the
+    /// returned vec may contain duplicates if a skill was active across
+    /// multiple turns.
+    pub fn active_skill_names(&self) -> Vec<String> {
+        self.channel
+            .captured_status_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                StatusUpdate::SkillActivated { skill_names } => Some(skill_names),
+                _ => None,
+            })
+            .flatten()
+            .collect()
     }
 
     /// Clear all captured responses and status events.
@@ -416,6 +451,7 @@ pub struct TestRigBuilder {
     injection_check: bool,
     auto_approve_tools: Option<bool>,
     enable_skills: bool,
+    skills_dir_override: Option<std::path::PathBuf>,
     enable_routines: bool,
     http_exchanges: Vec<HttpExchange>,
     http_interceptor_override: Option<Arc<dyn HttpInterceptor>>,
@@ -436,6 +472,7 @@ impl TestRigBuilder {
             injection_check: false,
             auto_approve_tools: Some(true),
             enable_skills: false,
+            skills_dir_override: None,
             enable_routines: false,
             http_exchanges: Vec::new(),
             http_interceptor_override: None,
@@ -528,6 +565,16 @@ impl TestRigBuilder {
         self
     }
 
+    /// Enable skills AND discover them from the given directory instead of the
+    /// rig's tempdir. Useful for tests that want to exercise real SKILL.md
+    /// files committed to the repo (e.g. `tests/support/live_harness.rs`
+    /// pointing at `./skills/` for commitments/persona tests).
+    pub fn with_skills_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.enable_skills = true;
+        self.skills_dir_override = Some(dir.into());
+        self
+    }
+
     /// Enable the routines system so the scheduler is wired with a `RoutineEngine`,
     /// allowing routine jobs to actually execute. Routine tools are always registered
     /// but require the engine to dispatch jobs.
@@ -588,6 +635,7 @@ impl TestRigBuilder {
             injection_check,
             auto_approve_tools,
             enable_skills,
+            skills_dir_override,
             enable_routines,
             http_exchanges: explicit_http_exchanges,
             http_interceptor_override,
@@ -611,19 +659,27 @@ impl TestRigBuilder {
 
         // 2. Build Config.
         let has_config_override = config_override.is_some();
-        let skills_dir = temp_dir.path().join("skills");
+        let default_skills_dir = temp_dir.path().join("skills");
+        let skills_dir = skills_dir_override
+            .clone()
+            .unwrap_or_else(|| default_skills_dir.clone());
         let installed_skills_dir = temp_dir.path().join("installed_skills");
-        let _ = std::fs::create_dir_all(&skills_dir);
+        // Only create the tempdir skills dir if we're using it (i.e. no override).
+        // Do not try to create the override path — callers are responsible for
+        // providing an existing directory.
+        if skills_dir_override.is_none() {
+            let _ = std::fs::create_dir_all(&skills_dir);
+        }
         let _ = std::fs::create_dir_all(&installed_skills_dir);
         let mut config = if let Some(mut cfg) = config_override {
             // Override database to use temp libSQL, but preserve agent/llm settings.
             cfg.database.backend = ironclaw::config::DatabaseBackend::LibSql;
             cfg.database.libsql_path = Some(db_path);
-            cfg.skills.local_dir = skills_dir;
-            cfg.skills.installed_dir = installed_skills_dir;
+            cfg.skills.local_dir = skills_dir.clone();
+            cfg.skills.installed_dir = installed_skills_dir.clone();
             cfg
         } else {
-            Config::for_testing(db_path, skills_dir, installed_skills_dir)
+            Config::for_testing(db_path, skills_dir.clone(), installed_skills_dir.clone())
         };
         config.agent.max_tool_iterations = max_tool_iterations;
         config.safety.injection_check_enabled = injection_check;
@@ -788,12 +844,18 @@ impl TestRigBuilder {
             }
 
             // Skills tools: ensure tests use temp skill dirs (sandbox-safe) even if
-            // AppBuilder did not wire them for this environment.
-            if enable_skills {
-                let registry = Arc::new(std::sync::RwLock::new(
-                    ironclaw_skills::SkillRegistry::new(temp_dir.path().join("skills"))
-                        .with_installed_dir(temp_dir.path().join("installed_skills")),
-                ));
+            // AppBuilder did not wire them for this environment. If AppBuilder
+            // already wired up a registry (because config.skills.enabled was
+            // true and it ran discover_all()), leave it alone so real
+            // SKILL.md files discovered from `skills_dir` stay loaded.
+            if enable_skills && components.skill_registry.is_none() {
+                let registry_dir = skills_dir_override
+                    .clone()
+                    .unwrap_or_else(|| temp_dir.path().join("skills"));
+                let mut registry = ironclaw_skills::SkillRegistry::new(registry_dir)
+                    .with_installed_dir(installed_skills_dir.clone());
+                let _ = registry.discover_all().await;
+                let registry = Arc::new(std::sync::RwLock::new(registry));
                 let catalog = ironclaw_skills::catalog::shared_catalog();
                 components
                     .tools
@@ -868,6 +930,7 @@ impl TestRigBuilder {
         let db_ref = components.db.clone().expect("test rig requires a database");
         let workspace_ref = components.workspace.clone();
         let ext_mgr_ref = components.extension_manager.clone();
+        let skill_registry_ref = components.skill_registry.clone();
         let session_manager_ref = Arc::new(ironclaw::agent::SessionManager::new());
 
         // 7. Construct AgentDeps from AppComponents (mirrors main.rs).
@@ -898,10 +961,17 @@ impl TestRigBuilder {
         // 7. Create TestChannel and ChannelManager.
         // When testing bootstrap, the channel must be named "gateway" because
         // the bootstrap greeting targets only the gateway channel.
+        //
+        // Use the agent's owner_id as the test channel user_id so that engine v2
+        // resolves the thread's project to the owner's default project. If the
+        // test user is not the owner, `resolve_user_project` creates a fresh
+        // per-user project that has no skills migrated to it, and skill
+        // activation silently fails.
+        let test_user_id = components.config.owner_id.clone();
         let test_channel = if self.keep_bootstrap {
-            Arc::new(TestChannel::new().with_name("gateway"))
+            Arc::new(TestChannel::with_user_id(test_user_id).with_name("gateway"))
         } else {
-            Arc::new(TestChannel::new())
+            Arc::new(TestChannel::with_user_id(test_user_id))
         };
         let handle = TestChannelHandle::new(Arc::clone(&test_channel));
         let channel_manager = ChannelManager::new();
@@ -963,6 +1033,7 @@ impl TestRigBuilder {
             workspace: workspace_ref,
             trace_llm: trace_llm_ref,
             extension_manager: ext_mgr_ref,
+            skill_registry: skill_registry_ref,
             session_manager: session_manager_ref,
             _temp_dir: temp_dir,
             bootstrap_greetings_to_keep: if keep_bootstrap { 1 } else { 0 },

@@ -455,6 +455,13 @@ pub async fn execute_orchestrator(
                     // __record_skill_usage__(doc_id, success)
                     "__record_skill_usage__" => handle_record_skill_usage(args, store).await,
 
+                    // __regex_match__(pattern, text) -> bool
+                    // Evaluates a regex against text using Rust's regex crate.
+                    // Invalid patterns return False silently. Monty has no `re`
+                    // module, so this host function bridges the gap for the
+                    // skill selector's pattern-based scoring.
+                    "__regex_match__" => handle_regex_match(args),
+
                     // Unknown — let Monty resolve it (user-defined functions, builtins)
                     other => ExtFunctionResult::NotFound(other.to_string()),
                 };
@@ -1754,6 +1761,34 @@ async fn handle_record_skill_usage(
     }
 
     ExtFunctionResult::Return(MontyObject::None)
+}
+
+/// Handle `__regex_match__(pattern, text) -> bool`.
+///
+/// Compiles `pattern` with a bounded size limit and returns whether it
+/// matches anywhere in `text`. Invalid regex or a size-limit violation
+/// returns `False` silently. Used by the Python skill selector for regex
+/// pattern scoring (Monty has no `re` module).
+fn handle_regex_match(args: &[MontyObject]) -> ExtFunctionResult {
+    let pattern = args.first().map(monty_to_string).unwrap_or_default();
+    let text = args.get(1).map(monty_to_string).unwrap_or_default();
+    if pattern.is_empty() {
+        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    }
+    // Cap compiled regex size to prevent ReDoS (matches the 64 KiB limit used
+    // by `LoadedSkill::compile_patterns` in `ironclaw_skills`).
+    const MAX_REGEX_SIZE: usize = 1 << 16;
+    let matched = match regex::RegexBuilder::new(&pattern)
+        .size_limit(MAX_REGEX_SIZE)
+        .build()
+    {
+        Ok(re) => re.is_match(&text),
+        Err(e) => {
+            debug!("__regex_match__: invalid pattern '{pattern}': {e}");
+            false
+        }
+    };
+    ExtFunctionResult::Return(MontyObject::Bool(matched))
 }
 
 // ── Helpers ─────────────────────────────────────────────────

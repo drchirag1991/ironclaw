@@ -220,6 +220,7 @@ pub struct LiveTestHarnessBuilder {
     max_tool_iterations: usize,
     engine_v2: Option<bool>,
     auto_approve_tools: Option<bool>,
+    skills_dir: Option<PathBuf>,
 }
 
 impl LiveTestHarnessBuilder {
@@ -233,6 +234,7 @@ impl LiveTestHarnessBuilder {
             max_tool_iterations: 30,
             engine_v2: None,
             auto_approve_tools: None,
+            skills_dir: None,
         }
     }
 
@@ -252,6 +254,14 @@ impl LiveTestHarnessBuilder {
     /// `Config::from_env()` is used in live mode (default: false).
     pub fn with_auto_approve_tools(mut self, enabled: bool) -> Self {
         self.auto_approve_tools = Some(enabled);
+        self
+    }
+
+    /// Enable skill discovery from the given directory. Skills discovered
+    /// here (e.g. the repo's `./skills/` dir) are loaded at startup and can
+    /// activate during the test conversation.
+    pub fn with_skills_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.skills_dir = Some(dir.into());
         self
     }
 
@@ -282,6 +292,16 @@ impl LiveTestHarnessBuilder {
         let _ = dotenvy::dotenv();
         ironclaw::bootstrap::load_ironclaw_env();
 
+        // Hydrate LLM credentials from the user's real secrets store into
+        // process env vars BEFORE config resolution. The test rig runs
+        // against an isolated temp libSQL database, so the real ironclaw DB's
+        // secrets aren't automatically visible to the provider chain. For
+        // backends that support env-var fallback (nearai via NEARAI_API_KEY,
+        // anthropic via ANTHROPIC_API_KEY, etc.), setting the env var before
+        // `build_provider_chain` bypasses the interactive auth flow without
+        // leaking secrets into the test database.
+        hydrate_llm_secrets_into_env().await;
+
         // Resolve full config (reads LLM_BACKEND, ENGINE_V2, ALLOW_LOCAL_TOOLS, etc.)
         // This mirrors the exact config the real `ironclaw` binary would use.
         let mut config = ironclaw::config::Config::from_env().await.expect(
@@ -296,10 +316,17 @@ impl LiveTestHarnessBuilder {
         if let Some(aa) = self.auto_approve_tools {
             config.agent.auto_approve_tools = aa;
         }
+        if let Some(ref dir) = self.skills_dir {
+            config.skills.enabled = true;
+            config.skills.local_dir = dir.clone();
+        }
 
         eprintln!(
-            "[LiveTest] Config: engine_v2={}, allow_local_tools={}, auto_approve={}",
-            config.agent.engine_v2, config.agent.allow_local_tools, config.agent.auto_approve_tools,
+            "[LiveTest] Config: engine_v2={}, allow_local_tools={}, auto_approve={}, skills_dir={}",
+            config.agent.engine_v2,
+            config.agent.allow_local_tools,
+            config.agent.auto_approve_tools,
+            config.skills.local_dir.display(),
         );
 
         let session = Arc::new(SessionManager::new(SessionConfig::default()));
@@ -318,13 +345,16 @@ impl LiveTestHarnessBuilder {
         // - engine_v2 controls which agentic loop path is used
         // - auto_approve_tools comes from the env/config (tests can override
         //   via LiveTestHarnessBuilder if needed)
-        let rig = TestRigBuilder::new()
+        let skills_dir_for_rig = self.skills_dir.clone();
+        let mut rig_builder = TestRigBuilder::new()
             .with_config(config)
             .with_llm(llm)
             .with_http_interceptor(http_interceptor)
-            .with_max_tool_iterations(self.max_tool_iterations)
-            .build()
-            .await;
+            .with_max_tool_iterations(self.max_tool_iterations);
+        if let Some(dir) = skills_dir_for_rig {
+            rig_builder = rig_builder.with_skills_dir(dir);
+        }
+        let rig = rig_builder.build().await;
 
         // Use cheap LLM for judge if available.
         let judge_llm = cheap_llm;
@@ -353,12 +383,19 @@ impl LiveTestHarnessBuilder {
             )
         });
 
-        let rig = TestRigBuilder::new()
+        let mut rig_builder = TestRigBuilder::new()
             .with_trace(trace)
             .with_max_tool_iterations(self.max_tool_iterations)
-            .with_auto_approve_tools(true)
-            .build()
-            .await;
+            .with_auto_approve_tools(true);
+        if let Some(dir) = self.skills_dir.clone() {
+            rig_builder = rig_builder.with_skills_dir(dir);
+        }
+        if let Some(v2) = self.engine_v2
+            && v2
+        {
+            rig_builder = rig_builder.with_engine_v2();
+        }
+        let rig = rig_builder.build().await;
 
         LiveTestHarness {
             rig,
@@ -428,6 +465,112 @@ pub async fn judge_response(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Load LLM API keys from the user's real secrets store into process env vars.
+///
+/// Live tests use an isolated temp libSQL database, so the real ironclaw DB's
+/// encrypted secrets are invisible to the test provider chain. This helper
+/// opens the user's real libSQL DB (read-only for our purposes), resolves the
+/// master key from the OS keychain, decrypts known LLM API-key secrets, and
+/// exports them as env vars. `build_provider_chain` then picks them up via
+/// each provider's env-var fallback, skipping interactive auth.
+///
+/// This function is best-effort: any failure (no DB, locked keychain, secret
+/// missing) is logged and ignored so the provider can fall back to whatever
+/// native auth path it supports.
+#[cfg(feature = "libsql")]
+async fn hydrate_llm_secrets_into_env() {
+    use ironclaw::secrets::{
+        LibSqlSecretsStore, SecretsStore, crypto_from_hex, resolve_master_key,
+    };
+
+    // Known (secret_name, env_var) pairs. When a backend supports multiple
+    // env-var fallbacks we pick the most canonical one.
+    const SECRET_TO_ENV: &[(&str, &str)] = &[
+        ("llm_nearai_api_key", "NEARAI_API_KEY"),
+        ("llm_anthropic_api_key", "ANTHROPIC_API_KEY"),
+        ("llm_openai_api_key", "OPENAI_API_KEY"),
+    ];
+
+    // If all target env vars are already set, skip the DB work entirely.
+    if SECRET_TO_ENV
+        .iter()
+        .all(|(_, env)| std::env::var(env).ok().filter(|v| !v.is_empty()).is_some())
+    {
+        return;
+    }
+
+    let master_key = match resolve_master_key().await {
+        Some(k) => k,
+        None => {
+            eprintln!("[LiveTest] hydrate_llm_secrets: no master key (env/keychain) — skipping");
+            return;
+        }
+    };
+
+    let crypto = match crypto_from_hex(&master_key) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[LiveTest] hydrate_llm_secrets: crypto init failed: {e} — skipping");
+            return;
+        }
+    };
+
+    // Open the user's real libSQL DB at ~/.ironclaw/ironclaw.db directly
+    // (bypassing the ironclaw Database wrapper — LibSqlSecretsStore needs a
+    // raw libsql::Database handle).
+    let db_path = ironclaw::bootstrap::ironclaw_base_dir().join("ironclaw.db");
+    if !db_path.exists() {
+        eprintln!(
+            "[LiveTest] hydrate_llm_secrets: real DB not found at {} — skipping",
+            db_path.display()
+        );
+        return;
+    }
+
+    let raw_db = match libsql::Builder::new_local(&db_path).build().await {
+        Ok(db) => std::sync::Arc::new(db),
+        Err(e) => {
+            eprintln!("[LiveTest] hydrate_llm_secrets: open real DB failed: {e} — skipping");
+            return;
+        }
+    };
+
+    let store = LibSqlSecretsStore::new(raw_db, crypto);
+
+    // Single-user mode owner id (matches Config::default().owner_id).
+    let owner_id = "default";
+
+    for (secret_name, env_var) in SECRET_TO_ENV {
+        if std::env::var(env_var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
+            continue;
+        }
+        match store.get_decrypted(owner_id, secret_name).await {
+            Ok(decrypted) => {
+                // SAFETY: this runs at test startup before any tokio tasks
+                // read the env. Single-threaded prologue is fine.
+                unsafe {
+                    std::env::set_var(env_var, decrypted.expose());
+                }
+                eprintln!(
+                    "[LiveTest] hydrate_llm_secrets: set {env_var} from secret '{secret_name}'"
+                );
+            }
+            Err(ironclaw::secrets::SecretError::NotFound { .. }) => {
+                // Normal: user hasn't configured this backend.
+            }
+            Err(e) => {
+                eprintln!(
+                    "[LiveTest] hydrate_llm_secrets: failed to read '{secret_name}': {e} — skipping"
+                );
+            }
+        }
+    }
+}
 
 /// Compute the path to a live trace fixture file.
 fn trace_fixture_path(test_name: &str) -> PathBuf {
