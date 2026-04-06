@@ -56,6 +56,15 @@ fn escape_tag_close(s: &str, needle: &str) -> String {
     out
 }
 
+/// Sentinel inserted into the cached HTML wherever a CSP script nonce should
+/// appear. The gateway substitutes this with a fresh per-response nonce
+/// before serving so the cached HTML can be reused across requests while the
+/// browser still sees a unique nonce on every page load.
+///
+/// Kept ASCII-only and unlikely to collide with anything an author might
+/// reasonably write into widget JS or layout JSON.
+pub const NONCE_PLACEHOLDER: &str = "__IRONCLAW_CSP_NONCE__";
+
 /// A resolved frontend bundle ready for serving.
 ///
 /// Contains the layout configuration, resolved widgets (with their JS/CSS
@@ -87,6 +96,12 @@ pub struct ResolvedWidget {
 
 /// Inject frontend customizations into the base HTML template.
 ///
+/// All injected `<script>` tags carry a `nonce` attribute set to
+/// [`NONCE_PLACEHOLDER`]. Callers (the gateway's `index_handler`) substitute
+/// the placeholder with a fresh per-response nonce and emit a matching
+/// `Content-Security-Policy: script-src 'nonce-…'` header. This lets us cache
+/// the assembled HTML across requests while still rotating nonces.
+///
 /// Modifications:
 ///
 /// **Before `</head>`:**
@@ -115,11 +130,15 @@ pub fn assemble_index(base_html: &str, bundle: &FrontendBundle) -> String {
     // Layout config as global variable. JSON strings can contain `</script>`
     // (serde_json does not escape `<` or `/` by default), so neutralize any
     // `</script…` sequence before dropping it into an inline <script> tag.
+    //
+    // The `nonce` attribute carries the [`NONCE_PLACEHOLDER`] sentinel — the
+    // gateway swaps it for a fresh per-response nonce that matches the
+    // response's `Content-Security-Policy` header. Without the nonce the
+    // browser blocks this inline script under the gateway's CSP.
     if let Ok(layout_json) = serde_json::to_string(&bundle.layout) {
         let safe_layout = escape_tag_close(&layout_json, "</script");
         body_injections.push(format!(
-            "<script>window.__IRONCLAW_LAYOUT__ = {};</script>",
-            safe_layout
+            "<script nonce=\"{NONCE_PLACEHOLDER}\">window.__IRONCLAW_LAYOUT__ = {safe_layout};</script>"
         ));
     }
 
@@ -131,6 +150,9 @@ pub fn assemble_index(base_html: &str, bundle: &FrontendBundle) -> String {
                 // Neutralize any `</style…` sequence in scoped CSS — scope_css
                 // only rewrites selectors, so a widget CSS string literal
                 // containing `</style>` would otherwise break out of the tag.
+                //
+                // No nonce needed: the gateway's CSP allows `'unsafe-inline'`
+                // for `style-src`. Scripts are the only nonce-gated tags.
                 let safe_css = escape_tag_close(&scoped, "</style");
                 body_injections.push(format!(
                     "<style data-widget=\"{}\">{}</style>",
@@ -140,11 +162,14 @@ pub fn assemble_index(base_html: &str, bundle: &FrontendBundle) -> String {
             }
         }
 
-        // Widget JS inlined (avoids auth issues with <script src> on protected endpoints).
-        // Escape </script> in widget JS to prevent script tag breakout (XSS).
+        // Widget JS inlined (avoids auth issues with <script src> on protected
+        // endpoints). Escape `</script>` to prevent tag breakout (XSS) and
+        // stamp the CSP nonce placeholder so the gateway can authorize this
+        // script under its `script-src 'nonce-…'` policy.
         let safe_js = escape_tag_close(&widget.js, "</script");
         body_injections.push(format!(
-            "<script type=\"module\" data-widget=\"{}\">\n{}\n</script>",
+            "<script type=\"module\" nonce=\"{}\" data-widget=\"{}\">\n{}\n</script>",
+            NONCE_PLACEHOLDER,
             escape_html_attr(&widget.manifest.id),
             safe_js
         ));
@@ -341,6 +366,89 @@ mod tests {
         // </script> in widget JS should be escaped to prevent tag breakout
         assert!(!result.contains("</script><script>alert(1)"));
         assert!(result.contains("<\\/script>"));
+    }
+
+    #[test]
+    fn test_assemble_index_layout_script_carries_nonce_placeholder() {
+        // Every injected <script> must carry the nonce placeholder so the
+        // gateway can rotate it per response. Without this attribute, the
+        // browser blocks the script under the gateway's strict CSP.
+        let bundle = FrontendBundle {
+            layout: LayoutConfig {
+                branding: BrandingConfig {
+                    title: Some("Acme".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        assert!(
+            result.contains(&format!("<script nonce=\"{NONCE_PLACEHOLDER}\">")),
+            "layout JSON script must carry nonce placeholder, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_assemble_index_widget_script_carries_nonce_placeholder() {
+        let bundle = FrontendBundle {
+            widgets: vec![ResolvedWidget {
+                manifest: WidgetManifest {
+                    id: "dashboard".to_string(),
+                    name: "Dashboard".to_string(),
+                    slot: WidgetSlot::Tab,
+                    icon: None,
+                    position: None,
+                },
+                js: "console.log('hi');".to_string(),
+                css: None,
+            }],
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        // Widget script must have BOTH the type=module and the nonce attribute.
+        assert!(
+            result.contains(&format!(
+                "<script type=\"module\" nonce=\"{NONCE_PLACEHOLDER}\" data-widget=\"dashboard\">"
+            )),
+            "widget script tag must carry nonce placeholder, got: {result}"
+        );
+        // The placeholder must be a substring the caller can substitute. The
+        // sentinel string itself must NOT be a valid nonce — it should never
+        // accidentally appear elsewhere in well-formed HTML.
+        assert!(NONCE_PLACEHOLDER.starts_with("__"));
+        assert!(!NONCE_PLACEHOLDER.contains(' '));
+    }
+
+    #[test]
+    fn test_assemble_index_widget_style_has_no_nonce() {
+        // Inline <style> blocks don't need a nonce — the gateway's CSP allows
+        // 'unsafe-inline' for style-src. Adding nonce there would be dead
+        // weight. This test pins that decision so a future change doesn't
+        // accidentally start nonce-gating styles.
+        let bundle = FrontendBundle {
+            widgets: vec![ResolvedWidget {
+                manifest: WidgetManifest {
+                    id: "styled".to_string(),
+                    name: "Styled".to_string(),
+                    slot: WidgetSlot::Tab,
+                    icon: None,
+                    position: None,
+                },
+                js: "// noop".to_string(),
+                css: Some(".panel { color: red; }".to_string()),
+            }],
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        // Find the <style data-widget="styled"> tag and assert no nonce attr.
+        let style_tag = "<style data-widget=\"styled\">";
+        assert!(result.contains(style_tag));
+        assert!(
+            !result.contains("<style data-widget=\"styled\" nonce="),
+            "<style> tags must not carry nonce attributes"
+        );
     }
 
     #[test]

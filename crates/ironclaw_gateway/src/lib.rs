@@ -1,6 +1,7 @@
-//! IronClaw Frontend — assets, layout configuration, and widget extension system.
+//! IronClaw Gateway — frontend assets, layout configuration, and widget
+//! extension system.
 //!
-//! This crate owns the complete frontend for the IronClaw web gateway:
+//! This crate owns the complete frontend served by the IronClaw web gateway:
 //!
 //! - **Embedded assets** (`assets` module): HTML, JS, CSS, i18n files compiled
 //!   into the binary for zero-dependency serving.
@@ -16,7 +17,7 @@ mod bundle;
 mod layout;
 mod widget;
 
-pub use bundle::{FrontendBundle, ResolvedWidget, assemble_index};
+pub use bundle::{FrontendBundle, NONCE_PLACEHOLDER, ResolvedWidget, assemble_index};
 pub use layout::{
     BrandingColors, BrandingConfig, ChatConfig, LayoutConfig, TabConfig, WidgetInstanceConfig,
 };

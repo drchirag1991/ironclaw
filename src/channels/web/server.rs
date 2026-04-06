@@ -13,7 +13,7 @@ use axum::{
     http::{StatusCode, header},
     middleware,
     response::{
-        IntoResponse,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post, put},
@@ -889,19 +889,7 @@ pub async fn start_server(
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::HeaderName::from_static("content-security-policy"),
-            header::HeaderValue::from_static(
-                "default-src 'self'; \
-                 script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://esm.sh; \
-                 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
-                 font-src https://fonts.gstatic.com data:; \
-                 connect-src 'self' https://esm.sh https://rpc.mainnet.near.org https://rpc.testnet.near.org; \
-                 img-src 'self' data: blob: https://*.googleusercontent.com https://avatars.githubusercontent.com; \
-                 frame-src https://accounts.google.com https://appleid.apple.com; \
-                 object-src 'none'; \
-                 frame-ancestors 'none'; \
-                 base-uri 'self'; \
-                 form-action 'self' https://accounts.google.com https://github.com https://appleid.apple.com",
-            ),
+            header::HeaderValue::from_static(BASE_CSP),
         ))
         .with_state(state.clone());
 
@@ -923,10 +911,75 @@ pub async fn start_server(
     Ok(bound_addr)
 }
 
+// --- Content Security Policy ---
+//
+// A single source of truth for the gateway's CSP. The static value below is
+// used by the global response-header layer for every endpoint. The
+// `build_csp_with_nonce` helper produces an equivalent policy with a CSP
+// `'nonce-…'` source added to `script-src` — used only by `index_handler`
+// when it serves customized HTML containing inline `<script>` blocks.
+//
+// Anything that needs to change about the CSP for the whole gateway should
+// be edited HERE so the per-response variant stays in lock-step.
+
+/// Origins allowed by `script-src` in addition to `'self'`. The Copilot
+/// review caught that injected widget scripts and the layout-config script
+/// were being blocked by this CSP — they now carry a per-request nonce
+/// (see `index_handler`).
+const SCRIPT_SRC_EXTRAS: &str =
+    "https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://esm.sh";
+
+/// Static CSP applied to every gateway response by the response-header layer.
+/// `script-src` lists the explicit allowed CDNs but does NOT include
+/// `'unsafe-inline'`. Inline scripts (only present on the customized index
+/// page) are authorized via a per-response `'nonce-…'` source instead.
+const BASE_CSP: &str = "default-src 'self'; \
+     script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://esm.sh; \
+     style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+     font-src https://fonts.gstatic.com data:; \
+     connect-src 'self' https://esm.sh https://rpc.mainnet.near.org https://rpc.testnet.near.org; \
+     img-src 'self' data: blob: https://*.googleusercontent.com https://avatars.githubusercontent.com; \
+     frame-src https://accounts.google.com https://appleid.apple.com; \
+     object-src 'none'; \
+     frame-ancestors 'none'; \
+     base-uri 'self'; \
+     form-action 'self' https://accounts.google.com https://github.com https://appleid.apple.com";
+
+/// Build a CSP equivalent to [`BASE_CSP`] but with `'nonce-{nonce}'` added to
+/// the `script-src` directive so a single inline `<script nonce="{nonce}">`
+/// block on the same response is authorized.
+fn build_csp_with_nonce(nonce: &str) -> String {
+    format!(
+        "default-src 'self'; \
+         script-src 'self' 'nonce-{nonce}' {SCRIPT_SRC_EXTRAS}; \
+         style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+         font-src https://fonts.gstatic.com data:; \
+         connect-src 'self' https://esm.sh https://rpc.mainnet.near.org https://rpc.testnet.near.org; \
+         img-src 'self' data: blob: https://*.googleusercontent.com https://avatars.githubusercontent.com; \
+         frame-src https://accounts.google.com https://appleid.apple.com; \
+         object-src 'none'; \
+         frame-ancestors 'none'; \
+         base-uri 'self'; \
+         form-action 'self' https://accounts.google.com https://github.com https://appleid.apple.com"
+    )
+}
+
+/// Generate a fresh per-response CSP nonce. 16 random bytes hex-encoded
+/// (32 chars) — well above the 128-bit minimum recommended for nonces and
+/// matching the `OsRng + hex` pattern used elsewhere in this module
+/// (see `tokens_create_handler`).
+fn generate_csp_nonce() -> String {
+    use rand::RngCore;
+    use rand::rngs::OsRng;
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 // --- Frontend bundle assembly ---
 
 use ironclaw_gateway::assets;
-use ironclaw_gateway::{FrontendBundle, LayoutConfig};
+use ironclaw_gateway::{FrontendBundle, LayoutConfig, NONCE_PLACEHOLDER};
 
 use crate::channels::web::handlers::frontend::load_resolved_widgets;
 
@@ -1064,20 +1117,48 @@ fn layout_has_customizations(layout: &LayoutConfig) -> bool {
 // All frontend assets are embedded in the `ironclaw_gateway` crate.
 // These handlers serve them with appropriate MIME types and cache headers.
 
-async fn index_handler(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
+async fn index_handler(State(state): State<Arc<GatewayState>>) -> Response {
     // Try to assemble customized HTML from workspace frontend config.
-    // Falls back to embedded HTML if workspace is unavailable or has no customizations.
-    let html = match build_frontend_html(&state).await {
-        Some(assembled) => assembled,
-        None => assets::INDEX_HTML.to_string(),
+    // Falls back to embedded HTML if workspace is unavailable or has no
+    // customizations — in that case there are no inline scripts and the
+    // global CSP layer applies unchanged.
+    let assembled = build_frontend_html(&state).await;
+
+    let Some(html_with_placeholder) = assembled else {
+        return (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            assets::INDEX_HTML,
+        )
+            .into_response();
     };
+
+    // Customized path: the assembled HTML contains inline `<script>` blocks
+    // (layout config + widget modules) carrying [`NONCE_PLACEHOLDER`] in
+    // their `nonce` attribute. Stamp a fresh per-response nonce in both
+    // the HTML and the response's Content-Security-Policy header so the
+    // browser actually executes the scripts.
+    //
+    // Setting `Content-Security-Policy` here suppresses the global
+    // `SetResponseHeaderLayer::if_not_present` value for this response only.
+    let nonce = generate_csp_nonce();
+    let html = html_with_placeholder.replace(NONCE_PLACEHOLDER, &nonce);
+    let csp = build_csp_with_nonce(&nonce);
+
     (
         [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+            (
+                header::HeaderName::from_static("content-security-policy"),
+                csp,
+            ),
         ],
         html,
     )
+        .into_response()
 }
 
 async fn css_handler(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
@@ -4395,6 +4476,45 @@ mod tests {
         if let Some(tx) = state.shutdown_tx.write().await.take() {
             let _ = tx.send(());
         }
+    }
+
+    #[test]
+    fn test_build_csp_with_nonce_includes_nonce_source() {
+        // Per-response CSP must add `'nonce-…'` to script-src so a single
+        // inline `<script nonce="…">` block is authorized for that response.
+        let csp = build_csp_with_nonce("deadbeefcafebabe");
+        assert!(
+            csp.contains("script-src 'self' 'nonce-deadbeefcafebabe' https://cdn.jsdelivr.net"),
+            "nonce source must appear immediately after 'self' in script-src; got: {csp}"
+        );
+        // The other directives must match the static BASE_CSP so the
+        // per-response value never accidentally relaxes anything else.
+        for needle in [
+            "default-src 'self'",
+            "style-src 'self' 'unsafe-inline'",
+            "object-src 'none'",
+            "frame-ancestors 'none'",
+            "base-uri 'self'",
+        ] {
+            assert!(csp.contains(needle), "missing directive: {needle}");
+        }
+        // And it must NOT contain `'unsafe-inline'` for scripts.
+        assert!(
+            !csp.contains("script-src 'self' 'unsafe-inline'"),
+            "script-src must not allow 'unsafe-inline'"
+        );
+    }
+
+    #[test]
+    fn test_generate_csp_nonce_is_unique_and_hex() {
+        let a = generate_csp_nonce();
+        let b = generate_csp_nonce();
+        assert_eq!(a.len(), 32, "16 bytes hex-encoded should be 32 chars");
+        assert_ne!(a, b, "nonces must be unique per call");
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "nonce must be lowercase hex"
+        );
     }
 
     #[tokio::test]
