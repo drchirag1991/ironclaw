@@ -919,6 +919,14 @@ impl AppBuilder {
             // Register credential mappings from skill frontmatter into the
             // shared registry so the HTTP tool can auto-inject credentials.
             crate::skills::register_skill_credentials(registry.skills(), &credential_registry);
+            if let Some(db) = self.db.as_ref() {
+                crate::skills::persist_skill_auth_descriptors(
+                    registry.skills(),
+                    Some(db.as_ref()),
+                    &self.config.owner_id,
+                )
+                .await;
+            }
 
             let registry = Arc::new(std::sync::RwLock::new(registry));
             let catalog = ironclaw_skills::catalog::shared_catalog();

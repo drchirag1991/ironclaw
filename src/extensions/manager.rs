@@ -10,6 +10,10 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::auth::{
+    AuthDescriptor, AuthDescriptorKind, OAuthFlowDescriptor, PendingOAuthLaunchParams,
+    auth_descriptor_for_secret, build_pending_oauth_launch, upsert_auth_descriptor,
+};
 use crate::channels::wasm::{
     LoadedChannel, RegisteredEndpoint, SharedWasmChannel, TELEGRAM_CHANNEL_NAME, WasmChannelLoader,
     WasmChannelRouter, WasmChannelRuntime, bot_username_setting_key,
@@ -1184,6 +1188,16 @@ impl ExtensionManager {
 
     pub async fn sse_sender(&self) -> Option<Arc<crate::channels::web::sse::SseManager>> {
         self.sse_manager.read().await.clone()
+    }
+
+    pub fn database(&self) -> Option<&Arc<dyn crate::db::Database>> {
+        self.store.as_ref()
+    }
+
+    fn settings_store(&self) -> Option<&dyn crate::db::SettingsStore> {
+        self.store
+            .as_ref()
+            .map(|db| db.as_ref() as &dyn crate::db::SettingsStore)
     }
 
     async fn clear_pending_extension_auth(&self, name: &str) {
@@ -2435,6 +2449,32 @@ impl ExtensionManager {
         user_id: &str,
     ) -> Result<(), crate::tools::mcp::config::ConfigError> {
         config.validate()?;
+        if let Some(oauth) = config.oauth.as_ref()
+            && let (Some(authorization_url), Some(token_url)) =
+                (oauth.authorization_url.clone(), oauth.token_url.clone())
+        {
+            upsert_auth_descriptor(
+                self.settings_store(),
+                user_id,
+                Self::mcp_auth_descriptor(
+                    &config,
+                    OAuthFlowDescriptor {
+                        authorization_url,
+                        token_url,
+                        client_id: Some(oauth.client_id.clone()),
+                        client_id_env: None,
+                        client_secret: None,
+                        client_secret_env: None,
+                        scopes: oauth.scopes.clone(),
+                        use_pkce: oauth.use_pkce,
+                        extra_params: oauth.extra_params.clone(),
+                        access_token_field: "access_token".to_string(),
+                        validation_url: None,
+                    },
+                ),
+            )
+            .await;
+        }
         if let Some(ref store) = self.store {
             crate::tools::mcp::config::add_mcp_server_db(store.as_ref(), user_id, config).await
         } else {
@@ -2448,6 +2488,32 @@ impl ExtensionManager {
         user_id: &str,
     ) -> Result<(), crate::tools::mcp::config::ConfigError> {
         config.validate()?;
+        if let Some(oauth) = config.oauth.as_ref()
+            && let (Some(authorization_url), Some(token_url)) =
+                (oauth.authorization_url.clone(), oauth.token_url.clone())
+        {
+            upsert_auth_descriptor(
+                self.settings_store(),
+                user_id,
+                Self::mcp_auth_descriptor(
+                    &config,
+                    OAuthFlowDescriptor {
+                        authorization_url,
+                        token_url,
+                        client_id: Some(oauth.client_id.clone()),
+                        client_id_env: None,
+                        client_secret: None,
+                        client_secret_env: None,
+                        scopes: oauth.scopes.clone(),
+                        use_pkce: oauth.use_pkce,
+                        extra_params: oauth.extra_params.clone(),
+                        access_token_field: "access_token".to_string(),
+                        validation_url: None,
+                    },
+                ),
+            )
+            .await;
+        }
         let mut servers = self.load_mcp_servers(user_id).await?;
         servers.upsert(config);
         if let Some(ref store) = self.store {
@@ -3183,18 +3249,6 @@ impl ExtensionManager {
         server: &McpServerConfig,
         user_id: &str,
     ) -> Result<AuthResult, ExtensionError> {
-        // Try to discover OAuth metadata and build a URL the user can open manually
-        let metadata = discover_full_oauth_metadata(&server.url)
-            .await
-            .map_err(|e| match e {
-                crate::tools::mcp::auth::AuthError::NotSupported => {
-                    ExtensionError::AuthNotSupported(e.to_string())
-                }
-                _ => ExtensionError::AuthFailed(e.to_string()),
-            })?;
-
-        use crate::cli::oauth_defaults;
-
         let is_gateway = self.should_use_gateway_mode();
         self.clear_pending_extension_auth(name).await;
 
@@ -3209,99 +3263,171 @@ impl ExtensionManager {
             format!("http://localhost:{}/callback", port.1)
         };
 
-        // Try DCR if no client_id configured
-        let (client_id, client_secret, client_secret_expires_at) =
-            if let Some(ref oauth) = server.oauth {
-                (oauth.client_id.clone(), None, None)
-            } else if let Some(ref reg_endpoint) = metadata.registration_endpoint {
+        let explicit_oauth = server.oauth.as_ref().and_then(|oauth| {
+            match (&oauth.authorization_url, &oauth.token_url) {
+                (Some(authorization_url), Some(token_url)) => Some((
+                    authorization_url.clone(),
+                    token_url.clone(),
+                    oauth.client_id.clone(),
+                    oauth.use_pkce,
+                    oauth.scopes.clone(),
+                    oauth.extra_params.clone(),
+                )),
+                _ => None,
+            }
+        });
+
+        let metadata = if explicit_oauth.is_some() {
+            None
+        } else {
+            Some(
+                discover_full_oauth_metadata(&server.url)
+                    .await
+                    .map_err(|e| match e {
+                        crate::tools::mcp::auth::AuthError::NotSupported => {
+                            ExtensionError::AuthNotSupported(e.to_string())
+                        }
+                        _ => ExtensionError::AuthFailed(e.to_string()),
+                    })?,
+            )
+        };
+
+        let (
+            authorization_url,
+            token_url,
+            client_id,
+            client_secret,
+            client_secret_expires_at,
+            use_pkce,
+            scopes,
+            mut extra_params,
+        ) = if let Some((authorization_url, token_url, client_id, use_pkce, scopes, extra_params)) =
+            explicit_oauth
+        {
+            (
+                authorization_url,
+                token_url,
+                client_id,
+                None,
+                None,
+                use_pkce,
+                scopes,
+                extra_params,
+            )
+        } else if let Some(ref oauth) = server.oauth {
+            let metadata = metadata
+                .as_ref()
+                .expect("metadata for discovered MCP oauth");
+            (
+                metadata.authorization_endpoint.clone(),
+                metadata.token_endpoint.clone(),
+                oauth.client_id.clone(),
+                None,
+                None,
+                oauth.use_pkce,
+                oauth.scopes.clone(),
+                oauth.extra_params.clone(),
+            )
+        } else if let Some(ref metadata) = metadata {
+            if let Some(ref reg_endpoint) = metadata.registration_endpoint {
                 let registration = register_client(reg_endpoint, &redirect_uri)
                     .await
                     .map_err(|e| ExtensionError::AuthFailed(e.to_string()))?;
 
                 (
+                    metadata.authorization_endpoint.clone(),
+                    metadata.token_endpoint.clone(),
                     registration.client_id,
                     registration.client_secret,
                     registration.client_secret_expires_at,
+                    true,
+                    metadata.scopes_supported.clone(),
+                    HashMap::new(),
                 )
             } else {
                 return Err(ExtensionError::AuthNotSupported(
                     "Server doesn't support OAuth or Dynamic Client Registration".to_string(),
                 ));
-            };
+            }
+        } else {
+            return Err(ExtensionError::AuthNotSupported(
+                "Server doesn't support OAuth or Dynamic Client Registration".to_string(),
+            ));
+        };
 
         // RFC 8707: resource parameter to scope the token to this MCP server
         let resource = canonical_resource_uri(&server.url);
 
-        // Build authorization URL with CSRF state using the shared oauth_defaults
-        // builder, which generates PKCE + state for us.
-        let mut extra_params = server
-            .oauth
-            .as_ref()
-            .map(|o| o.extra_params.clone())
-            .unwrap_or_default();
+        upsert_auth_descriptor(
+            self.settings_store(),
+            user_id,
+            Self::mcp_auth_descriptor(
+                server,
+                OAuthFlowDescriptor {
+                    authorization_url: authorization_url.clone(),
+                    token_url: token_url.clone(),
+                    client_id: Some(client_id.clone()),
+                    client_id_env: None,
+                    client_secret: None,
+                    client_secret_env: None,
+                    scopes: scopes.clone(),
+                    use_pkce,
+                    extra_params: extra_params.clone(),
+                    access_token_field: "access_token".to_string(),
+                    validation_url: None,
+                },
+            ),
+        )
+        .await;
+
         extra_params.insert("resource".to_string(), resource.clone());
 
-        let scopes = server
-            .oauth
-            .as_ref()
-            .map(|o| o.scopes.clone())
-            .unwrap_or_else(|| metadata.scopes_supported.clone());
-
-        let oauth_result = oauth_defaults::build_oauth_url(
-            &metadata.authorization_endpoint,
-            &client_id,
-            &redirect_uri,
-            &scopes,
-            true, // Always use PKCE for MCP
-            &extra_params,
-        );
-        let expected_state = oauth_result.state;
-        let code_verifier = oauth_result.code_verifier;
+        let launch = build_pending_oauth_launch(PendingOAuthLaunchParams {
+            extension_name: name.to_string(),
+            display_name: server.name.clone(),
+            authorization_url,
+            token_url: token_url.clone(),
+            client_id,
+            client_secret,
+            redirect_uri,
+            access_token_field: "access_token".to_string(),
+            secret_name: server.token_secret_name(),
+            provider: Some(format!("mcp:{}", name)),
+            validation_endpoint: None,
+            scopes,
+            use_pkce,
+            extra_params,
+            user_id: user_id.to_string(),
+            secrets: Arc::clone(&self.secrets),
+            sse_manager: self.sse_manager.read().await.clone(),
+            gateway_token: self.oauth_proxy_auth_token.clone(),
+            token_exchange_extra_params: {
+                let mut token_exchange_extra_params = HashMap::new();
+                token_exchange_extra_params.insert("resource".to_string(), resource.clone());
+                token_exchange_extra_params
+            },
+            client_id_secret_name: if server.oauth.is_none() {
+                Some(server.client_id_secret_name())
+            } else {
+                None
+            },
+            client_secret_secret_name: None,
+            client_secret_expires_at,
+            auto_activate_extension: true,
+        });
 
         if is_gateway {
-            let persist_client_secret = server.oauth.is_none() && client_secret.is_some();
-            let mut token_exchange_extra_params = HashMap::new();
-            token_exchange_extra_params.insert("resource".to_string(), resource.clone());
-
-            let flow = oauth_defaults::PendingOAuthFlow {
-                extension_name: name.to_string(),
-                display_name: server.name.clone(),
-                token_url: metadata.token_endpoint,
-                client_id,
-                client_secret,
-                redirect_uri,
-                code_verifier,
-                access_token_field: "access_token".to_string(),
-                secret_name: server.token_secret_name(),
-                provider: Some(format!("mcp:{}", name)),
-                validation_endpoint: None,
-                scopes,
-                user_id: user_id.to_string(),
-                secrets: Arc::clone(&self.secrets),
-                sse_manager: self.sse_manager.read().await.clone(),
-                gateway_token: self.oauth_proxy_auth_token.clone(),
-                token_exchange_extra_params,
-                client_id_secret_name: if server.oauth.is_none() {
-                    Some(server.client_id_secret_name())
-                } else {
-                    None
-                },
-                client_secret_secret_name: if persist_client_secret {
-                    Some(server.client_secret_secret_name())
-                } else {
-                    None
-                },
-                client_secret_expires_at,
-                created_at: std::time::Instant::now(),
-                auto_activate_extension: true,
-            };
+            let mut flow = launch.flow;
+            if server.oauth.is_none() && flow.client_secret.is_some() {
+                flow.client_secret_secret_name = Some(server.client_secret_secret_name());
+            }
 
             Ok(self
                 .start_gateway_oauth_flow(HostedOAuthFlowStart {
                     name: name.to_string(),
                     kind: ExtensionKind::McpServer,
-                    auth_url: oauth_result.url,
-                    expected_state,
+                    auth_url: launch.auth_url,
+                    expected_state: launch.expected_state,
                     flow,
                 })
                 .await)
@@ -3320,7 +3446,7 @@ impl ExtensionManager {
             Ok(AuthResult::awaiting_authorization(
                 name,
                 ExtensionKind::McpServer,
-                oauth_result.url,
+                launch.auth_url,
                 "local".to_string(),
             ))
         }
@@ -3470,9 +3596,14 @@ impl ExtensionManager {
 
         if all_provided {
             ToolAuthState::Ready
-        } else if required
-            .iter()
-            .any(|secret| self.secret_supports_oauth(&secret.name))
+        } else if futures::future::join_all(
+            required
+                .iter()
+                .map(|secret| self.secret_supports_oauth(user_id, &secret.name)),
+        )
+        .await
+        .into_iter()
+        .any(|supports| supports)
         {
             ToolAuthState::NeedsAuth
         } else {
@@ -3480,8 +3611,64 @@ impl ExtensionManager {
         }
     }
 
-    fn secret_supports_oauth(&self, secret_name: &str) -> bool {
-        matches!(secret_name, "google_oauth_token")
+    async fn secret_supports_oauth(&self, user_id: &str, secret_name: &str) -> bool {
+        if auth_descriptor_for_secret(self.settings_store(), user_id, secret_name)
+            .await
+            .is_some_and(|descriptor| descriptor.oauth.is_some())
+        {
+            return true;
+        }
+
+        self.tool_registry
+            .credential_registry()
+            .and_then(|registry| registry.oauth_refresh_for_secret(secret_name))
+            .is_some()
+    }
+
+    fn wasm_auth_descriptor(
+        name: &str,
+        kind: AuthDescriptorKind,
+        auth: &crate::tools::wasm::AuthCapabilitySchema,
+    ) -> AuthDescriptor {
+        AuthDescriptor {
+            kind,
+            secret_name: auth.secret_name.clone(),
+            integration_name: name.to_string(),
+            display_name: auth.display_name.clone(),
+            provider: auth.provider.clone(),
+            setup_url: auth.setup_url.clone(),
+            oauth: auth.oauth.as_ref().map(|oauth| OAuthFlowDescriptor {
+                authorization_url: oauth.authorization_url.clone(),
+                token_url: oauth.token_url.clone(),
+                client_id: oauth.client_id.clone(),
+                client_id_env: oauth.client_id_env.clone(),
+                client_secret: oauth.client_secret.clone(),
+                client_secret_env: oauth.client_secret_env.clone(),
+                scopes: oauth.scopes.clone(),
+                use_pkce: oauth.use_pkce,
+                extra_params: oauth.extra_params.clone(),
+                access_token_field: oauth.access_token_field.clone(),
+                validation_url: auth
+                    .validation_endpoint
+                    .as_ref()
+                    .map(|validation| validation.url.clone()),
+            }),
+        }
+    }
+
+    fn mcp_auth_descriptor(server: &McpServerConfig, oauth: OAuthFlowDescriptor) -> AuthDescriptor {
+        AuthDescriptor {
+            kind: AuthDescriptorKind::McpServer,
+            secret_name: server.token_secret_name(),
+            integration_name: server.name.clone(),
+            display_name: server
+                .description
+                .clone()
+                .or_else(|| Some(server.name.clone())),
+            provider: Some(format!("mcp:{}", server.name)),
+            setup_url: None,
+            oauth: Some(oauth),
+        }
     }
 
     async fn mcp_supports_auth(&self, server: &McpServerConfig) -> bool {
@@ -3512,53 +3699,72 @@ impl ExtensionManager {
     ) -> Option<AuthResult> {
         use crate::cli::oauth_defaults;
 
-        let builtin = oauth_defaults::builtin_credentials(secret_name)?;
-        let (display_name, provider, authorization_url, token_url, scopes) = match secret_name {
-            "google_oauth_token" => (
-                "Google",
-                Some("google".to_string()),
-                "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
-                "https://oauth2.googleapis.com/token".to_string(),
-                vec![
-                    "openid".to_string(),
-                    "email".to_string(),
-                    "profile".to_string(),
-                ],
-            ),
-            _ => return None,
-        };
+        let descriptor =
+            auth_descriptor_for_secret(self.settings_store(), user_id, secret_name).await?;
+        let oauth = descriptor.oauth?;
+        let builtin = oauth_defaults::builtin_credentials(secret_name);
+        let display_name = descriptor
+            .display_name
+            .clone()
+            .or_else(|| descriptor.provider.clone())
+            .unwrap_or_else(|| secret_name.to_string());
         let redirect_uri = if oauth_defaults::use_gateway_callback() {
             oauth_defaults::callback_url()
         } else {
             format!("{}/callback", oauth_defaults::callback_url())
         };
-        let oauth_result = oauth_defaults::build_oauth_url(
-            &authorization_url,
-            builtin.client_id,
-            &redirect_uri,
-            &scopes,
-            true,
-            &std::collections::HashMap::new(),
+        let client_id = oauth
+            .client_id
+            .clone()
+            .or_else(|| {
+                oauth
+                    .client_id_env
+                    .as_ref()
+                    .and_then(|env| std::env::var(env).ok())
+            })
+            .or_else(|| builtin.as_ref().map(|c| c.client_id.to_string()))?;
+        let client_secret = oauth
+            .client_secret
+            .clone()
+            .or_else(|| {
+                oauth
+                    .client_secret_env
+                    .as_ref()
+                    .and_then(|env| std::env::var(env).ok())
+            })
+            .or_else(|| builtin.as_ref().map(|c| c.client_secret.to_string()));
+        let client_secret = oauth_defaults::hosted_proxy_client_secret(
+            &client_secret,
+            builtin.as_ref(),
+            oauth_defaults::exchange_proxy_url().is_some(),
         );
         let sse_manager = self.sse_manager.read().await.clone();
         let kind = self
             .determine_installed_kind(extension_name, user_id)
             .await
             .unwrap_or(ExtensionKind::WasmChannel);
-
-        let pending_flow = oauth_defaults::PendingOAuthFlow {
+        let launch = build_pending_oauth_launch(PendingOAuthLaunchParams {
             extension_name: extension_name.to_string(),
             display_name: display_name.to_string(),
-            token_url,
-            client_id: builtin.client_id.to_string(),
-            client_secret: Some(builtin.client_secret.to_string()),
+            authorization_url: oauth.authorization_url.clone(),
+            token_url: oauth.token_url.clone(),
+            client_id,
+            client_secret,
             redirect_uri,
-            code_verifier: oauth_result.code_verifier,
-            access_token_field: "access_token".to_string(),
+            access_token_field: oauth.access_token_field,
             secret_name: secret_name.to_string(),
-            provider,
-            validation_endpoint: None,
-            scopes,
+            provider: descriptor.provider.clone(),
+            validation_endpoint: oauth.validation_url.map(|url| {
+                crate::tools::wasm::ValidationEndpointSchema {
+                    url,
+                    method: "GET".to_string(),
+                    success_status: 200,
+                    headers: std::collections::HashMap::new(),
+                }
+            }),
+            scopes: oauth.scopes,
+            use_pkce: oauth.use_pkce,
+            extra_params: oauth.extra_params,
             user_id: user_id.to_string(),
             secrets: Arc::clone(&self.secrets),
             sse_manager,
@@ -3567,17 +3773,17 @@ impl ExtensionManager {
             client_id_secret_name: None,
             client_secret_secret_name: None,
             client_secret_expires_at: None,
-            created_at: std::time::Instant::now(),
             auto_activate_extension: kind == ExtensionKind::WasmChannel,
-        };
+        });
+        let pending_flow = launch.flow;
 
         if self.should_use_gateway_mode() {
             return Some(
                 self.start_gateway_oauth_flow(HostedOAuthFlowStart {
                     name: extension_name.to_string(),
                     kind,
-                    auth_url: oauth_result.url,
-                    expected_state: oauth_result.state,
+                    auth_url: launch.auth_url,
+                    expected_state: launch.expected_state,
                     flow: pending_flow,
                 })
                 .await,
@@ -4050,6 +4256,13 @@ impl ExtensionManager {
     ) -> Result<AuthResult, String> {
         use crate::cli::oauth_defaults;
 
+        upsert_auth_descriptor(
+            self.settings_store(),
+            user_id,
+            Self::wasm_auth_descriptor(name, AuthDescriptorKind::WasmTool, auth),
+        )
+        .await;
+
         let builtin = oauth_defaults::builtin_credentials(&auth.secret_name);
 
         // Find setup secret names for client_id and client_secret from capabilities.
@@ -4112,69 +4325,49 @@ impl ExtensionManager {
             .collect_shared_scopes(&auth.secret_name, &oauth.scopes, user_id)
             .await;
 
-        // Build authorization URL with CSRF state
-        let oauth_result = oauth_defaults::build_oauth_url(
-            &oauth.authorization_url,
-            &client_id,
-            &redirect_uri,
-            &merged_scopes,
-            oauth.use_pkce,
-            &oauth.extra_params,
-        );
-        let auth_url = oauth_result.url.clone();
-        let code_verifier = oauth_result.code_verifier;
-        let expected_state = oauth_result.state;
-
         let display_name = auth
             .display_name
             .clone()
             .unwrap_or_else(|| name.to_string());
 
-        if self.should_use_gateway_mode() {
-            // When an exchange proxy is configured, omit the client_secret if it
-            // was resolved from built-in defaults (desktop app credentials). The
-            // proxy holds the correct web-app secret for platform-registered OAuth
-            // apps. Sending the desktop secret would cause a client_id/secret
-            // mismatch because the container's GOOGLE_OAUTH_CLIENT_ID is the web
-            // app, not the desktop app.
-            let proxy_client_secret = oauth_defaults::hosted_proxy_client_secret(
+        let launch = build_pending_oauth_launch(PendingOAuthLaunchParams {
+            extension_name: name.to_string(),
+            display_name: display_name.clone(),
+            authorization_url: oauth.authorization_url.clone(),
+            token_url: oauth.token_url.clone(),
+            client_id: client_id.clone(),
+            client_secret: oauth_defaults::hosted_proxy_client_secret(
                 &client_secret,
                 builtin.as_ref(),
                 oauth_defaults::exchange_proxy_url().is_some(),
-            );
+            ),
+            redirect_uri: redirect_uri.clone(),
+            access_token_field: oauth.access_token_field.clone(),
+            secret_name: auth.secret_name.clone(),
+            provider: auth.provider.clone(),
+            validation_endpoint: auth.validation_endpoint.clone(),
+            scopes: merged_scopes.clone(),
+            use_pkce: oauth.use_pkce,
+            extra_params: oauth.extra_params.clone(),
+            user_id: user_id.to_string(),
+            secrets: Arc::clone(&self.secrets),
+            sse_manager: self.sse_manager.read().await.clone(),
+            gateway_token: self.oauth_proxy_auth_token.clone(),
+            token_exchange_extra_params: std::collections::HashMap::new(),
+            client_id_secret_name: None,
+            client_secret_secret_name: None,
+            client_secret_expires_at: None,
+            auto_activate_extension: true,
+        });
 
-            let flow = oauth_defaults::PendingOAuthFlow {
-                extension_name: name.to_string(),
-                display_name: display_name.clone(),
-                token_url: oauth.token_url.clone(),
-                client_id: client_id.clone(),
-                client_secret: proxy_client_secret,
-                redirect_uri: redirect_uri.clone(),
-                code_verifier,
-                access_token_field: oauth.access_token_field.clone(),
-                secret_name: auth.secret_name.clone(),
-                provider: auth.provider.clone(),
-                validation_endpoint: auth.validation_endpoint.clone(),
-                scopes: merged_scopes,
-                user_id: user_id.to_string(),
-                secrets: Arc::clone(&self.secrets),
-                sse_manager: self.sse_manager.read().await.clone(),
-                gateway_token: self.oauth_proxy_auth_token.clone(),
-                token_exchange_extra_params: std::collections::HashMap::new(),
-                client_id_secret_name: None,
-                client_secret_secret_name: None,
-                client_secret_expires_at: None,
-                created_at: std::time::Instant::now(),
-                auto_activate_extension: true,
-            };
-
+        if self.should_use_gateway_mode() {
             Ok(self
                 .start_gateway_oauth_flow(HostedOAuthFlowStart {
                     name: name.to_string(),
                     kind: ExtensionKind::WasmTool,
-                    auth_url,
-                    expected_state,
-                    flow,
+                    auth_url: launch.auth_url,
+                    expected_state: launch.expected_state,
+                    flow: launch.flow,
                 })
                 .await)
         } else {
@@ -4184,15 +4377,19 @@ impl ExtensionManager {
                 .await
                 .map_err(|e| format!("Failed to start OAuth callback listener: {}", e))?;
 
-            let token_url = oauth.token_url.clone();
-            let access_token_field = oauth.access_token_field.clone();
-            let secret_name = auth.secret_name.clone();
-            let provider = auth.provider.clone();
-            let validation_endpoint = auth.validation_endpoint.clone();
-            let user_id = user_id.to_string();
-            let secrets = Arc::clone(&self.secrets);
+            let token_url = launch.flow.token_url.clone();
+            let access_token_field = launch.flow.access_token_field.clone();
+            let secret_name = launch.flow.secret_name.clone();
+            let provider = launch.flow.provider.clone();
+            let validation_endpoint = launch.flow.validation_endpoint.clone();
+            let user_id = launch.flow.user_id.clone();
+            let secrets = Arc::clone(&launch.flow.secrets);
             let sse_manager = self.sse_manager.read().await.clone();
             let ext_name = name.to_string();
+            let client_secret = client_secret.clone();
+            let redirect_uri = launch.flow.redirect_uri.clone();
+            let code_verifier = launch.flow.code_verifier.clone();
+            let expected_state = launch.expected_state.clone();
 
             let task_handle = tokio::spawn(async move {
                 let result: Result<(), String> = async {
@@ -4294,7 +4491,7 @@ impl ExtensionManager {
             Ok(AuthResult::awaiting_authorization(
                 name,
                 ExtensionKind::WasmTool,
-                auth_url,
+                launch.auth_url,
                 "local".to_string(),
             ))
         }
@@ -4420,6 +4617,15 @@ impl ExtensionManager {
         let Some(cap_file) = self.load_tool_capabilities(name).await else {
             return ToolAuthState::NoAuth;
         };
+
+        if let Some(auth) = cap_file.auth.as_ref() {
+            upsert_auth_descriptor(
+                self.settings_store(),
+                user_id,
+                Self::wasm_auth_descriptor(name, AuthDescriptorKind::WasmTool, auth),
+            )
+            .await;
+        }
 
         let saved_fields = self.load_tool_setup_fields(name).await.unwrap_or_default();
         let setup_is_complete = if let Some(setup) = &cap_file.setup {
@@ -7469,20 +7675,50 @@ mod tests {
     #[tokio::test]
     async fn ensure_extension_ready_reports_needs_auth_for_wasm_channel() {
         let dir = tempfile::tempdir().expect("temp dir");
+        let (store, _db_dir) = make_test_store().await;
         let channels_dir = write_test_channel(
             dir.path(),
             "gmail_channel",
             &serde_json::json!({
+                "name": "gmail_channel",
+                "description": "gmail channel",
                 "setup": {
                     "required_secrets": [
                         {"name": "google_oauth_token", "prompt": "Google OAuth token"}
-                    ]
+                    ],
+                    "setup_url": "https://example.com/setup"
                 }
             })
             .to_string(),
         );
+        crate::auth::upsert_auth_descriptor(
+            Some(store.as_ref()),
+            "test",
+            crate::auth::AuthDescriptor {
+                kind: crate::auth::AuthDescriptorKind::SkillCredential,
+                secret_name: "google_oauth_token".to_string(),
+                integration_name: "gmail".to_string(),
+                display_name: Some("Google".to_string()),
+                provider: Some("google".to_string()),
+                setup_url: None,
+                oauth: Some(crate::auth::OAuthFlowDescriptor {
+                    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+                    token_url: "https://oauth2.googleapis.com/token".to_string(),
+                    client_id: Some("client-id".to_string()),
+                    client_id_env: None,
+                    client_secret: Some("client-secret".to_string()),
+                    client_secret_env: None,
+                    scopes: vec!["openid".to_string()],
+                    use_pkce: true,
+                    extra_params: std::collections::HashMap::new(),
+                    access_token_field: "access_token".to_string(),
+                    validation_url: None,
+                }),
+            },
+        )
+        .await;
         let manager =
-            make_test_manager_with_dirs(None, dir.path().join("tools"), channels_dir, None);
+            make_test_manager_with_dirs(None, dir.path().join("tools"), channels_dir, Some(store));
 
         let outcome = manager
             .ensure_extension_ready(
@@ -7537,6 +7773,79 @@ mod tests {
             std::fs::read_to_string(&target_caps).expect("read capabilities"),
             r#"{"name":"web-search-tool"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn auth_wasm_channel_status_uses_persisted_secret_oauth_descriptor() {
+        let _env_guard = crate::config::helpers::lock_env();
+        unsafe {
+            std::env::set_var(
+                "IRONCLAW_OAUTH_CALLBACK_URL",
+                "https://example.com/oauth/callback",
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (store, _db_dir) = make_test_store().await;
+        let channels_dir = write_test_channel(
+            dir.path(),
+            "gmail_channel",
+            &serde_json::json!({
+                "name": "gmail_channel",
+                "description": "gmail channel",
+                "setup": {
+                    "required_secrets": [
+                        {"name": "google_oauth_token", "prompt": "Google OAuth token"}
+                    ],
+                    "setup_url": "https://example.com/setup"
+                }
+            })
+            .to_string(),
+        );
+        crate::auth::upsert_auth_descriptor(
+            Some(store.as_ref()),
+            "test",
+            crate::auth::AuthDescriptor {
+                kind: crate::auth::AuthDescriptorKind::SkillCredential,
+                secret_name: "google_oauth_token".to_string(),
+                integration_name: "gmail".to_string(),
+                display_name: Some("Google".to_string()),
+                provider: Some("google".to_string()),
+                setup_url: None,
+                oauth: Some(crate::auth::OAuthFlowDescriptor {
+                    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+                    token_url: "https://oauth2.googleapis.com/token".to_string(),
+                    client_id: Some("client-id".to_string()),
+                    client_id_env: None,
+                    client_secret: Some("client-secret".to_string()),
+                    client_secret_env: None,
+                    scopes: vec!["openid".to_string(), "email".to_string()],
+                    use_pkce: true,
+                    extra_params: std::collections::HashMap::new(),
+                    access_token_field: "access_token".to_string(),
+                    validation_url: None,
+                }),
+            },
+        )
+        .await;
+        let manager =
+            make_test_manager_with_dirs(None, dir.path().join("tools"), channels_dir, Some(store));
+
+        let auth = manager
+            .auth_wasm_channel_status("gmail_channel", "test")
+            .await
+            .expect("channel auth status");
+
+        assert_eq!(auth.status_str(), "awaiting_authorization");
+        assert!(
+            auth.auth_url()
+                .is_some_and(|url| url.contains("accounts.google.com")),
+            "expected hosted google auth url, got {auth:?}"
+        );
+
+        unsafe {
+            std::env::remove_var("IRONCLAW_OAUTH_CALLBACK_URL");
+        }
     }
 
     #[tokio::test]
@@ -9246,6 +9555,94 @@ mod tests {
                 "MCP secret {secret_name} should be deleted"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_add_mcp_server_persists_auth_descriptor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (store, _db_dir) = make_test_store().await;
+        let mgr = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        );
+        let server = McpServerConfig::new("notion", "https://example.com/mcp").with_oauth(
+            crate::tools::mcp::config::OAuthConfig::new("notion-client").with_endpoints(
+                "https://example.com/oauth/authorize",
+                "https://example.com/oauth/token",
+            ),
+        );
+
+        mgr.add_mcp_server(server.clone(), "test")
+            .await
+            .expect("add mcp server");
+
+        let descriptor = crate::auth::auth_descriptor_for_secret(
+            Some(store.as_ref()),
+            "test",
+            &server.token_secret_name(),
+        )
+        .await
+        .expect("persisted mcp auth descriptor");
+
+        assert_eq!(descriptor.kind, crate::auth::AuthDescriptorKind::McpServer);
+        assert_eq!(descriptor.integration_name, "notion");
+        assert_eq!(descriptor.provider.as_deref(), Some("mcp:notion"));
+        let oauth = descriptor.oauth.expect("oauth descriptor");
+        assert_eq!(
+            oauth.authorization_url,
+            "https://example.com/oauth/authorize"
+        );
+        assert_eq!(oauth.token_url, "https://example.com/oauth/token");
+        assert_eq!(oauth.client_id.as_deref(), Some("notion-client"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_mcp_build_url_uses_explicit_oauth_endpoints() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (store, _db_dir) = make_test_store().await;
+        let mgr = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        );
+        let server = McpServerConfig::new("notion", "https://example.com/mcp").with_oauth(
+            crate::tools::mcp::config::OAuthConfig::new("notion-client")
+                .with_endpoints(
+                    "https://example.com/oauth/authorize",
+                    "https://example.com/oauth/token",
+                )
+                .with_scopes(vec!["search:read".to_string()]),
+        );
+
+        let auth = mgr
+            .auth_mcp_build_url("notion", &server, "test")
+            .await
+            .expect("build auth url");
+
+        assert_eq!(auth.status_str(), "awaiting_authorization");
+        assert!(
+            auth.auth_url()
+                .is_some_and(|url| url.contains("https://example.com/oauth/authorize")),
+            "expected explicit auth endpoint in URL, got {auth:?}"
+        );
+
+        let descriptor = crate::auth::auth_descriptor_for_secret(
+            Some(store.as_ref()),
+            "test",
+            &server.token_secret_name(),
+        )
+        .await
+        .expect("persisted mcp auth descriptor");
+        let oauth = descriptor.oauth.expect("oauth descriptor");
+        assert_eq!(
+            oauth.authorization_url,
+            "https://example.com/oauth/authorize"
+        );
+        assert_eq!(oauth.token_url, "https://example.com/oauth/token");
+        assert_eq!(oauth.scopes, vec!["search:read".to_string()]);
     }
 
     #[test]

@@ -504,38 +504,6 @@ impl EffectBridgeAdapter {
             }
         }
 
-        if let Some((_, tool)) = self.tools.get_resolved(&lookup_name).await {
-            let requirement = tool.requires_approval(&parameters);
-            match requirement {
-                ApprovalRequirement::Always => {
-                    return Err(EngineError::LeaseDenied {
-                        reason: format!(
-                            "Tool '{}' requires explicit approval for this operation. \
-                             This action cannot be auto-approved.",
-                            action_name
-                        ),
-                    });
-                }
-                ApprovalRequirement::UnlessAutoApproved => {
-                    let is_approved = self.auto_approved.read().await.contains(&lookup_name);
-                    if !is_approved && !approval_already_granted {
-                        // Credential presence alone does NOT bypass approval.
-                        // Credentials indicate the call *can* be authenticated,
-                        // not that the user has authorized this specific request.
-                        return Err(Self::gate_paused(
-                            "approval",
-                            action_name,
-                            context.current_call_id.as_deref(),
-                            parameters,
-                            ironclaw_engine::ResumeKind::Approval { allow_always: true },
-                            None,
-                        ));
-                    }
-                }
-                ApprovalRequirement::Never => {}
-            }
-        }
-
         if let Some(tool) = self.tools.get(&lookup_name).await
             && let Some(rl_config) = tool.rate_limit_config()
         {
@@ -647,6 +615,35 @@ impl EffectBridgeAdapter {
                     });
                 }
                 ToolReadiness::Ready => {}
+            }
+        }
+
+        if let Some((_, tool)) = self.tools.get_resolved(&lookup_name).await {
+            let requirement = tool.requires_approval(&parameters);
+            match requirement {
+                ApprovalRequirement::Always => {
+                    return Err(EngineError::LeaseDenied {
+                        reason: format!(
+                            "Tool '{}' requires explicit approval for this operation. \
+                             This action cannot be auto-approved.",
+                            action_name
+                        ),
+                    });
+                }
+                ApprovalRequirement::UnlessAutoApproved => {
+                    let is_approved = self.auto_approved.read().await.contains(&lookup_name);
+                    if !is_approved && !approval_already_granted {
+                        return Err(Self::gate_paused(
+                            "approval",
+                            action_name,
+                            context.current_call_id.as_deref(),
+                            parameters,
+                            ironclaw_engine::ResumeKind::Approval { allow_always: true },
+                            None,
+                        ));
+                    }
+                }
+                ApprovalRequirement::Never => {}
             }
         }
 

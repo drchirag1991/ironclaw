@@ -5,13 +5,16 @@
 //! and extension_tools.rs with a single state machine.
 //!
 //! Three detection paths:
-//! 1. **HTTP tool** — `SharedCredentialRegistry` + `SecretsStore::exists()`
+//! 1. **HTTP tool** — `SharedCredentialRegistry` + shared refresh-aware credential resolution
 //! 2. **WASM tools** — same path (WASM tools register host→credential mappings)
 //! 3. **Extensions** — `ExtensionManager::check_tool_auth_status()`
 
 use std::sync::Arc;
 
-use crate::auth::resolve_secret_for_runtime;
+use crate::auth::{
+    AuthDescriptor, AuthDescriptorKind, OAuthFlowDescriptor, PendingOAuthLaunchParams,
+    build_pending_oauth_launch, resolve_secret_for_runtime, upsert_auth_descriptor,
+};
 use crate::extensions::naming::canonicalize_extension_name;
 use crate::extensions::{ConfigureResult, ExtensionError};
 use crate::secrets::SecretsStore;
@@ -108,6 +111,23 @@ impl AuthManager {
             extension_manager,
             tools,
         }
+    }
+
+    fn settings_store(&self) -> Option<&dyn crate::db::SettingsStore> {
+        self.tools
+            .as_ref()
+            .and_then(|tools| {
+                tools
+                    .database()
+                    .map(|db| db.as_ref() as &dyn crate::db::SettingsStore)
+            })
+            .or_else(|| {
+                self.extension_manager.as_ref().and_then(|manager| {
+                    manager
+                        .database()
+                        .map(|db| db.as_ref() as &dyn crate::db::SettingsStore)
+                })
+            })
     }
 
     /// Pre-flight credential check for a tool call.
@@ -451,6 +471,27 @@ impl AuthManager {
 
         let spec = self.get_credential_spec(credential_name)?;
         let oauth = spec.oauth.as_ref()?;
+        let descriptor = AuthDescriptor {
+            kind: AuthDescriptorKind::SkillCredential,
+            secret_name: spec.name.clone(),
+            integration_name: spec.name.clone(),
+            display_name: Some(spec.provider.clone()),
+            provider: Some(spec.provider.clone()),
+            setup_url: None,
+            oauth: Some(OAuthFlowDescriptor {
+                authorization_url: oauth.authorization_url.clone(),
+                token_url: oauth.token_url.clone(),
+                client_id: oauth.client_id.clone(),
+                client_id_env: oauth.client_id_env.clone(),
+                client_secret: oauth.client_secret.clone(),
+                client_secret_env: oauth.client_secret_env.clone(),
+                scopes: oauth.scopes.clone(),
+                use_pkce: oauth.use_pkce,
+                extra_params: oauth.extra_params.clone(),
+                access_token_field: "access_token".to_string(),
+                validation_url: oauth.test_url.clone(),
+            }),
+        };
         let builtin = oauth_defaults::builtin_credentials(credential_name);
         let exchange_proxy_url = oauth_defaults::exchange_proxy_url();
         let client_id = oauth
@@ -479,21 +520,13 @@ impl AuthManager {
             exchange_proxy_url.is_some(),
         );
         let ext_mgr = self.extension_manager.as_ref()?;
+        upsert_auth_descriptor(self.settings_store(), user_id, descriptor).await;
         let use_gateway = oauth_defaults::use_gateway_callback();
         let redirect_uri = if use_gateway {
             oauth_defaults::callback_url()
         } else {
             format!("{}/callback", oauth_defaults::callback_url())
         };
-        let oauth_result = oauth_defaults::build_oauth_url(
-            &oauth.authorization_url,
-            &client_id,
-            &redirect_uri,
-            &oauth.scopes,
-            oauth.use_pkce,
-            &oauth.extra_params,
-        );
-
         let validation_endpoint =
             oauth
                 .test_url
@@ -505,19 +538,21 @@ impl AuthManager {
                     headers: std::collections::HashMap::new(),
                 });
 
-        let pending_flow = oauth_defaults::PendingOAuthFlow {
+        let launch = build_pending_oauth_launch(PendingOAuthLaunchParams {
             extension_name: credential_name.to_string(),
             display_name: spec.provider.clone(),
+            authorization_url: oauth.authorization_url.clone(),
             token_url: oauth.token_url.clone(),
             client_id,
             client_secret,
             redirect_uri: redirect_uri.clone(),
-            code_verifier: oauth_result.code_verifier.clone(),
             access_token_field: "access_token".to_string(),
             secret_name: credential_name.to_string(),
             provider: Some(spec.provider.clone()),
             validation_endpoint: validation_endpoint.clone(),
             scopes: oauth.scopes.clone(),
+            use_pkce: oauth.use_pkce,
+            extra_params: oauth.extra_params.clone(),
             user_id: user_id.to_string(),
             secrets: Arc::clone(&self.secrets_store),
             sse_manager: ext_mgr.sse_sender().await,
@@ -526,16 +561,16 @@ impl AuthManager {
             client_id_secret_name: None,
             client_secret_secret_name: None,
             client_secret_expires_at: None,
-            created_at: std::time::Instant::now(),
             auto_activate_extension: false,
-        };
+        });
+        let pending_flow = launch.flow;
 
         if use_gateway {
             let mut pending_flows = ext_mgr.pending_oauth_flows().write().await;
             pending_flows.retain(|_, flow| {
                 !(flow.secret_name == credential_name && flow.user_id == user_id)
             });
-            pending_flows.insert(oauth_result.state.clone(), pending_flow);
+            pending_flows.insert(launch.expected_state.clone(), pending_flow);
         } else {
             let listener = oauth_defaults::bind_callback_listener().await.ok()?;
             let display_name = pending_flow.display_name.clone();
@@ -550,7 +585,7 @@ impl AuthManager {
             let validation_endpoint = pending_flow.validation_endpoint.clone();
             let secrets = Arc::clone(&pending_flow.secrets);
             let user_id = pending_flow.user_id.clone();
-            let expected_state = oauth_result.state.clone();
+            let expected_state = launch.expected_state.clone();
             tokio::spawn(async move {
                 let result: Result<(), String> = async {
                     let code = oauth_defaults::wait_for_callback(
@@ -623,7 +658,7 @@ impl AuthManager {
             });
         }
 
-        Some(oauth_result.url)
+        Some(launch.auth_url)
     }
 
     fn get_credential_spec(&self, credential_name: &str) -> Option<SkillCredentialSpec> {
@@ -1005,12 +1040,21 @@ Test skill
             .to_string(),
         )
         .expect("write channel caps");
-        let ext_mgr = make_extension_manager(
+        let credential_registry = crate::tools::wasm::SharedCredentialRegistry::new();
+        {
+            let guard = skill_registry.read().expect("skill registry");
+            crate::skills::register_skill_credentials(guard.skills(), &credential_registry);
+        }
+        let tools = Arc::new(
+            ToolRegistry::new().with_credentials(Arc::new(credential_registry), Arc::clone(&store)),
+        );
+        let ext_mgr = make_extension_manager_with_registry(
             Arc::clone(&store),
             wasm_tools_dir.path(),
             wasm_channels_dir.path(),
+            Arc::clone(&tools),
         );
-        let mgr = AuthManager::new(store, Some(skill_registry), Some(ext_mgr), None);
+        let mgr = AuthManager::new(store, Some(skill_registry), Some(ext_mgr), Some(tools));
 
         let readiness = mgr.check_tool_readiness("gmail-channel", "user1").await;
         match readiness {
@@ -1096,7 +1140,14 @@ Test skill
         )
         .expect("write channel caps");
 
-        let tools = Arc::new(ToolRegistry::new());
+        let credential_registry = crate::tools::wasm::SharedCredentialRegistry::new();
+        {
+            let guard = skill_registry.read().expect("skill registry");
+            crate::skills::register_skill_credentials(guard.skills(), &credential_registry);
+        }
+        let tools = Arc::new(
+            ToolRegistry::new().with_credentials(Arc::new(credential_registry), Arc::clone(&store)),
+        );
         tools.register(Arc::new(ProviderActionTool)).await;
         let ext_mgr = make_extension_manager_with_registry(
             Arc::clone(&store),

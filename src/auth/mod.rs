@@ -3,10 +3,222 @@ use std::future::Future;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::cli::oauth_defaults;
-use crate::db::Database;
+use crate::db::{Database, SettingsStore};
 use crate::secrets::{CreateSecretParams, DecryptedSecret, SecretError, SecretsStore};
 use crate::tools::wasm::OAuthRefreshConfig;
+
+const AUTH_DESCRIPTORS_SETTING_KEY: &str = "auth.descriptors_v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AuthDescriptorKind {
+    SkillCredential,
+    WasmTool,
+    WasmChannel,
+    McpServer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthFlowDescriptor {
+    pub authorization_url: String,
+    pub token_url: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_id_env: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub client_secret_env: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub use_pkce: bool,
+    #[serde(default)]
+    pub extra_params: HashMap<String, String>,
+    #[serde(default = "default_access_token_field")]
+    pub access_token_field: String,
+    #[serde(default)]
+    pub validation_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthDescriptor {
+    pub kind: AuthDescriptorKind,
+    pub secret_name: String,
+    pub integration_name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub setup_url: Option<String>,
+    #[serde(default)]
+    pub oauth: Option<OAuthFlowDescriptor>,
+}
+
+pub struct PendingOAuthLaunch {
+    pub auth_url: String,
+    pub expected_state: String,
+    pub flow: crate::cli::oauth_defaults::PendingOAuthFlow,
+}
+
+pub struct PendingOAuthLaunchParams {
+    pub extension_name: String,
+    pub display_name: String,
+    pub authorization_url: String,
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub access_token_field: String,
+    pub secret_name: String,
+    pub provider: Option<String>,
+    pub validation_endpoint: Option<crate::tools::wasm::ValidationEndpointSchema>,
+    pub scopes: Vec<String>,
+    pub use_pkce: bool,
+    pub extra_params: HashMap<String, String>,
+    pub user_id: String,
+    pub secrets: Arc<dyn SecretsStore + Send + Sync>,
+    pub sse_manager: Option<Arc<crate::channels::web::sse::SseManager>>,
+    pub gateway_token: Option<String>,
+    pub token_exchange_extra_params: HashMap<String, String>,
+    pub client_id_secret_name: Option<String>,
+    pub client_secret_secret_name: Option<String>,
+    pub client_secret_expires_at: Option<u64>,
+    pub auto_activate_extension: bool,
+}
+
+fn default_access_token_field() -> String {
+    "access_token".to_string()
+}
+
+pub fn build_pending_oauth_launch(params: PendingOAuthLaunchParams) -> PendingOAuthLaunch {
+    let oauth_result = oauth_defaults::build_oauth_url(
+        &params.authorization_url,
+        &params.client_id,
+        &params.redirect_uri,
+        &params.scopes,
+        params.use_pkce,
+        &params.extra_params,
+    );
+
+    let flow = crate::cli::oauth_defaults::PendingOAuthFlow {
+        extension_name: params.extension_name,
+        display_name: params.display_name,
+        token_url: params.token_url,
+        client_id: params.client_id,
+        client_secret: params.client_secret,
+        redirect_uri: params.redirect_uri,
+        code_verifier: oauth_result.code_verifier.clone(),
+        access_token_field: params.access_token_field,
+        secret_name: params.secret_name,
+        provider: params.provider,
+        validation_endpoint: params.validation_endpoint,
+        scopes: params.scopes,
+        user_id: params.user_id,
+        secrets: params.secrets,
+        sse_manager: params.sse_manager,
+        gateway_token: params.gateway_token,
+        token_exchange_extra_params: params.token_exchange_extra_params,
+        client_id_secret_name: params.client_id_secret_name,
+        client_secret_secret_name: params.client_secret_secret_name,
+        client_secret_expires_at: params.client_secret_expires_at,
+        created_at: std::time::Instant::now(),
+        auto_activate_extension: params.auto_activate_extension,
+    };
+
+    PendingOAuthLaunch {
+        auth_url: oauth_result.url,
+        expected_state: oauth_result.state,
+        flow,
+    }
+}
+
+async fn load_auth_descriptors(
+    store: &dyn SettingsStore,
+    user_id: &str,
+) -> Result<HashMap<String, AuthDescriptor>, crate::error::DatabaseError> {
+    match store
+        .get_setting(user_id, AUTH_DESCRIPTORS_SETTING_KEY)
+        .await?
+    {
+        Some(value) => serde_json::from_value(value)
+            .map_err(|error| crate::error::DatabaseError::Query(error.to_string())),
+        None => Ok(HashMap::new()),
+    }
+}
+
+pub async fn auth_descriptor_for_secret(
+    store: Option<&dyn SettingsStore>,
+    user_id: &str,
+    secret_name: &str,
+) -> Option<AuthDescriptor> {
+    let store = store?;
+    match load_auth_descriptors(store, user_id).await {
+        Ok(descriptors) => descriptors.get(&secret_name.to_lowercase()).cloned(),
+        Err(error) => {
+            tracing::warn!(
+                user_id = %user_id,
+                secret_name = %secret_name,
+                error = %error,
+                "Failed to load auth descriptors"
+            );
+            None
+        }
+    }
+}
+
+pub async fn upsert_auth_descriptor(
+    store: Option<&dyn SettingsStore>,
+    user_id: &str,
+    descriptor: AuthDescriptor,
+) {
+    let Some(store) = store else {
+        return;
+    };
+
+    let mut descriptors = match load_auth_descriptors(store, user_id).await {
+        Ok(descriptors) => descriptors,
+        Err(error) => {
+            tracing::warn!(
+                user_id = %user_id,
+                secret_name = %descriptor.secret_name,
+                error = %error,
+                "Failed to load auth descriptors for update"
+            );
+            return;
+        }
+    };
+    descriptors.insert(descriptor.secret_name.to_lowercase(), descriptor.clone());
+
+    let value = match serde_json::to_value(&descriptors) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                user_id = %user_id,
+                secret_name = %descriptor.secret_name,
+                error = %error,
+                "Failed to serialize auth descriptors"
+            );
+            return;
+        }
+    };
+
+    if let Err(error) = store
+        .set_setting(user_id, AUTH_DESCRIPTORS_SETTING_KEY, &value)
+        .await
+    {
+        tracing::warn!(
+            user_id = %user_id,
+            secret_name = %descriptor.secret_name,
+            error = %error,
+            "Failed to persist auth descriptor"
+        );
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct RefreshLockKey {

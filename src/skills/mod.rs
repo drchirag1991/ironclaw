@@ -36,6 +36,10 @@ pub use attenuation::{AttenuationResult, attenuate_tools};
 
 use crate::secrets::{CredentialLocation, CredentialMapping};
 use crate::tools::wasm::OAuthRefreshConfig;
+use crate::{
+    auth::{AuthDescriptor, AuthDescriptorKind, OAuthFlowDescriptor, upsert_auth_descriptor},
+    db::SettingsStore,
+};
 use ironclaw_skills::{LoadedSkill, SkillCredentialLocation, SkillCredentialSpec};
 
 /// Convert a skill credential location to the main crate's [`CredentialLocation`].
@@ -155,6 +159,33 @@ fn credential_spec_to_oauth_refresh(spec: &SkillCredentialSpec) -> Option<OAuthR
     })
 }
 
+fn credential_spec_to_auth_descriptor(
+    skill_name: &str,
+    spec: &SkillCredentialSpec,
+) -> AuthDescriptor {
+    AuthDescriptor {
+        kind: AuthDescriptorKind::SkillCredential,
+        secret_name: spec.name.clone(),
+        integration_name: skill_name.to_string(),
+        display_name: Some(spec.provider.clone()),
+        provider: Some(spec.provider.clone()),
+        setup_url: None,
+        oauth: spec.oauth.as_ref().map(|oauth| OAuthFlowDescriptor {
+            authorization_url: oauth.authorization_url.clone(),
+            token_url: oauth.token_url.clone(),
+            client_id: oauth.client_id.clone(),
+            client_id_env: oauth.client_id_env.clone(),
+            client_secret: oauth.client_secret.clone(),
+            client_secret_env: oauth.client_secret_env.clone(),
+            scopes: oauth.scopes.clone(),
+            use_pkce: oauth.use_pkce,
+            extra_params: oauth.extra_params.clone(),
+            access_token_field: "access_token".to_string(),
+            validation_url: oauth.test_url.clone(),
+        }),
+    }
+}
+
 /// Register credential mappings from loaded skills into the shared registry.
 ///
 /// Validates each spec before registration; invalid specs are logged and skipped.
@@ -192,6 +223,24 @@ pub fn register_skill_credentials(
     }
     if count > 0 {
         tracing::debug!(count, "Registered skill credential mappings");
+    }
+}
+
+pub async fn persist_skill_auth_descriptors(
+    skills: &[LoadedSkill],
+    store: Option<&dyn SettingsStore>,
+    user_id: &str,
+) {
+    for skill in skills {
+        for spec in &skill.manifest.credentials {
+            let errors = ironclaw_skills::validation::validate_credential_spec(spec);
+            if !errors.is_empty() {
+                continue;
+            }
+
+            let descriptor = credential_spec_to_auth_descriptor(skill.name(), spec);
+            upsert_auth_descriptor(store, user_id, descriptor).await;
+        }
     }
 }
 
