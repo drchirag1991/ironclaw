@@ -5484,6 +5484,40 @@ mod tests {
     }
 
     #[test]
+    fn test_http_request_rejects_private_ip_targets() {
+        let capabilities =
+            ChannelCapabilities::for_channel("test").with_tool_capabilities(ToolCapabilities {
+                http: Some(HttpCapability::new(vec![EndpointPattern::host(
+                    "127.0.0.1",
+                )])),
+                ..Default::default()
+            });
+        let mut store = super::ChannelStoreData::new(
+            1024 * 1024,
+            "test",
+            capabilities,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            Arc::new(PairingStore::new_noop()),
+        );
+
+        let result = super::near::agent::channel_host::Host::http_request(
+            &mut store,
+            "GET".to_string(),
+            "https://127.0.0.1:1/health".to_string(),
+            "{}".to_string(),
+            None,
+            Some(1_000),
+        );
+
+        assert!(result.is_err(), "loopback targets must be rejected");
+        assert!(
+            result.unwrap_err().contains("private/internal IP"),
+            "expected SSRF guard error"
+        );
+    }
+
+    #[test]
     fn test_should_skip_response_leak_scan_only_for_telegram_getupdates() {
         use super::should_skip_response_leak_scan;
 
