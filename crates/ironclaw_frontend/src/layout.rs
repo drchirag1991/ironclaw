@@ -93,15 +93,30 @@ pub struct ChatConfig {
 }
 
 /// Per-widget instance configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WidgetInstanceConfig {
-    /// Whether this widget is enabled.
-    #[serde(default)]
+    /// Whether this widget is enabled. Defaults to `true` so a layout entry
+    /// that only customizes a widget's `config` (and omits `enabled`) does
+    /// not silently disable the widget.
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Arbitrary widget-specific configuration passed to `widget.init()`.
     #[serde(default)]
     pub config: serde_json::Value,
+}
+
+impl Default for WidgetInstanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            config: serde_json::Value::Null,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl BrandingConfig {
@@ -167,6 +182,28 @@ mod tests {
         let css = branding.to_css_vars();
         assert!(css.contains("--color-primary: #0066cc;"));
         assert!(css.contains("--color-accent: #ff6b00;"));
+    }
+
+    #[test]
+    fn test_widget_instance_enabled_defaults_to_true() {
+        // A layout entry that customizes config but omits `enabled` must
+        // NOT silently disable the widget — that was the old bug.
+        let json = serde_json::json!({ "config": { "refresh": 30 } });
+        let cfg: WidgetInstanceConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.enabled, "enabled should default to true");
+    }
+
+    #[test]
+    fn test_widget_instance_default_impl_is_enabled() {
+        // The programmatic default must match the deserialized default.
+        assert!(WidgetInstanceConfig::default().enabled);
+    }
+
+    #[test]
+    fn test_widget_instance_explicit_false_respected() {
+        let json = serde_json::json!({ "enabled": false });
+        let cfg: WidgetInstanceConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.enabled);
     }
 
     #[test]

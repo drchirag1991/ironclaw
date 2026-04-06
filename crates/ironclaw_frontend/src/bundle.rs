@@ -21,6 +21,41 @@ fn escape_html_attr(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Rewrite any occurrence of `needle` (ASCII, case-insensitive) in `s` by
+/// inserting a backslash between the leading `<` and `/`, turning `</tag`
+/// into `<\/tag`. Used to neutralize `</script` / `</style` sequences so
+/// embedded content cannot break out of an inline `<script>` or `<style>`
+/// block. The HTML parser treats `</script ` and `</SCRIPT>` as end tags
+/// just like `</script>`, so a plain literal replace is insufficient.
+fn escape_tag_close(s: &str, needle: &str) -> String {
+    debug_assert!(needle.starts_with("</") && needle.is_ascii());
+    let bytes = s.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes.len() - i >= needle_bytes.len()
+            && bytes[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle_bytes)
+        {
+            // Preserve original casing, just inject the backslash.
+            out.push('<');
+            out.push('\\');
+            out.push_str(&s[i + 1..i + needle_bytes.len()]);
+            i += needle_bytes.len();
+        } else {
+            // Advance one full UTF-8 char. `is_char_boundary` guarantees we
+            // never split a multi-byte sequence.
+            let mut next = i + 1;
+            while next < bytes.len() && !s.is_char_boundary(next) {
+                next += 1;
+            }
+            out.push_str(&s[i..next]);
+            i = next;
+        }
+    }
+    out
+}
+
 /// A resolved frontend bundle ready for serving.
 ///
 /// Contains the layout configuration, resolved widgets (with their JS/CSS
@@ -77,11 +112,14 @@ pub fn assemble_index(base_html: &str, bundle: &FrontendBundle) -> String {
 
     // --- Body injections ---
 
-    // Layout config as global variable
+    // Layout config as global variable. JSON strings can contain `</script>`
+    // (serde_json does not escape `<` or `/` by default), so neutralize any
+    // `</script…` sequence before dropping it into an inline <script> tag.
     if let Ok(layout_json) = serde_json::to_string(&bundle.layout) {
+        let safe_layout = escape_tag_close(&layout_json, "</script");
         body_injections.push(format!(
             "<script>window.__IRONCLAW_LAYOUT__ = {};</script>",
-            layout_json
+            safe_layout
         ));
     }
 
@@ -90,17 +128,21 @@ pub fn assemble_index(base_html: &str, bundle: &FrontendBundle) -> String {
         if let Some(ref css) = widget.css {
             let scoped = scope_css(css, &widget.manifest.id);
             if !scoped.trim().is_empty() {
+                // Neutralize any `</style…` sequence in scoped CSS — scope_css
+                // only rewrites selectors, so a widget CSS string literal
+                // containing `</style>` would otherwise break out of the tag.
+                let safe_css = escape_tag_close(&scoped, "</style");
                 body_injections.push(format!(
                     "<style data-widget=\"{}\">{}</style>",
                     escape_html_attr(&widget.manifest.id),
-                    scoped
+                    safe_css
                 ));
             }
         }
 
         // Widget JS inlined (avoids auth issues with <script src> on protected endpoints).
         // Escape </script> in widget JS to prevent script tag breakout (XSS).
-        let safe_js = widget.js.replace("</script>", "<\\/script>");
+        let safe_js = escape_tag_close(&widget.js, "</script");
         body_injections.push(format!(
             "<script type=\"module\" data-widget=\"{}\">\n{}\n</script>",
             escape_html_attr(&widget.manifest.id),
@@ -112,7 +154,9 @@ pub fn assemble_index(base_html: &str, bundle: &FrontendBundle) -> String {
     if let Some(ref custom_css) = bundle.custom_css
         && !custom_css.trim().is_empty()
     {
-        body_injections.push(format!("<style data-custom-css>{}</style>", custom_css));
+        // Same reasoning as widget CSS — neutralize `</style…` breakouts.
+        let safe_custom = escape_tag_close(custom_css, "</style");
+        body_injections.push(format!("<style data-custom-css>{}</style>", safe_custom));
     }
 
     // --- Assemble ---
@@ -297,6 +341,117 @@ mod tests {
         // </script> in widget JS should be escaped to prevent tag breakout
         assert!(!result.contains("</script><script>alert(1)"));
         assert!(result.contains("<\\/script>"));
+    }
+
+    #[test]
+    fn test_assemble_index_layout_json_script_breakout_escaped() {
+        // Layout branding title containing `</script>` must not break out
+        // of the `window.__IRONCLAW_LAYOUT__` script injection.
+        let bundle = FrontendBundle {
+            layout: LayoutConfig {
+                branding: BrandingConfig {
+                    title: Some("evil</script><script>alert(1)</script>".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        // The layout <script> tag must not contain a raw `</script>` closer
+        // from the title — it must be neutralized as `<\/script>`.
+        // Title itself is injected into <title> HTML-escaped (a separate code path),
+        // but it's also present inside the JSON string in window.__IRONCLAW_LAYOUT__.
+        let layout_start = result.find("window.__IRONCLAW_LAYOUT__").unwrap();
+        let layout_end = result[layout_start..].find("</script>").unwrap() + layout_start;
+        let layout_script = &result[layout_start..layout_end];
+        // Between the opening `<script>` and the first real `</script>`, the
+        // raw breakout payload must not appear.
+        assert!(
+            !layout_script.contains("</script>"),
+            "raw </script> inside layout JSON broke out of the script tag"
+        );
+        assert!(layout_script.contains("<\\/script>"));
+    }
+
+    #[test]
+    fn test_assemble_index_widget_css_style_breakout_escaped() {
+        // Widget CSS containing `</style>` (e.g., via a content: "…" string)
+        // must not break out of the <style> tag.
+        let bundle = FrontendBundle {
+            widgets: vec![ResolvedWidget {
+                manifest: WidgetManifest {
+                    id: "evil-css".to_string(),
+                    name: "Evil CSS Widget".to_string(),
+                    slot: WidgetSlot::Tab,
+                    icon: None,
+                    position: None,
+                },
+                js: "// safe".to_string(),
+                css: Some(
+                    ".x::before { content: \"</style><script>alert(1)</script>\"; }".to_string(),
+                ),
+            }],
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        // The widget <style> block must not contain a raw `</style>` from
+        // the CSS string literal.
+        let style_start = result.find("data-widget=\"evil-css\">").unwrap();
+        // `style_start` points into the opening <style> tag's attribute; the
+        // first `</style>` after this marker must be the tag's real closer.
+        let rest = &result[style_start..];
+        let first_close = rest.find("</style>").unwrap();
+        let body = &rest[..first_close];
+        assert!(
+            !body.contains("</style>"),
+            "raw </style> inside widget CSS broke out of the style tag"
+        );
+        assert!(body.contains("<\\/style>"));
+    }
+
+    #[test]
+    fn test_assemble_index_custom_css_style_breakout_escaped() {
+        // Custom workspace CSS containing `</style>` must not break out.
+        let bundle = FrontendBundle {
+            custom_css: Some("body { color: red; } </style><script>alert(1)</script>".to_string()),
+            ..Default::default()
+        };
+        let result = assemble_index(MINIMAL_HTML, &bundle);
+        let style_start = result.find("data-custom-css>").unwrap();
+        let rest = &result[style_start..];
+        let first_close = rest.find("</style>").unwrap();
+        let body = &rest[..first_close];
+        assert!(
+            !body.contains("</style>"),
+            "raw </style> inside custom CSS broke out of the style tag"
+        );
+        assert!(body.contains("<\\/style>"));
+    }
+
+    #[test]
+    fn test_escape_tag_close_case_insensitive() {
+        // HTML parsers treat `</SCRIPT>` and `</script >` the same as
+        // `</script>`, so the escape must be case-insensitive.
+        assert_eq!(
+            escape_tag_close("a </SCRIPT> b", "</script"),
+            "a <\\/SCRIPT> b"
+        );
+        assert_eq!(
+            escape_tag_close("a </Script\n> b", "</script"),
+            "a <\\/Script\n> b"
+        );
+        // Unrelated `<` and `/` characters must be untouched.
+        assert_eq!(escape_tag_close("<div>x</div>", "</script"), "<div>x</div>");
+    }
+
+    #[test]
+    fn test_escape_tag_close_multibyte_safe() {
+        // Must not panic on multi-byte UTF-8 characters adjacent to the needle.
+        let input = "日本語</script>日本語";
+        let out = escape_tag_close(input, "</script");
+        assert!(out.contains("<\\/script>"));
+        assert!(out.contains("日本語"));
     }
 
     #[test]

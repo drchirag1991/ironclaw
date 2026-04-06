@@ -250,6 +250,8 @@ impl GatewayWorkflowHarness {
             near_rpc_url: None,
             near_network: None,
             oauth_sweep_shutdown: None,
+
+            frontend_html_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
         });
 
         let mut agent = Agent::new(

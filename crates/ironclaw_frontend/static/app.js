@@ -1409,10 +1409,17 @@ function upgradeStructuredData(contentEl) {
 
 /**
  * Find JSON-like objects in text nodes and replace them with styled cards.
+ *
+ * Uses a linear bracket-counting scan instead of a regex with nested
+ * quantifiers — the old `/(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})/g` exhibited
+ * catastrophic backtracking on adversarial input. The current implementation
+ * is bounded by two caps:
+ *   - MAX_PARA_LEN: skip paragraphs larger than this entirely
+ *   - MAX_SCAN:     each `{` scan is capped at this many chars
+ *   - MAX_CANDIDATES per paragraph
  */
 function upgradeInlineJson(contentEl) {
-  // Walk text content looking for JSON objects: {...} patterns
-  // Only process <p> and top-level text, not code blocks
+  var MAX_PARA_LEN = 20000;
   var paragraphs = contentEl.querySelectorAll('p');
   if (paragraphs.length === 0) {
     // No <p> tags — markdown might have produced bare text
@@ -1425,39 +1432,115 @@ function upgradeInlineJson(contentEl) {
 
     var html = p.innerHTML;
     if (!html.includes('{')) return; // Fast path: no braces at all
+    if (html.length > MAX_PARA_LEN) return; // Bail on very long content
 
-    // Match JSON-like objects: {...} (including Python-style single quotes)
-    var jsonRegex = /(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})/g;
-    var match;
-    var replaced = false;
+    var candidates = _findJsonCandidates(html);
+    if (candidates.length === 0) return;
 
-    while ((match = jsonRegex.exec(html)) !== null) {
-      var raw = match[1];
-      // Skip matches inside <code> tags by checking surrounding HTML
-      var before = html.substring(0, match.index);
-      var openCodes = (before.match(/<code/gi) || []).length;
-      var closeCodes = (before.match(/<\/code/gi) || []).length;
-      if (openCodes > closeCodes) continue; // Inside a <code> tag
-      // Normalize Python-style single quotes to double quotes for parsing
-      var normalized = raw.replace(/'/g, '"');
-      try {
-        var obj = JSON.parse(normalized);
-        if (typeof obj === 'object' && obj !== null && !Array.isArray(obj)) {
-          var card = buildDataCard(obj);
-          html = html.substring(0, match.index) + card + html.substring(match.index + match[0].length);
-          replaced = true;
-          // Reset regex since we modified the string
-          jsonRegex.lastIndex = match.index + card.length;
-        }
-      } catch (e) {
-        // Not valid JSON — leave as text
+    // Apply replacements in reverse order so earlier-index positions stay valid.
+    var out = html;
+    for (var i = candidates.length - 1; i >= 0; i--) {
+      var c = candidates[i];
+      var card = buildDataCard(c.obj);
+      out = out.substring(0, c.start) + card + out.substring(c.end);
+    }
+    p.innerHTML = out;
+  });
+}
+
+/**
+ * Scan `html` once and return `{start, end, obj}` spans for every balanced
+ * `{...}` that parses as a JSON object (not array, not primitive). Positions
+ * inside `<code>…</code>` or `<pre>…</pre>` blocks are skipped.
+ *
+ * Linear in `html` length for typical input; bounded by MAX_SCAN and
+ * MAX_CANDIDATES for adversarial input.
+ * @private
+ */
+function _findJsonCandidates(html) {
+  var MAX_SCAN = 5000;
+  var MAX_CANDIDATES = 32;
+  var results = [];
+  var n = html.length;
+  var i = 0;
+  var lowerHtml = html.toLowerCase();
+
+  while (i < n && results.length < MAX_CANDIDATES) {
+    var ch = html.charCodeAt(i);
+
+    // Fast-skip past <code>...</code> and <pre>...</pre> regions — avoids
+    // counting braces that belong to rendered code samples.
+    if (ch === 60 /* < */) {
+      if (lowerHtml.substr(i, 5) === '<code') {
+        var codeEnd = lowerHtml.indexOf('</code>', i + 5);
+        i = codeEnd === -1 ? n : codeEnd + 7;
+        continue;
+      }
+      if (lowerHtml.substr(i, 4) === '<pre') {
+        var preEnd = lowerHtml.indexOf('</pre>', i + 4);
+        i = preEnd === -1 ? n : preEnd + 6;
+        continue;
       }
     }
 
-    if (replaced) {
-      p.innerHTML = html;
+    if (ch !== 123 /* { */) {
+      i++;
+      continue;
     }
-  });
+
+    // Scan forward with brace counting; respect string literals so that
+    // `"a}b"` inside an object doesn't prematurely end the scan.
+    var end = _findBalancedEnd(html, i, MAX_SCAN);
+    if (end === -1) {
+      i++;
+      continue;
+    }
+
+    var raw = html.substring(i, end);
+    // Normalize Python-style single quotes to double quotes. This is a
+    // best-effort convenience; quoted apostrophes may get mangled.
+    var normalized = raw.replace(/'/g, '"');
+    try {
+      var obj = JSON.parse(normalized);
+      if (typeof obj === 'object' && obj !== null && !Array.isArray(obj)) {
+        results.push({ start: i, end: end, obj: obj });
+        i = end;
+        continue;
+      }
+    } catch (_e) { /* not valid JSON — leave as text */ }
+
+    i++;
+  }
+
+  return results;
+}
+
+/**
+ * Return the index one past the matching `}` for the `{` at `start`, or -1
+ * if no balanced close is found within `maxLen` characters. Respects single
+ * and double-quoted string literals (with backslash escapes) so `"a}b"`
+ * doesn't terminate the scan.
+ * @private
+ */
+function _findBalancedEnd(html, start, maxLen) {
+  var depth = 0;
+  var inString = null; // '"' | "'" | null
+  var n = Math.min(html.length, start + maxLen);
+  for (var j = start; j < n; j++) {
+    var ch = html[j];
+    if (inString) {
+      if (ch === '\\') { j++; continue; } // skip escaped char
+      if (ch === inString) inString = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inString = ch; continue; }
+    if (ch === '{') { depth++; continue; }
+    if (ch === '}') {
+      depth--;
+      if (depth === 0) return j + 1;
+    }
+  }
+  return -1;
 }
 
 /**

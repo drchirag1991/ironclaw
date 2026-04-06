@@ -460,6 +460,41 @@ pub struct GatewayState {
     /// When this sender is dropped, the sweep loops exit gracefully.
     #[allow(dead_code)]
     pub oauth_sweep_shutdown: Option<tokio::sync::watch::Sender<()>>,
+    /// Cache for the assembled frontend HTML served from `/`.
+    ///
+    /// The cache key is derived from the `updated_at` of `frontend/layout.json`
+    /// and the `frontend/widgets/` directory — both returned by a single cheap
+    /// `list("frontend/")` call. A hit skips reading the layout, every widget
+    /// manifest, every widget JS file, and every widget CSS file. A miss (or
+    /// absent cache) falls through to the full `build_frontend_html()` path.
+    pub frontend_html_cache: Arc<tokio::sync::RwLock<Option<FrontendHtmlCache>>>,
+}
+
+/// Cached result of `build_frontend_html()`, keyed by a cheap workspace
+/// signature so the fast path only needs one `list()` call per request.
+#[derive(Debug, Clone)]
+pub struct FrontendHtmlCache {
+    /// Signature the cache is valid for. The cache is bypassed when the
+    /// current workspace signature differs from this one.
+    pub key: FrontendCacheKey,
+    /// The assembled HTML, or `None` if the layout had no customizations
+    /// and the caller should serve the embedded default unchanged.
+    pub html: Option<String>,
+}
+
+/// Cheap workspace fingerprint covering the inputs of `build_frontend_html`.
+///
+/// Uses the per-entry `updated_at` timestamps returned by `Workspace::list`
+/// (the directory entry's `updated_at` is "latest among children", so widget
+/// file edits bubble up automatically). Timestamps are stored as
+/// `(seconds, nanoseconds)` pairs to avoid depending on `chrono` types here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontendCacheKey {
+    /// Signature for `frontend/layout.json`, or `None` if the file is absent.
+    pub layout: Option<(i64, u32)>,
+    /// Signature for `frontend/widgets/` (max child mtime), or `None` if the
+    /// directory is empty or absent.
+    pub widgets: Option<(i64, u32)>,
 }
 
 /// Start the gateway HTTP server.
@@ -879,96 +914,137 @@ pub async fn start_server(
 // --- Frontend bundle assembly ---
 
 use ironclaw_frontend::assets;
-use ironclaw_frontend::{FrontendBundle, LayoutConfig, ResolvedWidget, WidgetManifest};
+use ironclaw_frontend::{FrontendBundle, LayoutConfig};
+
+use crate::channels::web::handlers::frontend::load_resolved_widgets;
+
+/// Read and parse `frontend/layout.json` from the workspace. Malformed JSON
+/// logs a warning and falls back to the default layout so a broken file
+/// cannot crash the page load.
+async fn read_layout_config(workspace: &crate::workspace::Workspace) -> LayoutConfig {
+    match workspace.read("frontend/layout.json").await {
+        Ok(doc) => match serde_json::from_str(&doc.content) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "frontend/layout.json is invalid — falling back to default layout"
+                );
+                LayoutConfig::default()
+            }
+        },
+        Err(_) => LayoutConfig::default(),
+    }
+}
+
+/// Compute a cheap cache key for `build_frontend_html` — one `list` call
+/// against `frontend/`. The directory entry for `widgets/` carries the max
+/// `updated_at` of its children, so any widget file edit naturally bubbles
+/// into the key without needing to read individual manifests.
+async fn compute_frontend_cache_key(workspace: &crate::workspace::Workspace) -> FrontendCacheKey {
+    let Ok(entries) = workspace.list("frontend/").await else {
+        return FrontendCacheKey {
+            layout: None,
+            widgets: None,
+        };
+    };
+    let mut key = FrontendCacheKey {
+        layout: None,
+        widgets: None,
+    };
+    for entry in entries {
+        let ts = entry
+            .updated_at
+            .map(|t| (t.timestamp(), t.timestamp_subsec_nanos()));
+        match entry.name() {
+            "layout.json" if !entry.is_directory => key.layout = ts,
+            "widgets" if entry.is_directory => key.widgets = ts,
+            _ => {}
+        }
+    }
+    key
+}
 
 /// Build customized HTML from workspace frontend config.
 ///
-/// Returns `None` if workspace is unavailable or has no customizations,
-/// signaling the caller to serve the embedded default.
+/// Returns `None` if the workspace is unavailable or the loaded layout has no
+/// customizations and no widgets — in that case the caller serves the embedded
+/// default HTML unchanged. Custom CSS is deliberately **not** included in the
+/// returned bundle: `css_handler` appends `frontend/custom.css` onto
+/// `/style.css` so the stylesheet is the single source of truth for CSS
+/// overrides.
+///
+/// The assembled HTML is cached in `GatewayState::frontend_html_cache` behind
+/// a fingerprint of `frontend/layout.json` and `frontend/widgets/` mtimes
+/// (computed with a single `list()` call). A cache hit skips reading every
+/// widget manifest / JS / CSS file, which would otherwise fire on every page
+/// load.
 async fn build_frontend_html(state: &GatewayState) -> Option<String> {
     let ws = state.workspace.as_ref()?;
 
-    // Read layout config
-    let layout: LayoutConfig = match ws.read("frontend/layout.json").await {
-        Ok(doc) => serde_json::from_str(&doc.content).unwrap_or_default(),
-        Err(_) => LayoutConfig::default(),
-    };
-
-    // Read custom CSS
-    let custom_css = ws
-        .read("frontend/custom.css")
-        .await
-        .ok()
-        .map(|doc| doc.content)
-        .filter(|c| !c.trim().is_empty());
-
-    // Discover widgets
-    let mut widgets = Vec::new();
-    if let Ok(entries) = ws.list("frontend/widgets/").await {
-        for entry in entries {
-            if !entry.is_directory {
-                continue;
-            }
-            let name = entry.name().to_string();
-            let manifest_path = format!("frontend/widgets/{}/manifest.json", name);
-            let js_path = format!("frontend/widgets/{}/index.js", name);
-
-            let manifest: WidgetManifest = match ws.read(&manifest_path).await {
-                Ok(doc) => match serde_json::from_str(&doc.content) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                },
-                Err(_) => continue,
-            };
-
-            let js = match ws.read(&js_path).await {
-                Ok(doc) => doc.content,
-                Err(_) => continue,
-            };
-
-            let css = ws
-                .read(&format!("frontend/widgets/{}/style.css", name))
-                .await
-                .ok()
-                .map(|doc| doc.content)
-                .filter(|c| !c.trim().is_empty());
-
-            // Check if widget is enabled in layout config (default: enabled)
-            let enabled = layout
-                .widgets
-                .get(&manifest.id)
-                .map(|w| w.enabled)
-                .unwrap_or(true);
-
-            if enabled {
-                widgets.push(ResolvedWidget { manifest, js, css });
-            }
+    // Fast path — cache hit. One workspace `list()` call, no file reads.
+    let cache_key = compute_frontend_cache_key(ws).await;
+    {
+        let cache = state.frontend_html_cache.read().await;
+        if let Some(ref cached) = *cache
+            && cached.key == cache_key
+        {
+            return cached.html.clone();
         }
     }
 
-    // Skip assembly if there's nothing to customize
-    if layout.branding.title.is_none()
-        && layout.branding.colors.is_none()
-        && layout.tabs.order.is_none()
-        && layout.tabs.hidden.is_none()
-        && layout.chat.suggestions.is_none()
-        && layout.widgets.is_empty()
-        && custom_css.is_none()
-        && widgets.is_empty()
-    {
-        return None;
-    }
+    // Slow path — rebuild.
+    let layout = read_layout_config(ws).await;
+    let widgets = load_resolved_widgets(ws, &layout).await;
 
-    let bundle = FrontendBundle {
-        layout,
-        widgets,
-        custom_css,
+    // Skip assembly when nothing is customized. `layout_has_customizations`
+    // is the single source of truth so adding a new field to `LayoutConfig`
+    // forces an update in one place instead of a big boolean expression here.
+    let html = if widgets.is_empty() && !layout_has_customizations(&layout) {
+        None
+    } else {
+        let bundle = FrontendBundle {
+            layout,
+            widgets,
+            // Custom CSS is served via /style.css (css_handler) to avoid
+            // double-application — see the doc comment on this function.
+            custom_css: None,
+        };
+        Some(ironclaw_frontend::assemble_index(
+            assets::INDEX_HTML,
+            &bundle,
+        ))
     };
 
-    Some(ironclaw_frontend::assemble_index(
-        assets::INDEX_HTML,
-        &bundle,
-    ))
+    // Store in cache. If another request raced us here, either writer wins —
+    // both produced the same HTML for the same key, so the cache ends up
+    // consistent either way.
+    *state.frontend_html_cache.write().await = Some(FrontendHtmlCache {
+        key: cache_key,
+        html: html.clone(),
+    });
+
+    html
+}
+
+/// Returns `true` if the layout config has any field that would affect the
+/// rendered HTML. When this returns `false` and there are no widgets, the
+/// gateway serves the embedded default unchanged.
+fn layout_has_customizations(layout: &LayoutConfig) -> bool {
+    let b = &layout.branding;
+    let t = &layout.tabs;
+    let c = &layout.chat;
+    b.title.is_some()
+        || b.subtitle.is_some()
+        || b.logo_url.is_some()
+        || b.favicon_url.is_some()
+        || b.colors.is_some()
+        || t.order.is_some()
+        || t.hidden.is_some()
+        || t.default_tab.is_some()
+        || c.suggestions.is_some()
+        || c.image_upload.is_some()
+        || !layout.widgets.is_empty()
 }
 
 // --- Static file handlers ---
@@ -3574,6 +3650,7 @@ mod tests {
             near_rpc_url: None,
             near_network: None,
             oauth_sweep_shutdown: None,
+            frontend_html_cache: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 

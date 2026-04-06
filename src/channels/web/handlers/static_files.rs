@@ -1,34 +1,19 @@
 //! Static file and health handlers.
+//!
+//! The root-level static handlers (`/`, `/style.css`, `/app.js`, favicon,
+//! i18n) live inline in `server.rs` so they can access `GatewayState` for
+//! workspace-driven customization. This module only hosts the project-file
+//! handlers (which serve files from job workspaces) and health/logs/status.
 
 use axum::{
     Json,
     http::{StatusCode, header},
-    response::{Html, IntoResponse},
+    response::IntoResponse,
 };
 
 use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::web::auth::AuthenticatedUser;
 use crate::channels::web::types::*;
-
-// --- Static file handlers ---
-
-pub async fn index_handler() -> Html<&'static str> {
-    Html(ironclaw_frontend::assets::INDEX_HTML)
-}
-
-pub async fn css_handler() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css")],
-        ironclaw_frontend::assets::STYLE_CSS,
-    )
-}
-
-pub async fn js_handler() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        ironclaw_frontend::assets::APP_JS,
-    )
-}
 
 // --- Health ---
 
