@@ -106,6 +106,9 @@ tower-http = { version = "0.6", features = ["trace", "cors", "set-header", "catc
 # Cron scheduling for routines
 cron = "0.13"
 
+# JSON Schema validation (workspace document metadata)
+jsonschema = "0.45"
+
 # Shared types
 ironclaw_common = { path = "crates/ironclaw_common", version = "0.1.0" }
 

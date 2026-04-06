@@ -44,12 +44,16 @@ mod chunker;
 mod document;
 mod embedding_cache;
 mod embeddings;
+pub mod extension_state;
 pub mod hygiene;
 pub mod layer;
 pub mod privacy;
 #[cfg(feature = "postgres")]
 mod repository;
+pub mod schema;
 mod search;
+pub mod settings_adapter;
+pub mod settings_schemas;
 
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{
@@ -975,8 +979,13 @@ impl Workspace {
             reject_if_injected(&path, &new_content)?;
         }
 
-        // Resolve metadata once — shared by versioning and indexing.
+        // Resolve metadata once — shared by schema validation, versioning, and indexing.
         let metadata = self.resolve_metadata(&path).await;
+
+        // Schema validation: validate the resulting content after replacement.
+        if let Some(schema) = &metadata.schema {
+            schema::validate_content_against_schema(&path, &new_content, schema)?;
+        }
 
         // Auto-version before updating.
         // Fail-open: versioning failures must not block writes.
@@ -1027,8 +1036,13 @@ impl Workspace {
             return Ok(doc);
         }
 
-        // Resolve metadata once — shared by versioning and indexing.
+        // Resolve metadata once — shared by schema validation, versioning, and indexing.
         let metadata = self.resolve_metadata(&path).await;
+
+        // Schema validation: if metadata carries a JSON Schema, validate content.
+        if let Some(schema) = &metadata.schema {
+            schema::validate_content_against_schema(&path, content, schema)?;
+        }
 
         // Auto-version previous content before overwriting.
         // Fail-open: versioning failures must not block writes.
@@ -1076,8 +1090,13 @@ impl Workspace {
             reject_if_injected(&path, &new_content)?;
         }
 
-        // Resolve metadata once — shared by versioning and indexing.
+        // Resolve metadata once — shared by schema validation, versioning, and indexing.
         let metadata = self.resolve_metadata(&path).await;
+
+        // Schema validation: validate the combined content (not just the appended chunk).
+        if let Some(schema) = &metadata.schema {
+            schema::validate_content_against_schema(&path, &new_content, schema)?;
+        }
 
         // Auto-version previous content before appending.
         // Fail-open: versioning failures must not block writes.
@@ -1173,8 +1192,14 @@ impl Workspace {
             .get_or_create_document_by_path(&scope, self.agent_id, &path)
             .await?;
 
-        // Resolve metadata once — shared by versioning and indexing.
+        // Resolve metadata once — shared by schema validation, versioning, and indexing.
         let metadata = self.resolve_metadata(&path).await;
+
+        // Schema validation: if metadata carries a JSON Schema, validate content.
+        if let Some(ref schema) = metadata.schema {
+            schema::validate_content_against_schema(&path, content, schema)?;
+        }
+
         let _ = self
             .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
             .await;
@@ -1225,8 +1250,14 @@ impl Workspace {
             format!("{}\n\n{}", doc.content, content)
         };
 
-        // Resolve metadata once — shared by versioning and indexing.
+        // Resolve metadata once — shared by schema validation, versioning, and indexing.
         let metadata = self.resolve_metadata(&path).await;
+
+        // Schema validation: validate the combined content after append.
+        if let Some(ref schema) = metadata.schema {
+            schema::validate_content_against_schema(&path, &new_content, schema)?;
+        }
+
         let _ = self
             .maybe_save_version(doc.id, &doc.content, &metadata, Some(&self.user_id))
             .await;
@@ -2859,5 +2890,253 @@ mod versioning_tests {
         let result = ws.patch("test.md", " cruel", "", false).await.unwrap();
 
         assert_eq!(result.document.content, "hello world");
+    }
+}
+
+#[cfg(test)]
+mod schema_validation_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    async fn create_test_workspace() -> (Workspace, tempfile::TempDir) {
+        use crate::db::libsql::LibSqlBackend;
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("schema_test.db");
+        let backend = LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("LibSqlBackend");
+        <LibSqlBackend as crate::db::Database>::run_migrations(&backend)
+            .await
+            .expect("migrations");
+        let db: Arc<dyn crate::db::Database> = Arc::new(backend);
+        let ws = Workspace::new_with_db("test_schema", db);
+        (ws, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn write_valid_json_with_schema_passes() {
+        let (ws, _dir) = create_test_workspace().await;
+
+        // Create document and set schema in metadata
+        let doc = ws.write("config.json", "{}").await.unwrap();
+        ws.update_metadata(
+            doc.id,
+            &serde_json::json!({
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    },
+                    "required": ["name"]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Valid write should succeed
+        let result = ws.write("config.json", r#"{"name": "Alice"}"#).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_invalid_json_with_schema_fails() {
+        let (ws, _dir) = create_test_workspace().await;
+
+        // Create document and set schema
+        let doc = ws.write("config.json", "{}").await.unwrap();
+        ws.update_metadata(
+            doc.id,
+            &serde_json::json!({
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    },
+                    "required": ["name"]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Missing required field should fail
+        let result = ws.write("config.json", r#"{"age": 30}"#).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WorkspaceError::SchemaValidation { path, errors } => {
+                assert_eq!(path, "config.json");
+                assert!(!errors.is_empty());
+            }
+            other => panic!("expected SchemaValidation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_non_json_with_schema_fails() {
+        let (ws, _dir) = create_test_workspace().await;
+
+        let doc = ws.write("config.json", "{}").await.unwrap();
+        ws.update_metadata(
+            doc.id,
+            &serde_json::json!({
+                "schema": { "type": "object" }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Non-JSON content should fail when schema is set
+        let result = ws.write("config.json", "this is not json").await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WorkspaceError::SchemaValidation { errors, .. } => {
+                assert!(errors[0].contains("not valid JSON"));
+            }
+            other => panic!("expected SchemaValidation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_without_schema_allows_anything() {
+        let (ws, _dir) = create_test_workspace().await;
+
+        // No schema — any content is accepted (backward-compatible)
+        let result = ws.write("notes.md", "free form text").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn schema_inherited_from_folder_config() {
+        let (ws, _dir) = create_test_workspace().await;
+
+        // Set schema on folder .config
+        let config_doc = ws.write("settings/.config", "").await.unwrap();
+        ws.update_metadata(
+            config_doc.id,
+            &serde_json::json!({
+                "skip_indexing": true,
+                "schema": {
+                    "type": "string",
+                    "enum": ["anthropic", "openai", "ollama"]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Child document inherits schema — valid value
+        let result = ws.write("settings/backend.json", r#""anthropic""#).await;
+        assert!(result.is_ok());
+
+        // Child document inherits schema — invalid value
+        let result = ws.write("settings/backend.json", r#""unknown""#).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            WorkspaceError::SchemaValidation { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn document_schema_overrides_folder_schema() {
+        let (ws, _dir) = create_test_workspace().await;
+
+        // Folder schema: string enum
+        let config_doc = ws.write("settings/.config", "").await.unwrap();
+        ws.update_metadata(
+            config_doc.id,
+            &serde_json::json!({
+                "schema": { "type": "string" }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Document overrides with permissive object schema
+        let doc = ws
+            .write("settings/special.json", r#""temp""#)
+            .await
+            .unwrap();
+        ws.update_metadata(
+            doc.id,
+            &serde_json::json!({
+                "schema": { "type": "object" }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Now the document-level schema (object) should apply, not the folder (string)
+        let result = ws
+            .write("settings/special.json", r#"{"key": "value"}"#)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn patch_validates_resulting_content() {
+        let (ws, _dir) = create_test_workspace().await;
+
+        // Create doc with schema that requires "name" field
+        let doc = ws
+            .write("config.json", r#"{"name": "Alice", "role": "admin"}"#)
+            .await
+            .unwrap();
+        ws.update_metadata(
+            doc.id,
+            &serde_json::json!({
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "role": { "type": "string" }
+                    },
+                    "required": ["name"]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Patch that keeps the document valid should succeed
+        let result = ws
+            .patch("config.json", "\"admin\"", "\"user\"", false)
+            .await;
+        assert!(result.is_ok());
+
+        // Patch that makes the document invalid (removes name value, breaks JSON)
+        // We can't easily make a patch that removes required fields without
+        // breaking JSON structure, so test with a type violation instead
+        let result = ws.patch("config.json", "\"user\"", "42", false).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            WorkspaceError::SchemaValidation { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn append_validates_combined_content() {
+        let (ws, _dir) = create_test_workspace().await;
+
+        // Create doc with array schema
+        let doc = ws.write("list.json", r#"["item1"]"#).await.unwrap();
+        ws.update_metadata(
+            doc.id,
+            &serde_json::json!({
+                "schema": { "type": "array", "items": { "type": "string" } }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Append breaks JSON structure (array + newline + text = invalid JSON)
+        let result = ws.append("list.json", "not json").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            WorkspaceError::SchemaValidation { .. }
+        ));
     }
 }

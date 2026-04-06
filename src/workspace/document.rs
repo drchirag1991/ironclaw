@@ -38,6 +38,22 @@ pub mod paths {
     pub const ASSISTANT_DIRECTIVES: &str = "context/assistant-directives.md";
 }
 
+/// Well-known system paths for internal state (settings, extensions, skills).
+///
+/// Documents under `_system/` are excluded from search results via folder
+/// `.config` metadata (`skip_indexing: true`) and are never auto-cleaned
+/// by hygiene. They ARE versioned for audit trail.
+pub mod system_paths {
+    /// Root prefix for all system state.
+    pub const SYSTEM_PREFIX: &str = "_system/";
+    /// Settings documents directory.
+    pub const SETTINGS_PREFIX: &str = "_system/settings/";
+    /// Extension state directory.
+    pub const EXTENSIONS_PREFIX: &str = "_system/extensions/";
+    /// Skill state directory.
+    pub const SKILLS_PREFIX: &str = "_system/skills/";
+}
+
 /// Name of the folder-level configuration document.
 ///
 /// A document at `{directory}/.config` carries metadata flags that apply
@@ -63,6 +79,15 @@ pub struct DocumentMetadata {
     /// Hygiene (auto-cleanup) configuration for this folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hygiene: Option<HygieneMetadata>,
+
+    /// Optional JSON Schema for content validation.
+    ///
+    /// When set, workspace write operations parse content as JSON and validate
+    /// against this schema before persisting. Inherited via the `.config` chain
+    /// (folder `.config` → document metadata), so a folder-level schema applies
+    /// to all documents in that directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
 
     /// Preserve unknown fields for forward compatibility.
     #[serde(flatten)]

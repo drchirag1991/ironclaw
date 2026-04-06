@@ -324,6 +324,9 @@ pub enum WorkspaceError {
 
     #[error("Patch failed for '{path}': {reason}")]
     PatchFailed { path: String, reason: String },
+
+    #[error("Schema validation failed for '{path}': {}", errors.join("; "))]
+    SchemaValidation { path: String, errors: Vec<String> },
 }
 
 /// Orchestrator errors (internal API, container management).
