@@ -582,7 +582,15 @@ mod tests {
         ));
 
         let trace = build_trace(&thread);
-        match &trace.events[0].kind {
+        // `Thread::add_message` records a `MessageAdded` event for each
+        // message, so the `ApprovalRequested` event is no longer at index 0
+        // — it's mixed in with the message events. Find it by kind.
+        let approval = trace
+            .events
+            .iter()
+            .find(|e| matches!(&e.kind, EventKind::ApprovalRequested { .. }))
+            .expect("trace should contain an ApprovalRequested event");
+        match &approval.kind {
             EventKind::ApprovalRequested {
                 action_name,
                 call_id,
@@ -610,7 +618,10 @@ mod tests {
         assert!(json.contains("\"ApprovalRequested\""));
         assert!(json.contains("\"action_name\":\"tool_install\""));
         assert!(json.contains("\"call_id\":\"call_install_1\""));
-        assert!(json.contains("\"parameters\":{\"name\":\"notion\",\"kind\":\"mcp_server\"}"));
+        // Parameter map key order isn't stable across serde_json versions; check
+        // both required keys are present rather than the exact serialized form.
+        assert!(json.contains("\"name\":\"notion\""));
+        assert!(json.contains("\"kind\":\"mcp_server\""));
         assert!(json.contains("\"description\":\"Install an extension\""));
         assert!(json.contains("\"allow_always\":true"));
         assert!(json.contains("\"gate_name\":\"approval\""));

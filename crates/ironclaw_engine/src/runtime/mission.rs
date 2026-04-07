@@ -2508,12 +2508,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_mission_requires_system_user_to_manage() {
+    async fn shared_mission_engine_permits_any_user_admin_check_at_caller() {
+        // Security model: the engine is permissive for shared (system) missions —
+        // anyone can pause/resume them at the engine level. The web handler is
+        // expected to enforce the admin role check before forwarding the call.
+        // This test pins down the engine-level behavior so the contract with
+        // the caller stays explicit.
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
         let project_id = ProjectId::new();
 
-        // Create a system mission
+        // Create a system/shared mission (owner = "system" is treated as shared)
         let system_id = mgr
             .create_mission(
                 project_id,
@@ -2526,19 +2531,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Regular user cannot pause system mission
-        let result = mgr.pause_mission(system_id, "alice").await;
-        assert!(
-            matches!(result.unwrap_err(), EngineError::AccessDenied { .. }),
-            "regular user cannot manage system missions"
-        );
-
-        // System user can pause (admin path passes "system" as user_id)
-        mgr.pause_mission(system_id, "system").await.unwrap();
+        // Engine permits any user to pause shared missions (caller enforces admin)
+        mgr.pause_mission(system_id, "alice").await.unwrap();
         let m = mgr.get_mission(system_id).await.unwrap().unwrap();
         assert_eq!(m.status, MissionStatus::Paused);
 
-        // System user can resume
+        // System user can also pause/resume
         mgr.resume_mission(system_id, "system").await.unwrap();
         let m = mgr.get_mission(system_id).await.unwrap().unwrap();
         assert_eq!(m.status, MissionStatus::Active);
