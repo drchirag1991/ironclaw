@@ -38,7 +38,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | HTTP endpoints for Control UI | ✅ | ✅ | Web dashboard with chat, memory, jobs, logs, extensions |
 | Channel connection lifecycle | ✅ | ✅ | ChannelManager + WebSocket tracker |
 | Session management/routing | ✅ | ✅ | SessionManager exists |
-| Configuration hot-reload | ✅ | ❌ | |
+| Configuration hot-reload | ✅ | ✅ | SIGHUP handler for LLM + Channel configs |
 | Network modes (loopback/LAN/remote) | ✅ | 🚧 | HTTP only |
 | OpenAI-compatible HTTP API | ✅ | ✅ | /v1/chat/completions, per-request `model` override |
 | Canvas hosting | ✅ | ❌ | Agent-driven UI |
@@ -49,7 +49,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Health check endpoints | ✅ | ✅ | /api/health + /api/gateway/status + /healthz + /readyz, with channel-backed readiness probes |
 | `doctor` diagnostics | ✅ | 🚧 | 16 checks: settings, LLM, DB, embeddings, routines, gateway, MCP, skills, secrets, service, Docker daemon, tunnel binaries |
 | Agent event broadcast | ✅ | 🚧 | SSE broadcast manager exists (SseManager) but tool/job-state events not fully wired |
-| Channel health monitor | ✅ | ❌ | Auto-restart with configurable interval |
+| Channel health monitor | ✅ | ✅ | Auto-restart with configurable interval |
 | Presence system | ✅ | ❌ | Beacons on connect, system presence for agents |
 | Trusted-proxy auth mode | ✅ | ❌ | Header-based auth for reverse proxies |
 | APNs push pipeline | ✅ | ❌ | Wake disconnected iOS nodes via push |
@@ -276,8 +276,8 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 | Feature | OpenClaw | IronClaw | Priority | Notes |
 |---------|----------|----------|----------|-------|
-| Image processing (Sharp) | ✅ | ❌ | P2 | Resize, format convert |
-| Configurable image resize dims | ✅ | ❌ | P2 | Per-agent dimension config |
+| Image processing (Sharp) | ✅ | ✅ | Using Rust `image` crate: resize, format convert |
+| Configurable image resize dims | ✅ | 🚧 | Hardcoded to 2048px (MAX_IMAGE_DIMENSION) |
 | Multiple images per tool call | ✅ | ❌ | P2 | Single tool invocation, multiple images |
 | Audio transcription | ✅ | ❌ | P2 | |
 | Video support | ✅ | ❌ | P3 | |
@@ -285,7 +285,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | PDF parsing | ✅ | ❌ | P2 | `pdfjs-dist` fallback path |
 | MIME detection | ✅ | ❌ | P2 | |
 | Media caching | ✅ | ❌ | P3 | |
-| Vision model integration | ✅ | ❌ | P2 | Image understanding |
+| Vision model integration | ✅ | ✅ | Middleware prepares JPEG/resized images |
 | TTS (Edge TTS) | ✅ | ❌ | P3 | Text-to-speech |
 | TTS (OpenAI) | ✅ | ❌ | P3 | |
 | Incremental TTS playback | ✅ | ❌ | P3 | iOS progressive playback |
@@ -441,7 +441,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Cron finished-run webhook | ✅ | ❌ | P3 | Webhook on job completion |
 | Timezone support | ✅ | ✅ | - | Via cron expressions |
 | One-shot/recurring jobs | ✅ | ✅ | - | Manual + cron triggers |
-| Channel health monitor | ✅ | ❌ | P2 | Auto-restart with configurable interval |
+| Channel health monitor | ✅ | ✅ | Auto-restart with configurable interval |
 | `beforeInbound` hook | ✅ | ✅ | P2 | |
 | `beforeOutbound` hook | ✅ | ✅ | P2 | |
 | `beforeToolCall` hook | ✅ | ✅ | P2 | |
@@ -470,6 +470,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | Feature | OpenClaw | IronClaw | Notes |
 |---------|----------|----------|-------|
 | Gateway token auth | ✅ | ✅ | Bearer token auth on web gateway |
+| API key authentication | ❌ | ✅ | X-API-KEY header via IRONCLAW_API_KEY env var |
 | Device pairing | ✅ | ❌ | |
 | Tailscale identity | ✅ | ❌ | |
 | Trusted-proxy auth | ✅ | ❌ | Header-based reverse proxy auth |
@@ -567,11 +568,9 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 
 ### P2 - Medium Priority
 
-- ❌ Media handling (images, PDFs)
-- ✅ Ollama/local model support (via rig::providers::ollama)
-- ❌ Configuration hot-reload
-- ✅ Tool-driven webhook ingress (`/webhook/tools/{tool}` -> host-verified + tool-normalized `system_event` routines)
-- ❌ Channel health monitor with auto-restart
+- ✅ Media handling (images)
+- ✅ Configuration hot-reload
+- ✅ Channel health monitor with auto-restart
 - ❌ Partial output preservation on abort
 
 ### P3 - Lower Priority

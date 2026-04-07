@@ -1,14 +1,19 @@
 //! Authentication middleware for the web gateway.
 //!
-//! Supports three auth mechanisms, tried in order:
+//! Supports four auth mechanisms, tried in order:
 //!
 //! ```text
 //!   Request
 //!     │
 //!     ▼
 //!   ┌─────────────────────────────┐
-//!   │ Authorization: Bearer …     │──► env-var token match ──► ALLOW
-//!   │ or ?token=xxx (SSE/WS only) │──► DB-backed token match ──► ALLOW
+//!   │ X-API-KEY: <key>            │──► IRONCLAW_API_KEY env match ──► ALLOW
+//!   └────────────┬────────────────┘
+//!                │ no match / missing
+//!                ▼
+//!   ┌─────────────────────────────┐
+//!   │ Authorization: Bearer …      │──► env-var token match ──► ALLOW
+//!   │ or ?token=xxx (SSE/WS)   │──► DB-backed token match ──► ALLOW
 //!   └────────────┬────────────────┘
 //!                │ no match / missing
 //!                ▼
@@ -20,6 +25,11 @@
 //!                ▼
 //!              401 Unauthorized
 //! ```
+//!
+//! **API Key (X-API-KEY)** — Simple API key authentication via the `X-API-KEY`
+//! header. The key is compared against the `IRONCLAW_API_KEY` environment variable
+//! using constant-time comparison to prevent timing attacks. Successful auth
+//! grants admin role. Returns `{"error": "Unauthorized"}` on failure.
 //!
 //! **Bearer token** — constant-time comparison via SHA-256 hashed tokens.
 //! Supports multi-user mode: each token maps to a `UserIdentity` that carries
@@ -46,10 +56,12 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, request::Parts},
     middleware::Next,
     response::{IntoResponse, Response},
+    Json,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
@@ -1007,6 +1019,33 @@ fn extract_token(headers: &HeaderMap, request: &Request) -> Option<String> {
     extract_cookie_value(headers, SESSION_COOKIE_NAME)
 }
 
+/// Environment variable name for API key authentication.
+const IRONCLAW_API_KEY_ENV: &str = "IRONCLAW_API_KEY";
+
+/// Extract and validate X-API-KEY header.
+///
+/// Returns Some(UserIdentity) if valid, None otherwise.
+/// Uses constant-time comparison to prevent timing attacks.
+fn extract_api_key(headers: &HeaderMap) -> Option<UserIdentity> {
+    let api_key_header = headers.get("X-API-KEY")?;
+    let api_key_value = api_key_header.to_str().ok()?;
+
+    // Get the expected API key from environment variable
+    let expected_key = std::env::var(IRONCLAW_API_KEY_ENV).ok()?;
+
+    // Use constant-time comparison to prevent timing attacks
+    if bool::from(api_key_value.as_bytes().ct_eq(expected_key.as_bytes())) {
+        // Valid API key - return admin identity
+        Some(UserIdentity {
+            user_id: "api_key_user".to_string(),
+            role: "admin".to_string(),
+            workspace_read_scopes: Vec::new(),
+        })
+    } else {
+        None
+    }
+}
+
 // ── Middleware ────────────────────────────────────────────────────────────
 
 /// Auth middleware: bearer/query token → OIDC JWT → 401.
@@ -1024,6 +1063,12 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // 0. Try X-API-KEY header first (new API key auth).
+    if let Some(identity) = extract_api_key(&headers) {
+        request.extensions_mut().insert(identity);
+        return next.run(request).await;
+    }
+
     // Extract the candidate token from header or query param.
     let token = extract_token(&headers, &request);
 
@@ -1042,7 +1087,7 @@ pub async fn auth_middleware(
                     return next.run(request).await;
                 }
                 Err(()) => {
-                    return (StatusCode::SERVICE_UNAVAILABLE, "Database unavailable")
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "Database unavailable"})))
                         .into_response();
                 }
                 Ok(None) => {}
@@ -1066,8 +1111,7 @@ pub async fn auth_middleware(
                         tracing::warn!(sub = %sub, email = ?email, "OIDC login rejected: domain restriction requires verified email");
                         return (
                             StatusCode::FORBIDDEN,
-                            "Login requires a verified email address from an authorized domain."
-                                .to_string(),
+                            Json(json!({"error": "Login requires a verified email address from an authorized domain."})),
                         )
                             .into_response();
                     }
@@ -1076,7 +1120,7 @@ pub async fn auth_middleware(
                         &auth.oidc_allowed_domains,
                     ) {
                         tracing::warn!(sub = %sub, error = %msg, "OIDC login rejected by domain restriction");
-                        return (StatusCode::FORBIDDEN, msg).into_response();
+                        return (StatusCode::FORBIDDEN, Json(json!({"error": msg}))).into_response();
                     }
                 }
                 tracing::debug!(sub = %sub, "OIDC auth succeeded");
@@ -1094,7 +1138,7 @@ pub async fn auth_middleware(
         }
     }
 
-    (StatusCode::UNAUTHORIZED, "Invalid or missing auth token").into_response()
+    Json(json!({"error": "Unauthorized"})).into_response()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

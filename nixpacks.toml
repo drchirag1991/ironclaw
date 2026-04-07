@@ -1,0 +1,9 @@
+[phases.setup]
+nixpacks = ["pkg-config", "libssl-dev"]
+
+[phases.build]
+commands = ["cargo build --release --manifest-path=Cargo.toml"]
+buildPlan = "cargo-buildplan"
+
+[start]
+cmd = "target/release/ironclaw"
