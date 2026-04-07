@@ -88,11 +88,14 @@ async def _open_authed_page(browser, base_url: str):
 async def _drive_chat_customization(page, prompt: str) -> None:
     """Send a customization prompt and wait for the agent to finish the turn.
 
-    The mock LLM responds with one ``memory_write`` tool call per trigger
-    phrase. The agent loop dispatches the tool, gets a result, and the mock
-    LLM then summarizes it as plain text — at which point the chat input
-    is re-enabled and a fresh assistant message is in the DOM. We block on
-    that terminal state so the next reload sees the workspace write.
+    The mock LLM responds with one *or more* ``memory_write`` tool calls
+    per trigger phrase (the customization patterns deliberately fan out
+    into multiple parallel calls so the v2 engine multi-tool dispatch
+    path gets exercised). The agent loop runs every dispatched tool,
+    feeds the results back to the LLM, and the mock summarizes them as
+    plain text — at which point the chat input is re-enabled and a fresh
+    assistant message is in the DOM. We block on that terminal state so
+    the next reload sees every workspace write.
     """
     result = await send_chat_and_wait_for_terminal_message(
         page,
@@ -196,15 +199,13 @@ async def test_chat_adds_skills_viewer_widget_to_top_panel(
     ``IronClaw.registerWidget({ slot: 'tab', ... })``. The widget then
     fetches workspace skills from ``/api/skills`` and renders them.
     """
-    # 1. Two chat turns — one for the manifest, one for the implementation.
-    #    The mock LLM matches each trigger with a single memory_write call;
-    #    splitting the work this way keeps every turn within the
-    #    one-tool-per-response shape that mock_llm currently supports.
+    # 1. One chat turn fans out into *two* parallel ``memory_write`` tool
+    #    calls (manifest + index.js). This intentionally exercises the
+    #    multi-tool-call path of the v2 engine — pinning the test to a
+    #    single call per turn would silently mask regressions in parallel
+    #    dispatch / accumulator handling.
     await _drive_chat_customization(
-        page, "customize: create skills viewer manifest"
-    )
-    await _drive_chat_customization(
-        page, "customize: install skills viewer code"
+        page, "customize: install skills viewer widget"
     )
 
     # 2. Confirm both files actually landed in the workspace.
