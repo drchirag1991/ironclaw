@@ -1476,9 +1476,16 @@ async fn resolve_host_credentials(
     let store = match store {
         Some(s) => s,
         None => {
-            // If tool requires credentials but has no secrets store, this is a configuration error
+            // If tool requires non-UrlPath credentials but has no secrets store, this is
+            // a configuration error. UrlPath credentials are handled by placeholder
+            // substitution and don't need the secrets store.
             if let Some(http_cap) = &capabilities.http
-                && !http_cap.credentials.is_empty()
+                && http_cap.credentials.values().any(|m| {
+                    !matches!(
+                        m.location,
+                        crate::secrets::CredentialLocation::UrlPath { .. }
+                    )
+                })
             {
                 return Err(ToolError::NotAuthorized(format!(
                     "secrets store not configured; cannot resolve credentials for user '{user_id}'"
@@ -1540,6 +1547,12 @@ async fn resolve_host_credentials(
         // No cross-tenant fallback: each user must configure their own credentials.
         let secret = match store.get_decrypted(user_id, &mapping.secret_name).await {
             Ok(s) => s,
+            Err(crate::secrets::SecretError::Expired) => {
+                return Err(ToolError::NotAuthorized(format!(
+                    "credential '{}' for user '{}' has expired; refresh or re-set via `ironclaw secrets set`",
+                    mapping.secret_name, user_id
+                )));
+            }
             Err(_) => {
                 return Err(ToolError::NotAuthorized(format!(
                     "credential '{}' not found for user '{}'; configure it via `ironclaw secrets set`",
@@ -2317,6 +2330,90 @@ mod tests {
             err.to_string().contains("secrets store not configured"),
             "error message: {}",
             err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_credentials_no_store_with_only_urlpath_ok() {
+        use crate::secrets::{CredentialLocation, CredentialMapping};
+        use crate::tools::wasm::capabilities::HttpCapability;
+        use crate::tools::wasm::wrapper::resolve_host_credentials;
+
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "api_key".to_string(),
+            CredentialMapping {
+                secret_name: "api_key".to_string(),
+                location: CredentialLocation::UrlPath {
+                    placeholder: "{api_key}".to_string(),
+                },
+                host_patterns: vec!["api.example.com".to_string()],
+            },
+        );
+        let caps = Capabilities {
+            http: Some(HttpCapability {
+                credentials,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // No store but only UrlPath credentials — should be Ok(empty), not an error
+        let result = resolve_host_credentials(&caps, None, "user1", None)
+            .await
+            .expect("UrlPath-only credentials should not require a secrets store"); // safety: test code only
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_credentials_expired_credential_returns_specific_error() {
+        use crate::secrets::{
+            CreateSecretParams, CredentialLocation, CredentialMapping, SecretsStore,
+        };
+        use crate::tools::wasm::capabilities::HttpCapability;
+        use crate::tools::wasm::wrapper::resolve_host_credentials;
+
+        let store = test_secrets_store();
+
+        // Store an expired token
+        store
+            .create(
+                "user1",
+                CreateSecretParams::new("my_token", "expired-value")
+                    .with_expiry(chrono::Utc::now() - chrono::Duration::hours(1)),
+            )
+            .await
+            .unwrap();
+
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "my_token".to_string(),
+            CredentialMapping {
+                secret_name: "my_token".to_string(),
+                location: CredentialLocation::AuthorizationBearer,
+                host_patterns: vec!["api.example.com".to_string()],
+            },
+        );
+        let caps = Capabilities {
+            http: Some(HttpCapability {
+                credentials,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Expired credential — error message should say "expired", not "not found"
+        let err = resolve_host_credentials(&caps, Some(&store), "user1", None)
+            .await
+            .expect_err("expired credential must error"); // safety: test code only
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expired"),
+            "error should mention expiry: {msg}"
+        );
+        assert!(
+            msg.contains("my_token"),
+            "error should name the credential: {msg}"
         );
     }
 
