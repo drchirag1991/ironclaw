@@ -55,6 +55,7 @@ r = requests.get(
 check("status 200", r.status_code == 200, f"got {r.status_code}: {r.text[:300]}")
 if r.status_code == 200:
     data = r.json()
+    print('data', data, '\n\n\n')
     check("status success", data.get("status") == "success", str(data)[:300])
     acct = data.get("data", {})
     check("has user_id", "user_id" in acct, str(acct.keys()))
