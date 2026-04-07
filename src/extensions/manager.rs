@@ -1744,7 +1744,10 @@ impl ExtensionManager {
         actions
     }
 
-    async fn cached_latent_wasm_provider_actions(&self, user_id: &str) -> Vec<LatentProviderAction> {
+    async fn cached_latent_wasm_provider_actions(
+        &self,
+        user_id: &str,
+    ) -> Vec<LatentProviderAction> {
         // Per-user cache: `build_*` calls `determine_installed_kind(name, user_id)`
         // which returns user-scoped results, so a single global cache would
         // leak installed-kind state across tenants.
@@ -3561,14 +3564,11 @@ impl ExtensionManager {
                 extra_params,
             )
         } else if let Some(ref oauth) = server.oauth {
-            let metadata = metadata
-                .as_ref()
-                .ok_or_else(|| {
-                    ExtensionError::AuthFailed(
-                        "discovered MCP OAuth metadata missing authorization endpoints"
-                            .to_string(),
-                    )
-                })?;
+            let metadata = metadata.as_ref().ok_or_else(|| {
+                ExtensionError::AuthFailed(
+                    "discovered MCP OAuth metadata missing authorization endpoints".to_string(),
+                )
+            })?;
             (
                 metadata.authorization_endpoint.clone(),
                 metadata.token_endpoint.clone(),
@@ -8276,10 +8276,7 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "expected registry-backed web_search latent action; got: {:?}",
-                    actions
-                        .iter()
-                        .map(|a| &a.action_name)
-                        .collect::<Vec<_>>()
+                    actions.iter().map(|a| &a.action_name).collect::<Vec<_>>()
                 )
             });
         assert_eq!(web_search.provider_extension, "web_search");
@@ -9293,8 +9290,7 @@ mod tests {
     /// the Helper") for the rule motivating this test.
     #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn test_has_wasm_channel_pairing_reflects_db_backed_identities() -> Result<(), String>
-    {
+    async fn test_has_wasm_channel_pairing_reflects_db_backed_identities() -> Result<(), String> {
         use crate::db::{Database, UserStore};
         use crate::ownership::{OwnerId, OwnershipCache};
         use crate::pairing::PairingStore;
@@ -9419,11 +9415,9 @@ mod tests {
         // name and returned true for any channel with any identity in
         // the table would slip through the previous assertion alone.)
         if manager.has_wasm_channel_pairing("discord").await {
-            return Err(
-                "has_wasm_channel_pairing leaked across channel names — \
+            return Err("has_wasm_channel_pairing leaked across channel names — \
                  'discord' has no identities but reported paired"
-                    .to_string(),
-            );
+                .to_string());
         }
 
         Ok(())

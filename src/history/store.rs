@@ -5,10 +5,10 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 #[cfg(feature = "postgres")]
+use deadpool_postgres::GenericClient;
+#[cfg(feature = "postgres")]
 use deadpool_postgres::{Config, Pool};
 use rust_decimal::Decimal;
-#[cfg(feature = "postgres")]
-use deadpool_postgres::GenericClient;
 use uuid::Uuid;
 
 #[cfg(feature = "postgres")]

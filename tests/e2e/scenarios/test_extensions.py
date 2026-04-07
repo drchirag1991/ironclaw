@@ -216,7 +216,7 @@ async def open_channels_with_mock_role(
 
     await page.goto(
         f"{ironclaw_server}/?token={AUTH_TOKEN}",
-        wait_until="networkidle",
+        wait_until="load",
         timeout=15000,
     )
     await page.locator(SEL["auth_screen"]).wait_for(state="hidden", timeout=10000)
@@ -641,7 +641,10 @@ async def test_install_with_auth_url_opens_popup_and_shows_auth_prompt(page):
     await install_btn.click()
 
     await page.wait_for_function(
-        "() => window._lastOpenCall !== null",
+        """() => {
+            const call = window._lastOpenCall;
+            return !!(call && typeof call.url === 'string' && call.url.length > 0 && call.target === '_blank');
+        }""",
         timeout=5000,
     )
     call = await page.evaluate("window._lastOpenCall")
@@ -843,7 +846,13 @@ async def test_configure_modal_save_oauth(page):
     await page.locator(SEL["configure_input"]).fill("ignored")
     await page.locator(SEL["configure_save_btn"]).click()
 
-    await page.wait_for_function("() => window._lastOpenCall !== null", timeout=5000)
+    await page.wait_for_function(
+        """() => {
+            const call = window._lastOpenCall;
+            return !!(call && typeof call.url === 'string' && call.url.length > 0 && call.target === '_blank');
+        }""",
+        timeout=5000,
+    )
     call = await page.evaluate("window._lastOpenCall")
     assert call is not None, "window.open was not called"
     assert "oauth" in call["url"] or "example.com" in call["url"], (
@@ -1309,7 +1318,13 @@ async def test_activate_with_auth_url_opens_popup_and_shows_auth_prompt(page):
     await activate_btn.wait_for(state="visible", timeout=5000)
     await activate_btn.click()
 
-    await page.wait_for_function("() => window._lastOpenCall !== null", timeout=5000)
+    await page.wait_for_function(
+        """() => {
+            const call = window._lastOpenCall;
+            return !!(call && typeof call.url === 'string' && call.url.length > 0 && call.target === '_blank');
+        }""",
+        timeout=5000,
+    )
     call = await page.evaluate("window._lastOpenCall")
     assert call is not None, "window.open was not called"
     assert "example.com" in call["url"], f"unexpected URL: {call['url']}"

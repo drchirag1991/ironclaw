@@ -573,15 +573,14 @@ async fn handle_llm_complete(
         .and_then(json_to_thread_messages)
         .unwrap_or_else(|| thread.messages.clone());
 
-    if let Err(e) =
-        reconcile_dynamic_tool_lease(
-            thread,
-            deps.effects,
-            deps.leases,
-            deps.store,
-            &crate::LeasePlanner::new(),
-        )
-        .await
+    if let Err(e) = reconcile_dynamic_tool_lease(
+        thread,
+        deps.effects,
+        deps.leases,
+        deps.store,
+        &crate::LeasePlanner::new(),
+    )
+    .await
     {
         warn_on_lease_refresh_failure("llm_complete", &e);
     }

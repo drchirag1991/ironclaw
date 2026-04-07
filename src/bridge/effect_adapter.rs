@@ -24,6 +24,7 @@ use crate::context::JobContext;
 use crate::hooks::{HookEvent, HookOutcome, HookRegistry};
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::{ApprovalRequirement, ToolRegistry};
+use crate::tools::permissions::{PermissionState, effective_permission};
 use ironclaw_safety::SafetyLayer;
 
 /// Wraps the existing tool pipeline to implement the engine's `EffectExecutor`.
@@ -628,6 +629,32 @@ impl EffectBridgeAdapter {
         }
 
         if let Some((_, tool)) = self.tools.get_resolved(&lookup_name).await {
+            let user_permission = if let Some(db) = self.tools.database() {
+                match db.get_all_settings(&context.user_id).await {
+                    Ok(db_map) => {
+                        let settings = crate::settings::Settings::from_db_map(&db_map);
+                        Some(effective_permission(&lookup_name, &settings.tool_permissions))
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            user_id = %context.user_id,
+                            tool = %lookup_name,
+                            error = %error,
+                            "Failed to load tool permission overrides for engine v2"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if matches!(user_permission, Some(PermissionState::Disabled)) {
+                return Err(EngineError::LeaseDenied {
+                    reason: format!("Tool '{}' is disabled for this user.", action_name),
+                });
+            }
+
             let requirement = tool.requires_approval(&parameters);
             match requirement {
                 ApprovalRequirement::Always => {
@@ -641,7 +668,8 @@ impl EffectBridgeAdapter {
                 }
                 ApprovalRequirement::UnlessAutoApproved => {
                     let is_approved = self.auto_approve_tools
-                        || self.auto_approved.read().await.contains(&lookup_name);
+                        || self.auto_approved.read().await.contains(&lookup_name)
+                        || matches!(user_permission, Some(PermissionState::AlwaysAllow));
                     if !is_approved && !approval_already_granted {
                         return Err(Self::gate_paused(
                             "approval",

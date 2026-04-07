@@ -139,7 +139,8 @@ impl UserStore for LibSqlBackend {
         let metadata_json = serde_json::to_string(&user.metadata)
             .map_err(|e| DatabaseError::Serialization(e.to_string()))?;
 
-        conn.execute(
+        let rows = conn
+            .execute(
             r#"
             INSERT OR IGNORE INTO users (id, email, display_name, status, role, created_at, updated_at, last_login_at, created_by, metadata)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -159,6 +160,10 @@ impl UserStore for LibSqlBackend {
         )
         .await
         .map_err(|e| DatabaseError::Query(format!("get_or_create_user: {e}")))?;
+
+        if rows > 0 {
+            seed_initial_assistant_thread(&conn, &user.id, &user.created_at).await?;
+        }
         Ok(())
     }
 
@@ -864,6 +869,22 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
         assert_eq!(messages[0].content, GREETING_SEED);
+    }
+
+    #[tokio::test]
+    async fn test_get_or_create_user_seeds_initial_assistant_greeting_on_insert() {
+        let (db, _dir) = setup().await;
+        let user = test_user("owner");
+
+        db.get_or_create_user(user.clone()).await.unwrap();
+
+        let messages = assistant_messages(&db, "owner").await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, GREETING_SEED);
+
+        db.get_or_create_user(user).await.unwrap();
+        let messages_again = assistant_messages(&db, "owner").await;
+        assert_eq!(messages_again.len(), 1);
     }
 
     #[tokio::test]

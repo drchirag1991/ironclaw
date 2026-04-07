@@ -245,6 +245,7 @@ async def v2_server(ironclaw_binary, mock_llm_server, mock_api):
         "GATEWAY_PORT": str(gateway_port),
         "GATEWAY_AUTH_TOKEN": AUTH_TOKEN,
         "GATEWAY_USER_ID": "e2e-v2-tester",
+        "IRONCLAW_OWNER_ID": "e2e-v2-tester",
         "HTTP_HOST": "127.0.0.1",
         "HTTP_PORT": str(http_port),
         "CLI_ENABLED": "false",

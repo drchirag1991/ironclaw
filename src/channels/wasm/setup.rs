@@ -520,11 +520,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use secrecy::SecretString;
     use super::reserved_wasm_channel_names;
     use crate::agent::session::{BOOTSTRAP_SOURCE_CHANNEL, TRUSTED_APPROVAL_CHANNELS};
     use crate::secrets::{CreateSecretParams, InMemorySecretsStore, SecretsCrypto, SecretsStore};
     use crate::testing::credentials::TEST_CRYPTO_KEY;
+    use secrecy::SecretString;
 
     /// Build the same reserved-name list that `setup_wasm_channels` uses.
     fn reserved_names() -> Vec<&'static str> {

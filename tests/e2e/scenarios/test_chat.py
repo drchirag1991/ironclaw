@@ -8,14 +8,24 @@ async def test_send_message_and_receive_response(page):
     """Type a message, receive a streamed response from mock LLM."""
     chat_input = page.locator(SEL["chat_input"])
     await chat_input.wait_for(state="visible", timeout=5000)
+    initial_assistant_count = await page.locator(SEL["message_assistant"]).count()
 
     # Send message
     await chat_input.fill("What is 2+2?")
     await chat_input.press("Enter")
 
-    # Wait for assistant response
+    # Wait for a new assistant response after any seeded greeting.
+    await page.wait_for_function(
+        """({ selector, initialCount }) => {
+            return document.querySelectorAll(selector).length > initialCount;
+        }""",
+        arg={
+            "selector": SEL["message_assistant"],
+            "initialCount": initial_assistant_count,
+        },
+        timeout=15000,
+    )
     assistant_msg = page.locator(SEL["message_assistant"]).last
-    await assistant_msg.wait_for(state="visible", timeout=15000)
 
     # Verify user message
     user_msgs = page.locator(SEL["message_user"])
@@ -33,23 +43,37 @@ async def test_multiple_messages(page):
     """Send two messages, verify both get responses."""
     chat_input = page.locator(SEL["chat_input"])
     await chat_input.wait_for(state="visible", timeout=5000)
+    initial_assistant_count = await page.locator(SEL["message_assistant"]).count()
 
     # First message
     await chat_input.fill("Hello")
     await chat_input.press("Enter")
 
-    # Wait for first response
-    await page.locator(SEL["message_assistant"]).first.wait_for(
-        state="visible", timeout=15000
+    # Wait for first new response after any seeded greeting.
+    await page.wait_for_function(
+        """({ selector, expectedCount }) => {
+            return document.querySelectorAll(selector).length >= expectedCount;
+        }""",
+        arg={
+            "selector": SEL["message_assistant"],
+            "expectedCount": initial_assistant_count + 1,
+        },
+        timeout=15000,
     )
 
     # Second message
     await chat_input.fill("What is 2+2?")
     await chat_input.press("Enter")
 
-    # Wait for second response (at least 2 assistant messages)
+    # Wait for second new response (beyond any initial greeting).
     await page.wait_for_function(
-        """() => document.querySelectorAll('#chat-messages .message.assistant').length >= 2""",
+        """({ selector, expectedCount }) => {
+            return document.querySelectorAll(selector).length >= expectedCount;
+        }""",
+        arg={
+            "selector": SEL["message_assistant"],
+            "expectedCount": initial_assistant_count + 2,
+        },
         timeout=15000,
     )
 
@@ -57,7 +81,9 @@ async def test_multiple_messages(page):
     user_count = await page.locator(SEL["message_user"]).count()
     assistant_count = await page.locator(SEL["message_assistant"]).count()
     assert user_count >= 2, f"Expected >= 2 user messages, got {user_count}"
-    assert assistant_count >= 2, f"Expected >= 2 assistant messages, got {assistant_count}"
+    assert assistant_count >= initial_assistant_count + 2, (
+        f"Expected >= {initial_assistant_count + 2} assistant messages, got {assistant_count}"
+    )
 
 
 async def test_empty_message_not_sent(page):

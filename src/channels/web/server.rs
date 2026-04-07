@@ -2646,10 +2646,11 @@ fn extension_phase_for_web(
         crate::extensions::ExtensionPhase::NeedsAuth
     } else if ext.active
         || matches!(
-        ext.kind,
-        crate::extensions::ExtensionKind::WasmChannel
-            | crate::extensions::ExtensionKind::ChannelRelay
-    ) {
+            ext.kind,
+            crate::extensions::ExtensionKind::WasmChannel
+                | crate::extensions::ExtensionKind::ChannelRelay
+        )
+    {
         crate::extensions::ExtensionPhase::Ready
     } else {
         crate::extensions::ExtensionPhase::NeedsActivation
@@ -4166,8 +4167,7 @@ mod tests {
         // developer's real `~/.ironclaw/mcp-servers.json` (which would
         // panic with `AlreadyInstalled("notion")` on dev machines that
         // already have a notion entry configured).
-        let (ext_mgr, _wasm_tools_dir, _wasm_channels_dir, _db_dir) =
-            test_ext_mgr_with_db().await;
+        let (ext_mgr, _wasm_tools_dir, _wasm_channels_dir, _db_dir) = test_ext_mgr_with_db().await;
         let mut server =
             crate::tools::mcp::McpServerConfig::new("notion", "https://mcp.notion.com/mcp");
         server.description = Some("Notion".to_string());

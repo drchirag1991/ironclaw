@@ -26,14 +26,15 @@ async def _open_gateway_page(browser, base_url: str):
 
 async def _wait_for_connected(page, *, timeout: int = 10000) -> None:
     """Wait until the frontend reports an active SSE connection."""
-    status = page.locator(SEL["sse_status"])
-    await status.wait_for(state="visible", timeout=timeout)
+    dot = page.locator(SEL["sse_dot"])
+    await dot.wait_for(state="visible", timeout=timeout)
     deadline = asyncio.get_running_loop().time() + (timeout / 1000)
     while asyncio.get_running_loop().time() < deadline:
-        if await status.text_content() == "Connected":
+        classes = await dot.get_attribute("class") or ""
+        if "disconnected" not in classes:
             return
         await asyncio.sleep(0.2)
-    raise AssertionError("SSE status did not return to Connected before timeout")
+    raise AssertionError("SSE connection dot did not return to connected before timeout")
 
 
 async def _wait_for_last_event_id(page, *, timeout: int = 15000) -> str:
@@ -73,8 +74,9 @@ async def test_sse_reconnect_after_disconnect(page):
     await page.evaluate("if (eventSource) eventSource.close()")
     await page.evaluate("connectSSE()")
     await _wait_for_connected(page, timeout=10000)
-    status = page.locator(SEL["sse_status"])
-    assert await status.text_content() == "Connected"
+    classes = await page.locator(SEL["sse_dot"]).get_attribute("class")
+    assert classes is not None
+    assert "disconnected" not in classes, classes
 
 
 async def test_sse_reconnect_preserves_chat_history(page):

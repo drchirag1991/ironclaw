@@ -144,6 +144,7 @@ async def cancel_server(ironclaw_binary, mock_llm_server, cancel_mock_api):
         "GATEWAY_PORT": str(gw_port),
         "GATEWAY_AUTH_TOKEN": AUTH_TOKEN,
         "GATEWAY_USER_ID": "e2e-cancel-tester",
+        "IRONCLAW_OWNER_ID": "e2e-cancel-tester",
         "HTTP_HOST": "127.0.0.1",
         "HTTP_PORT": str(http_port),
         "CLI_ENABLED": "false",
@@ -271,9 +272,10 @@ class TestV2EngineAuthCancel:
             json={"content": "list issues in nearai/ironclaw github repo", "thread_id": thread_id},
             timeout=30,
         )
-        history = await _wait_for_approval_prompt(cancel_server, thread_id, timeout=60)
-        last = (history["turns"][-1].get("response") or "").lower()
-        if "requires approval" in last:
+        try:
+            await _wait_for_auth_prompt(cancel_server, thread_id, timeout=30)
+        except AssertionError:
+            history = await _wait_for_approval_prompt(cancel_server, thread_id, timeout=60)
             gate = await _wait_for_pending_gate(timeout=60)
             approve = await api_post(
                 cancel_server, "/api/chat/approval",
@@ -282,13 +284,13 @@ class TestV2EngineAuthCancel:
             )
             assert approve.status_code == 202, approve.text
             await _wait_for_pending_gate_absent(gate["request_id"], timeout=60)
-        try:
-            await _wait_for_auth_prompt(cancel_server, thread_id, timeout=60)
-        except AssertionError:
-            pytest.skip(
-                "Dedicated cancel fixture stayed on approval flow after explicit approval; "
-                "auth cancel behavior is covered by the main v2 auth scenarios."
-            )
+            try:
+                await _wait_for_auth_prompt(cancel_server, thread_id, timeout=60)
+            except AssertionError:
+                pytest.skip(
+                    "Dedicated cancel fixture stayed on approval flow after explicit approval; "
+                    "auth cancel behavior is covered by the main v2 auth scenarios."
+                )
 
         await api_post(
             cancel_server, "/api/chat/send",

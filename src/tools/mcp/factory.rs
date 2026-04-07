@@ -120,9 +120,7 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use crate::secrets::{
-        CreateSecretParams, InMemorySecretsStore, SecretsCrypto, SecretsStore,
-    };
+    use crate::secrets::{CreateSecretParams, InMemorySecretsStore, SecretsCrypto, SecretsStore};
     use crate::testing::credentials::TEST_CRYPTO_KEY;
     use crate::tools::mcp::OAuthConfig;
     use crate::tools::mcp::client::McpClientConstructor;
@@ -271,10 +269,7 @@ mod tests {
         secrets
             .create(
                 "test-user",
-                CreateSecretParams::new(
-                    "mcp_stored-token-1948_access_token",
-                    "stored-oauth-token",
-                ),
+                CreateSecretParams::new("mcp_stored-token-1948_access_token", "stored-oauth-token"),
             )
             .await
             .expect("seed token");
