@@ -84,6 +84,7 @@ impl OAuthRefreshConfig {
 /// Built before each WASM execution by decrypting secrets from the store.
 /// Applied per-request by matching the URL host against `host_patterns`.
 /// WASM tools never see the raw secret values.
+#[derive(Debug)]
 struct ResolvedHostCredential {
     /// Host patterns this credential applies to (e.g., "www.googleapis.com").
     host_patterns: Vec<String>,
@@ -1151,7 +1152,7 @@ impl Tool for WasmToolWrapper {
             credential_user_id,
             self.oauth_refresh.as_ref(),
         )
-        .await;
+        .await?;
 
         // Serialize context for WASM
         let context_json = serde_json::to_string(ctx).ok();
@@ -1463,15 +1464,15 @@ async fn persist_refreshed_oauth_tokens(
 /// If an `OAuthRefreshConfig` is provided and the access token is expired
 /// (or within 5 minutes of expiry), attempts a transparent refresh first.
 ///
-/// Silently skips credentials that can't be resolved (e.g., missing secrets).
-/// The tool will get a 401/403 from the API, which is the expected UX when
-/// auth hasn't been configured yet.
+/// Returns `Err(ToolError::NotAuthorized)` when a required credential is
+/// missing for the given `user_id`. No cross-tenant fallback: each user
+/// must have their own credentials configured.
 async fn resolve_host_credentials(
     capabilities: &Capabilities,
     store: Option<&(dyn SecretsStore + Send + Sync)>,
     user_id: &str,
     oauth_refresh: Option<&OAuthRefreshConfig>,
-) -> Vec<ResolvedHostCredential> {
+) -> Result<Vec<ResolvedHostCredential>, ToolError> {
     let store = match store {
         Some(s) => s,
         None => {
@@ -1479,12 +1480,11 @@ async fn resolve_host_credentials(
             if let Some(http_cap) = &capabilities.http
                 && !http_cap.credentials.is_empty()
             {
-                tracing::warn!(
-                    user_id = %user_id,
-                    "WASM tool requires credentials but secrets_store is not configured - authentication will fail"
-                );
+                return Err(ToolError::NotAuthorized(format!(
+                    "secrets store not configured; cannot resolve credentials for user '{user_id}'"
+                )));
             }
-            return Vec::new();
+            return Ok(Vec::new());
         }
     };
 
@@ -1518,11 +1518,11 @@ async fn resolve_host_credentials(
 
     let http_cap = match &capabilities.http {
         Some(cap) => cap,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
 
     if http_cap.credentials.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut resolved = Vec::new();
@@ -1536,46 +1536,15 @@ async fn resolve_host_credentials(
             continue;
         }
 
-        // Try to get credential under the provided user_id first.
-        // If not found and user_id != "default", fallback to "default" (global credentials).
-        // This handles OAuth tokens stored globally under "default" but accessed from routine contexts.
+        // Look up credential under the provided user_id only.
+        // No cross-tenant fallback: each user must configure their own credentials.
         let secret = match store.get_decrypted(user_id, &mapping.secret_name).await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::trace!(
-                    user_id = %user_id,
-                    secret_name = %mapping.secret_name,
-                    error = %e,
-                    "No matching host credential resolved for WASM tool in the requested scope"
-                );
-
-                // If lookup fails and we're not already looking up "default", try "default" as fallback
-                if user_id != "default" {
-                    tracing::debug!(
-                        secret_name = %mapping.secret_name,
-                        user_id = %user_id,
-                        error = %e,
-                        "Credential not found for user, trying default global credentials"
-                    );
-                    store
-                        .get_decrypted("default", &mapping.secret_name)
-                        .await
-                        .ok()
-                } else {
-                    None
-                }
-            }
-        };
-
-        let secret = match secret {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    secret_name = %mapping.secret_name,
-                    user_id = %user_id,
-                    "Could not resolve credential for WASM tool (not found in user context or default)"
-                );
-                continue;
+            Ok(s) => s,
+            Err(_) => {
+                return Err(ToolError::NotAuthorized(format!(
+                    "credential '{}' not found for user '{}'; configure it via `ironclaw secrets set`",
+                    mapping.secret_name, user_id
+                )));
             }
         };
 
@@ -1601,7 +1570,7 @@ async fn resolve_host_credentials(
         );
     }
 
-    resolved
+    Ok(resolved)
 }
 
 /// Extract the hostname from a URL string.
@@ -2311,8 +2280,44 @@ mod tests {
         use crate::tools::wasm::wrapper::resolve_host_credentials;
 
         let caps = Capabilities::default();
-        let result = resolve_host_credentials(&caps, None, "user1", None).await;
+        let result = resolve_host_credentials(&caps, None, "user1", None)
+            .await
+            .expect("no http cap means Ok(empty)"); // safety: test code only
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_credentials_no_store_with_credentials_errors() {
+        use crate::secrets::{CredentialLocation, CredentialMapping};
+        use crate::tools::wasm::capabilities::HttpCapability;
+        use crate::tools::wasm::wrapper::resolve_host_credentials;
+
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "api_token".to_string(),
+            CredentialMapping {
+                secret_name: "api_token".to_string(),
+                location: CredentialLocation::AuthorizationBearer,
+                host_patterns: vec!["api.example.com".to_string()],
+            },
+        );
+        let caps = Capabilities {
+            http: Some(HttpCapability {
+                credentials,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // No store but credentials required — must error
+        let err = resolve_host_credentials(&caps, None, "user1", None)
+            .await
+            .expect_err("no store with required credentials must error"); // safety: test code only
+        assert!(
+            err.to_string().contains("secrets store not configured"),
+            "error message: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -2322,7 +2327,9 @@ mod tests {
         let store = test_secrets_store();
 
         let caps = Capabilities::default();
-        let result = resolve_host_credentials(&caps, Some(&store), "user1", None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "user1", None)
+            .await
+            .expect("no http cap means Ok(empty)"); // safety: test code only
         assert!(result.is_empty());
     }
 
@@ -2362,7 +2369,9 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_host_credentials(&caps, Some(&store), "user1", None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "user1", None)
+            .await
+            .expect("user1 has the credential"); // safety: test code only
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].host_patterns, vec!["www.googleapis.com"]);
         assert_eq!(
@@ -2408,7 +2417,9 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_host_credentials(&caps, Some(&store), &ctx.user_id, None).await;
+        let result = resolve_host_credentials(&caps, Some(&store), &ctx.user_id, None)
+            .await
+            .expect("owner-scope has the credential"); // safety: test code only
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].headers.get("Authorization"),
@@ -2466,14 +2477,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_host_credentials_missing_secret() {
+    async fn test_resolve_host_credentials_missing_secret_returns_error() {
         use crate::secrets::{CredentialLocation, CredentialMapping};
         use crate::tools::wasm::capabilities::HttpCapability;
         use crate::tools::wasm::wrapper::resolve_host_credentials;
 
         let store = test_secrets_store();
 
-        // No secret stored, should silently skip
+        // No secret stored — must fail with NotAuthorized, not silently skip
         let mut credentials = HashMap::new();
         credentials.insert(
             "missing_token".to_string(),
@@ -2492,7 +2503,53 @@ mod tests {
             ..Default::default()
         };
 
-        let result = resolve_host_credentials(&caps, Some(&store), "user1", None).await;
+        let err = resolve_host_credentials(&caps, Some(&store), "user1", None)
+            .await
+            .expect_err("missing credential must return error"); // safety: test code only
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing_token"),
+            "error should name the missing credential: {msg}"
+        );
+        assert!(msg.contains("user1"), "error should name the user: {msg}");
+    }
+
+    /// UrlPath credentials are resolved via URL placeholder substitution, not
+    /// the secrets store lookup in `resolve_host_credentials`. A missing
+    /// UrlPath credential must NOT trigger `NotAuthorized`.
+    #[tokio::test]
+    async fn test_resolve_host_credentials_skips_urlpath_credentials() {
+        use crate::secrets::{CredentialLocation, CredentialMapping};
+        use crate::tools::wasm::capabilities::HttpCapability;
+        use crate::tools::wasm::wrapper::resolve_host_credentials;
+
+        let store = test_secrets_store();
+
+        // Only a UrlPath credential — no secret stored for it
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "api_key".to_string(),
+            CredentialMapping {
+                secret_name: "api_key".to_string(),
+                location: CredentialLocation::UrlPath {
+                    placeholder: "{api_key}".to_string(),
+                },
+                host_patterns: vec!["api.example.com".to_string()],
+            },
+        );
+
+        let caps = Capabilities {
+            http: Some(HttpCapability {
+                credentials,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // UrlPath creds are skipped — result is Ok(empty), not an error
+        let result = resolve_host_credentials(&caps, Some(&store), "user1", None)
+            .await
+            .expect("UrlPath credentials should be skipped, not cause an error"); // safety: test code only
         assert!(result.is_empty());
     }
 
@@ -2546,8 +2603,9 @@ mod tests {
         };
 
         // Should resolve the existing fresh token without attempting refresh
-        let result =
-            resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config)).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config))
+            .await
+            .expect("user1 has a fresh token"); // safety: test code only
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].headers.get("Authorization"),
@@ -2593,9 +2651,11 @@ mod tests {
             ..Default::default()
         };
 
-        // No OAuth config, expired token can't be resolved (get_decrypted returns Expired)
-        let result = resolve_host_credentials(&caps, Some(&store), "user1", None).await;
-        assert!(result.is_empty());
+        // No OAuth config, expired token can't be resolved — returns NotAuthorized error
+        let err = resolve_host_credentials(&caps, Some(&store), "user1", None)
+            .await
+            .expect_err("expired credential without refresh config must error"); // safety: test code only
+        assert!(err.to_string().contains("my_token"));
     }
 
     #[tokio::test]
@@ -2646,8 +2706,9 @@ mod tests {
         };
 
         // Should use the legacy token directly without attempting refresh
-        let result =
-            resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config)).await;
+        let result = resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config))
+            .await
+            .expect("user1 has a legacy token"); // safety: test code only
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].headers.get("Authorization"),
@@ -2711,8 +2772,9 @@ mod tests {
             provider: Some("google".to_string()),
         };
 
-        let resolved =
-            resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config)).await;
+        let resolved = resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config))
+            .await
+            .expect("refresh should succeed via proxy"); // safety: test code only
         assert_eq!(resolved.len(), 1);
         assert_eq!(
             resolved[0].headers.get("Authorization"),
@@ -2820,9 +2882,10 @@ mod tests {
             provider: Some("google".to_string()),
         };
 
-        let resolved =
-            resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config)).await;
-        assert!(resolved.is_empty());
+        let err = resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config))
+            .await
+            .expect_err("expired token without gateway_token should error"); // safety: test code only
+        assert!(err.to_string().contains("google_oauth_token"));
 
         let lookups = store.decrypted_lookups();
         assert!(lookups.contains(&("user1".to_string(), "google_oauth_token".to_string())));
@@ -2887,9 +2950,10 @@ mod tests {
             provider: Some("google".to_string()),
         };
 
-        let resolved =
-            resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config)).await;
-        assert!(resolved.is_empty());
+        let err = resolve_host_credentials(&caps, Some(&store), "user1", Some(&oauth_config))
+            .await
+            .expect_err("expired token with invalid direct URL should error"); // safety: test code only
+        assert!(err.to_string().contains("google_oauth_token"));
 
         let lookups = store.decrypted_lookups();
         assert!(lookups.contains(&("user1".to_string(), "google_oauth_token".to_string())));
@@ -3092,15 +3156,17 @@ mod tests {
         );
     }
 
+    /// Regression test for #2069: credentials stored under "default" must NOT
+    /// leak to a different user's tool execution.
     #[tokio::test]
-    async fn test_resolve_host_credentials_fallback_to_default_user() {
+    async fn test_resolve_host_credentials_no_cross_tenant_fallback() {
         use crate::secrets::{CredentialLocation, CredentialMapping, SecretsStore};
         use crate::tools::wasm::capabilities::HttpCapability;
         use crate::tools::wasm::wrapper::resolve_host_credentials;
 
         let store = test_secrets_store();
 
-        // Store a token under the "default" global user
+        // Store a token under the "default" user only
         store
             .create(
                 "default",
@@ -3109,7 +3175,6 @@ mod tests {
             .await
             .expect("Failed to store global token"); // safety: test code only
 
-        // Create capabilities requiring this credential
         let mut creds = std::collections::HashMap::new();
         creds.insert(
             "google_oauth_token".to_string(),
@@ -3131,12 +3196,19 @@ mod tests {
             ..Default::default()
         };
 
-        // Resolve credentials for a different user (routine context)
-        // Should fallback to "default" and find the token
-        let result = resolve_host_credentials(&caps, Some(&store), "routine_user_123", None).await;
-
-        assert!(!result.is_empty(), "fallback to default"); // safety: test code only
-        assert_eq!(result[0].secret_value, "global_token_value"); // safety: test code only
+        // Must NOT fall back to "default" — returns NotAuthorized error
+        let err = resolve_host_credentials(&caps, Some(&store), "routine_user_123", None)
+            .await
+            .expect_err("cross-tenant credential must not leak"); // safety: test code only
+        let msg = err.to_string();
+        assert!(
+            msg.contains("routine_user_123"),
+            "error names the user: {msg}"
+        );
+        assert!(
+            msg.contains("google_oauth_token"),
+            "error names the credential: {msg}"
+        );
     }
 
     fn test_capabilities_with_google_oauth() -> Capabilities {
@@ -3166,20 +3238,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_host_credentials_prefers_user_specific_over_default() {
+    async fn test_resolve_host_credentials_returns_user_specific_token() {
         use crate::secrets::SecretsStore;
         use crate::tools::wasm::wrapper::resolve_host_credentials;
 
         let store = test_secrets_store();
-
-        // Store token under "default" (global)
-        store
-            .create(
-                "default",
-                crate::secrets::CreateSecretParams::new("google_oauth_token", "global_token"),
-            )
-            .await
-            .expect("Failed to store global token"); // safety: test code only
 
         // Store token under user_123 (user-specific)
         store
@@ -3193,25 +3256,25 @@ mod tests {
             .await
             .expect("Failed to store user token"); // safety: test code only
 
-        // Create capabilities
         let caps = test_capabilities_with_google_oauth();
 
-        // Resolve credentials for user_123
-        // Should prefer user_123's token over default
-        let result = resolve_host_credentials(&caps, Some(&store), "user_123", None).await;
+        // Resolve credentials for user_123 — finds user's own token directly
+        let result = resolve_host_credentials(&caps, Some(&store), "user_123", None)
+            .await
+            .expect("user_123 has the credential"); // safety: test code only
 
         assert!(!result.is_empty(), "has user credentials"); // safety: test code only
         assert_eq!(result[0].secret_value, "user_specific_token", "user token"); // safety: test code only
     }
 
     #[tokio::test]
-    async fn test_resolve_host_credentials_no_fallback_when_already_default() {
+    async fn test_resolve_host_credentials_direct_lookup_for_default_user() {
         use crate::secrets::SecretsStore;
         use crate::tools::wasm::wrapper::resolve_host_credentials;
 
         let store = test_secrets_store();
 
-        // Only store token under "default" (not a duplicate)
+        // Store token under "default"
         store
             .create(
                 "default",
@@ -3220,33 +3283,36 @@ mod tests {
             .await
             .expect("Failed to store default token"); // safety: test code only
 
-        // Create capabilities
         let caps = test_capabilities_with_google_oauth();
 
-        // Resolve credentials for "default" user
-        // Should NOT attempt fallback (already looking up default)
-        let result = resolve_host_credentials(&caps, Some(&store), "default", None).await;
+        // Direct lookup for "default" user — finds its own token
+        let result = resolve_host_credentials(&caps, Some(&store), "default", None)
+            .await
+            .expect("default user has the credential"); // safety: test code only
 
         assert!(!result.is_empty(), "Should find default token"); // safety: test code only
         assert_eq!(result[0].secret_value, "default_token"); // safety: test code only
     }
 
     #[tokio::test]
-    async fn test_resolve_host_credentials_missing_secret_warns() {
+    async fn test_resolve_host_credentials_missing_secret_returns_not_authorized() {
         use crate::tools::wasm::wrapper::resolve_host_credentials;
 
         let store = test_secrets_store();
 
         // Don't store any token
-
-        // Create capabilities expecting a credential
         let caps = test_capabilities_with_google_oauth();
 
-        // Resolve credentials when neither user nor default has the token
-        let result = resolve_host_credentials(&caps, Some(&store), "user_456", None).await;
-
-        // Should return empty since credential can't be found anywhere
-        assert!(result.is_empty(), "no credentials found"); // safety: test code only
+        // Missing credential must return actionable error
+        let err = resolve_host_credentials(&caps, Some(&store), "user_456", None)
+            .await
+            .expect_err("missing credential must error"); // safety: test code only
+        let msg = err.to_string();
+        assert!(msg.contains("user_456"), "error names the user: {msg}");
+        assert!(
+            msg.contains("ironclaw secrets set"),
+            "error suggests fix: {msg}"
+        );
     }
 
     // --- needs_content_length_zero (regression for #1529) ---
