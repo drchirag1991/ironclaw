@@ -66,6 +66,12 @@ impl Store {
         embed_migrations!("migrations");
 
         let mut client = self.pool.get().await?;
+
+        // Realign any historically modified migration checksums before
+        // refinery validates them. See `crate::db::migration_fixup` and
+        // issue #1328 for context.
+        crate::db::migration_fixup::realign_diverged_checksums(&mut client).await?;
+
         migrations::runner()
             .run_async(&mut **client)
             .await

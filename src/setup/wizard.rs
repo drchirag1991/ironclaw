@@ -906,6 +906,13 @@ impl SetupWizard {
                 .await
                 .map_err(|e| SetupError::Database(format!("Pool error: {}", e)))?;
 
+            // Realign any historically modified migration checksums before
+            // refinery validates them. See `crate::db::migration_fixup` and
+            // issue #1328 for context.
+            crate::db::migration_fixup::realign_diverged_checksums(&mut client)
+                .await
+                .map_err(|e| SetupError::Database(format!("Migration fix-up failed: {}", e)))?;
+
             migrations::runner()
                 .run_async(&mut **client)
                 .await
