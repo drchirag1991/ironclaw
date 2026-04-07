@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::debug;
+use tokio::sync::OnceCell;
+use tracing::{debug, warn};
 
 use crate::db::{Database, SettingsStore};
 use crate::error::DatabaseError;
@@ -20,12 +21,43 @@ use crate::history::SettingRow;
 use crate::workspace::Workspace;
 use crate::workspace::settings_schemas::{schema_for_key, settings_path, validate_settings_key};
 
+/// Returns true if `actual` matches the expected `.system/.config` metadata
+/// closely enough that no repair is needed. The check is permissive: an
+/// older/newer adapter version may have written extra fields, but the
+/// load-bearing flags are:
+///
+/// - `skip_indexing == true` (so descendants are excluded from search)
+/// - `skip_versioning != true` (versioning must NOT be silently disabled —
+///   absent or `false` is fine)
+/// - `hygiene.enabled != true` (system state must not be auto-cleaned)
+fn system_config_metadata_matches(
+    actual: &serde_json::Value,
+    _expected: &serde_json::Value,
+) -> bool {
+    let skip_indexing_ok = actual
+        .get("skip_indexing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let versioning_ok = actual.get("skip_versioning").and_then(|v| v.as_bool()) != Some(true);
+    let hygiene_ok = actual
+        .get("hygiene")
+        .and_then(|h| h.get("enabled"))
+        .and_then(|v| v.as_bool())
+        != Some(true);
+    skip_indexing_ok && versioning_ok && hygiene_ok
+}
+
 /// Implements `SettingsStore` by reading/writing workspace documents at
 /// `.system/settings/{key}.json`. Falls back to the legacy `settings` table
 /// for reads during migration.
 pub struct WorkspaceSettingsAdapter {
     workspace: Arc<Workspace>,
     legacy_store: Arc<dyn Database>,
+    /// Guards the lazy `ensure_system_config()` call so it runs at most once
+    /// per adapter instance regardless of which write path triggers it. This
+    /// removes the requirement that callers run `ensure_system_config()` at
+    /// startup before any setting write — see the comment on `set_setting`.
+    system_config_seeded: OnceCell<()>,
 }
 
 impl WorkspaceSettingsAdapter {
@@ -33,6 +65,7 @@ impl WorkspaceSettingsAdapter {
         Self {
             workspace,
             legacy_store,
+            system_config_seeded: OnceCell::new(),
         }
     }
 
@@ -51,23 +84,43 @@ impl WorkspaceSettingsAdapter {
     /// a human-readable JSON summary of what gets inherited.
     pub async fn ensure_system_config(&self) -> Result<(), DatabaseError> {
         let config_path = ".system/.config";
+        let expected = serde_json::json!({
+            "skip_indexing": true,
+            "skip_versioning": false,
+            "hygiene": { "enabled": false }
+        });
+
+        // If the doc already exists, verify its metadata column matches the
+        // expected inherited values and repair it if it diverges. Older
+        // workspaces (pre-PR or pre-fix #3042846635) may have a `.config`
+        // doc whose metadata silently disables versioning for `.system/**`,
+        // and we need this seeding to be idempotent across upgrades.
         if self
             .workspace
             .exists(config_path)
             .await
             .map_err(|e| DatabaseError::Query(format!("workspace exists check failed: {e}")))?
         {
+            let doc = self
+                .workspace
+                .read(config_path)
+                .await
+                .map_err(|e| DatabaseError::Query(format!("workspace read failed: {e}")))?;
+            if !system_config_metadata_matches(&doc.metadata, &expected) {
+                debug!("repairing .system/.config metadata to expected system defaults");
+                self.workspace
+                    .update_metadata(doc.id, &expected)
+                    .await
+                    .map_err(|e| {
+                        DatabaseError::Query(format!("workspace metadata repair failed: {e}"))
+                    })?;
+            }
             return Ok(());
         }
 
-        let inherited_metadata = serde_json::json!({
-            "skip_indexing": true,
-            "skip_versioning": false,
-            "hygiene": { "enabled": false }
-        });
         let doc = self
             .workspace
-            .write(config_path, &inherited_metadata.to_string())
+            .write(config_path, &expected.to_string())
             .await
             .map_err(|e| DatabaseError::Query(format!("workspace write failed: {e}")))?;
 
@@ -77,11 +130,27 @@ impl WorkspaceSettingsAdapter {
         // changing it to `true` here would silently disable versioning for
         // every document under `.system/**`.
         self.workspace
-            .update_metadata(doc.id, &inherited_metadata)
+            .update_metadata(doc.id, &expected)
             .await
             .map_err(|e| DatabaseError::Query(format!("workspace metadata update failed: {e}")))?;
 
         debug!("seeded .system/.config for workspace settings");
+        Ok(())
+    }
+
+    /// Lazy idempotent wrapper around `ensure_system_config` used by write
+    /// paths so callers don't have to remember to seed at startup. After the
+    /// first successful call this becomes a cheap atomic load.
+    async fn ensure_system_config_lazy(&self) -> Result<(), DatabaseError> {
+        // We can't return a borrow of `()` and propagate errors cleanly with
+        // OnceCell::get_or_try_init because the closure must be `'static`,
+        // so we manually check `get()` first.
+        if self.system_config_seeded.get().is_some() {
+            return Ok(());
+        }
+        self.ensure_system_config().await?;
+        // Ignore the SetError if another task raced us — both calls succeeded.
+        let _ = self.system_config_seeded.set(());
         Ok(())
     }
 
@@ -91,6 +160,11 @@ impl WorkspaceSettingsAdapter {
         key: &str,
         value: &serde_json::Value,
     ) -> Result<(), DatabaseError> {
+        // Lazily seed `.system/.config` so the first setting write cannot
+        // create `.system/settings/**` documents before the inherited
+        // `skip_indexing` / hygiene flags are in place. Cheap after the
+        // first call (atomic OnceCell load).
+        self.ensure_system_config_lazy().await?;
         validate_settings_key(key)
             .map_err(|e| DatabaseError::Query(format!("invalid settings key '{key}': {e}")))?;
         let path = settings_path(key);
@@ -213,9 +287,19 @@ impl SettingsStore for WorkspaceSettingsAdapter {
 
     async fn delete_setting(&self, user_id: &str, key: &str) -> Result<bool, DatabaseError> {
         // Delete from both. Skip workspace for invalid keys (cannot exist there).
+        // We don't propagate workspace delete errors: the legacy table is the
+        // source of truth during migration, so a stale workspace doc on a
+        // failed delete is recoverable on next write. We do log the failure
+        // so partial-delete state is observable.
         if validate_settings_key(key).is_ok() {
             let path = settings_path(key);
-            let _ = self.workspace.delete(&path).await;
+            if let Err(e) = self.workspace.delete(&path).await {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "workspace delete failed in delete_setting; legacy table will still be updated"
+                );
+            }
         }
         self.legacy_store.delete_setting(user_id, key).await
     }
@@ -341,5 +425,80 @@ mod tests {
         // Should not be found in workspace anymore
         let value = adapter.get_setting("test_user", "test_key").await.unwrap();
         assert!(value.is_none());
+    }
+
+    /// Regression for review comment #3043199991: a caller that forgets to
+    /// run `ensure_system_config()` at startup must still get a properly
+    /// configured `.system/.config` after the first `set_setting` write.
+    #[tokio::test]
+    async fn set_setting_lazily_seeds_system_config() {
+        use crate::db::libsql::LibSqlBackend;
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("settings_lazy_test.db");
+        let backend = LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("LibSqlBackend");
+        <LibSqlBackend as Database>::run_migrations(&backend)
+            .await
+            .expect("migrations");
+        let db: Arc<dyn Database> = Arc::new(backend);
+        let ws = Arc::new(Workspace::new_with_db("test_user", Arc::clone(&db)));
+
+        let adapter = WorkspaceSettingsAdapter::new(Arc::clone(&ws), db);
+        // Deliberately do NOT call ensure_system_config() here.
+        adapter
+            .set_setting("test_user", "llm_backend", &serde_json::json!("anthropic"))
+            .await
+            .unwrap();
+
+        // .system/.config must now exist with the expected metadata.
+        let cfg = ws.read(".system/.config").await.unwrap();
+        assert!(system_config_metadata_matches(
+            &cfg.metadata,
+            &serde_json::Value::Null
+        ));
+    }
+
+    /// Regression for review comment #3043199972: if `.system/.config`
+    /// already exists with broken metadata (e.g., from an older adapter
+    /// that set `skip_versioning: true`), `ensure_system_config()` must
+    /// repair it instead of silently leaving it broken.
+    #[tokio::test]
+    async fn ensure_system_config_repairs_existing_metadata() {
+        use crate::db::libsql::LibSqlBackend;
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("settings_repair_test.db");
+        let backend = LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("LibSqlBackend");
+        <LibSqlBackend as Database>::run_migrations(&backend)
+            .await
+            .expect("migrations");
+        let db: Arc<dyn Database> = Arc::new(backend);
+        let ws = Arc::new(Workspace::new_with_db("test_user", Arc::clone(&db)));
+
+        // Simulate an old workspace where .system/.config exists but its
+        // metadata column has skip_versioning: true (the pre-fix bug).
+        let doc = ws.write(".system/.config", "{}").await.unwrap();
+        ws.update_metadata(
+            doc.id,
+            &serde_json::json!({
+                "skip_indexing": true,
+                "skip_versioning": true,
+                "hygiene": { "enabled": false }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let adapter = WorkspaceSettingsAdapter::new(Arc::clone(&ws), db);
+        adapter.ensure_system_config().await.unwrap();
+
+        // After ensure, the metadata must no longer disable versioning.
+        let cfg = ws.read(".system/.config").await.unwrap();
+        assert!(system_config_metadata_matches(
+            &cfg.metadata,
+            &serde_json::Value::Null
+        ));
     }
 }

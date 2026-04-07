@@ -27,6 +27,13 @@ pub fn validate_content_against_schema(
             errors: vec![format!("content is not valid JSON: {e}")],
         })?;
 
+    // NOTE: `jsonschema::validate` recompiles the schema on every call. This
+    // is intentionally not cached today: schema-validated writes are limited
+    // to settings/extension/skill state, which are rare user-initiated
+    // operations (not a hot path). If schema validation moves into a frequent
+    // write path, build a `Validator` once per distinct schema (e.g., via
+    // `OnceCell`/`DashMap` keyed on the schema's canonical JSON) and call
+    // `Validator::validate` here instead.
     jsonschema::validate(schema, &instance).map_err(|e| WorkspaceError::SchemaValidation {
         path: path.to_string(),
         errors: vec![e.to_string()],
