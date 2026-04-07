@@ -53,9 +53,10 @@ mod search;
 
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{
-    CONFIG_FILE_NAME, DocumentMetadata, DocumentVersion, HygieneMetadata, IDENTITY_PATHS,
-    MemoryChunk, MemoryDocument, PatchResult, VersionSummary, WorkspaceEntry, content_sha256,
-    is_config_path, is_identity_path, merge_workspace_entries, paths,
+    ADMIN_SCOPE, CONFIG_FILE_NAME, DocumentMetadata, DocumentVersion, HygieneMetadata,
+    IDENTITY_PATHS, MemoryChunk, MemoryDocument, PatchResult, VersionSummary, WorkspaceEntry,
+    content_sha256, is_config_path, is_identity_path, is_reserved_scope, merge_workspace_entries,
+    paths,
 };
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 #[cfg(feature = "bedrock")]
@@ -97,6 +98,7 @@ const SYSTEM_PROMPT_FILES: &[&str] = &[
     paths::AGENTS,
     paths::USER,
     paths::IDENTITY,
+    paths::SYSTEM,
     paths::MEMORY,
     paths::TOOLS,
     paths::HEARTBEAT,
@@ -518,6 +520,9 @@ pub struct Workspace {
     /// Optional privacy classifier for shared layer writes.
     /// When None, writes go exactly where requested — no silent redirect.
     privacy_classifier: Option<Arc<dyn crate::workspace::privacy::PrivacyClassifier>>,
+    /// When true, the system prompt includes admin-defined instructions from
+    /// the `__admin__` scope. Set by `WorkspacePool` in multi-tenant mode.
+    admin_prompt_enabled: bool,
 }
 
 impl Workspace {
@@ -537,6 +542,7 @@ impl Workspace {
             search_defaults: SearchConfig::default(),
             memory_layers,
             privacy_classifier: None,
+            admin_prompt_enabled: false,
         }
     }
 
@@ -557,6 +563,7 @@ impl Workspace {
             search_defaults: SearchConfig::default(),
             memory_layers,
             privacy_classifier: None,
+            admin_prompt_enabled: false,
         }
     }
 
@@ -655,6 +662,16 @@ impl Workspace {
         self
     }
 
+    /// Enable admin system prompt reading from the `__admin__` scope.
+    ///
+    /// When enabled, `system_prompt_for_context_inner()` reads `SYSTEM.md`
+    /// from the `__admin__` scope and injects it before identity files.
+    /// Only set in multi-tenant mode (via `WorkspacePool`).
+    pub fn with_admin_prompt(mut self) -> Self {
+        self.admin_prompt_enabled = true;
+        self
+    }
+
     /// Get the configured memory layers.
     pub fn memory_layers(&self) -> &[crate::workspace::layer::MemoryLayer] {
         &self.memory_layers
@@ -727,6 +744,7 @@ impl Workspace {
             search_defaults: self.search_defaults.clone(),
             memory_layers,
             privacy_classifier: self.privacy_classifier.clone(),
+            admin_prompt_enabled: self.admin_prompt_enabled,
         }
     }
 
@@ -1559,6 +1577,20 @@ impl Workspace {
         } else {
             false
         };
+
+        // Admin system prompt: shared instructions set by an admin.
+        // Only read in multi-tenant mode (admin_prompt_enabled is set by WorkspacePool).
+        // Read directly from __admin__ scope with no agent_id — the admin prompt
+        // is global and applies to all users regardless of workspace config.
+        if self.admin_prompt_enabled
+            && let Ok(doc) = self
+                .storage
+                .get_document_by_path(ADMIN_SCOPE, None, paths::SYSTEM)
+                .await
+            && !doc.content.is_empty()
+        {
+            parts.push(format!("## System Instructions\n\n{}", doc.content));
+        }
 
         // Load identity files in order of importance.
         // These MUST use read_primary() — see comment above.
@@ -2411,12 +2443,25 @@ mod tests {
     // ── Injection scanning tests ─────────────────────────────────────
 
     #[test]
+    fn test_system_md_is_system_prompt_file_but_not_identity() {
+        assert!(
+            is_system_prompt_file(paths::SYSTEM),
+            "SYSTEM.md should be scanned for injection"
+        );
+        assert!(
+            !is_identity_path(paths::SYSTEM),
+            "SYSTEM.md must NOT be an identity path — it is shared, not per-user"
+        );
+    }
+
+    #[test]
     fn test_system_prompt_file_matching() {
         let cases = vec![
             ("SOUL.md", true),
             ("AGENTS.md", true),
             ("USER.md", true),
             ("IDENTITY.md", true),
+            ("SYSTEM.md", true),
             ("MEMORY.md", true),
             ("HEARTBEAT.md", true),
             ("TOOLS.md", true),

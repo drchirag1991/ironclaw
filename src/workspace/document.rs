@@ -32,6 +32,8 @@ pub mod paths {
     pub const TOOLS: &str = "TOOLS.md";
     /// First-run ritual file; self-deletes after onboarding completes.
     pub const BOOTSTRAP: &str = "BOOTSTRAP.md";
+    /// Admin-defined system instructions shared with all users.
+    pub const SYSTEM: &str = "SYSTEM.md";
     /// User psychographic profile (JSON).
     pub const PROFILE: &str = "context/profile.json";
     /// Assistant behavioral directives (derived from profile).
@@ -39,54 +41,43 @@ pub mod paths {
 }
 
 /// Name of the folder-level configuration document.
-///
-/// A document at `{directory}/.config` carries metadata flags that apply
-/// as defaults to all documents in that directory (e.g., `skip_indexing`,
-/// `hygiene` settings). Individual document metadata overrides folder defaults.
 pub const CONFIG_FILE_NAME: &str = ".config";
 
-/// Typed overlay for the `metadata` JSON field on [`MemoryDocument`].
+/// Well-known scope identifier for admin-defined content (e.g., system prompt).
 ///
-/// Fields use `Option` so that only explicitly set flags participate in
-/// the merge chain (document metadata → folder `.config` → system defaults).
-/// Unknown fields are preserved via `serde(flatten)`.
+/// Documents stored under this scope are readable by all workspaces when
+/// `admin_prompt_enabled` is set (multi-tenant mode). The double-underscore
+/// prefix prevents collision with real user IDs.
+pub const ADMIN_SCOPE: &str = "__admin__";
+
+/// Check if a scope identifier is reserved for system use.
+///
+/// Reserved scopes must never be assigned as a user ID.
+/// Currently only `__admin__` is reserved (used for the admin system prompt).
+pub fn is_reserved_scope(scope: &str) -> bool {
+    scope == ADMIN_SCOPE
+}
+
+/// Typed overlay for the `metadata` JSON field on [`MemoryDocument`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DocumentMetadata {
-    /// When `true`, skip chunking and embedding for this document/folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_indexing: Option<bool>,
-
-    /// When `true`, skip automatic versioning for this document/folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_versioning: Option<bool>,
-
-    /// Hygiene (auto-cleanup) configuration for this folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hygiene: Option<HygieneMetadata>,
-
-    /// Preserve unknown fields for forward compatibility.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl DocumentMetadata {
-    /// Parse from a raw JSON [`serde_json::Value`].
-    ///
-    /// Returns [`Default`] if the value is not an object or cannot be parsed.
     pub fn from_value(value: &serde_json::Value) -> Self {
         serde_json::from_value(value.clone()).unwrap_or_default()
     }
-
-    /// Convert to a JSON [`serde_json::Value`].
     pub fn to_value(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap_or(serde_json::json!({}))
     }
-
-    /// Merge two metadata values: `overlay` keys win over `base` keys.
-    ///
-    /// This is a shallow merge at the top-level keys — nested objects are
-    /// replaced wholesale, not recursively merged. This keeps the semantics
-    /// simple and predictable across both PostgreSQL and libSQL.
     pub fn merge(base: &serde_json::Value, overlay: &serde_json::Value) -> serde_json::Value {
         let mut merged = match base {
             serde_json::Value::Object(map) => map.clone(),
@@ -101,16 +92,11 @@ impl DocumentMetadata {
     }
 }
 
-/// Minimum allowed `retention_days` to prevent accidental mass-deletion.
 const MIN_RETENTION_DAYS: u32 = 1;
 
-/// Hygiene (auto-cleanup) settings for a folder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HygieneMetadata {
-    /// Whether this folder is a hygiene target.
     pub enabled: bool,
-
-    /// Delete documents older than this many days (minimum: 1).
     #[serde(
         default = "default_retention_days",
         deserialize_with = "deserialize_retention_days"
@@ -130,48 +116,31 @@ where
     Ok(value.max(MIN_RETENTION_DAYS))
 }
 
-/// A historical version of a workspace document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentVersion {
-    /// Version record ID.
     pub id: Uuid,
-    /// Parent document ID.
     pub document_id: Uuid,
-    /// Version number (1-based, monotonically increasing per document).
     pub version: i32,
-    /// Full document content at this version.
     pub content: String,
-    /// SHA-256 hash of `content` (hex-encoded, prefixed with `sha256:`).
     pub content_hash: String,
-    /// When this version was created.
     pub created_at: DateTime<Utc>,
-    /// Who/what created this version (e.g. `"agent"`, `"user:alice"`).
     pub changed_by: Option<String>,
 }
 
-/// Summary of a document version (without full content).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionSummary {
-    /// Version number.
     pub version: i32,
-    /// SHA-256 hash of the version's content.
     pub content_hash: String,
-    /// When this version was created.
     pub created_at: DateTime<Utc>,
-    /// Who/what created this version.
     pub changed_by: Option<String>,
 }
 
-/// Result of a workspace patch operation.
 #[derive(Debug, Clone)]
 pub struct PatchResult {
-    /// The updated document.
     pub document: MemoryDocument,
-    /// Number of replacements made.
     pub replacements: usize,
 }
 
-/// Compute a SHA-256 hash of content, returned as `"sha256:{hex}"`.
 pub fn content_sha256(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -179,7 +148,6 @@ pub fn content_sha256(content: &str) -> String {
     format!("sha256:{:x}", result)
 }
 
-/// Check if a path refers to a `.config` document.
 pub fn is_config_path(path: &str) -> bool {
     let file_name = path.rsplit('/').next().unwrap_or(path);
     file_name == CONFIG_FILE_NAME
@@ -399,6 +367,15 @@ mod tests {
 
         doc.content = "Hello world, this is a test.".to_string();
         assert_eq!(doc.word_count(), 6);
+    }
+
+    #[test]
+    fn test_is_reserved_scope() {
+        assert!(is_reserved_scope("__admin__"));
+        assert!(!is_reserved_scope("alice"));
+        assert!(!is_reserved_scope(""));
+        assert!(!is_reserved_scope("admin"));
+        assert!(!is_reserved_scope("550e8400-e29b-41d4-a716-446655440000"));
     }
 
     #[test]
