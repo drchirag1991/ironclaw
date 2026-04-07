@@ -801,8 +801,8 @@ function connectSSE() {
   eventSource.addEventListener('image_generated', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    rememberGeneratedImage(data.thread_id, data.data_url, data.path);
-    addGeneratedImage(data.data_url, data.path);
+    rememberGeneratedImage(data.thread_id, data.event_id, data.data_url, data.path);
+    addGeneratedImage(data.data_url, data.path, data.event_id);
   });
 
   eventSource.addEventListener('error', (e) => {
@@ -1076,16 +1076,25 @@ chatMessagesEl.addEventListener('copy', (e) => {
   e.clipboardData.setData('text/plain', text);
 });
 
-function createGeneratedImageElement(dataUrl, path) {
+function createGeneratedImageElement(dataUrl, path, eventId) {
   const card = document.createElement('div');
   card.className = 'generated-image-card';
+  if (eventId) {
+    card.dataset.imageEventId = eventId;
+  }
 
-  const img = document.createElement('img');
-  img.className = 'generated-image';
-  img.src = dataUrl;
-  img.alt = 'Generated image';
-
-  card.appendChild(img);
+  if (dataUrl) {
+    const img = document.createElement('img');
+    img.className = 'generated-image';
+    img.src = dataUrl;
+    img.alt = 'Generated image';
+    card.appendChild(img);
+  } else {
+    const placeholder = document.createElement('div');
+    placeholder.className = 'generated-image-placeholder';
+    placeholder.textContent = 'Generated image unavailable in history payload';
+    card.appendChild(placeholder);
+  }
 
   if (path) {
     const pathLabel = document.createElement('div');
@@ -1097,30 +1106,27 @@ function createGeneratedImageElement(dataUrl, path) {
   return card;
 }
 
-function hasRenderedGeneratedImage(container, dataUrl, path) {
-  const normalizedPath = path || null;
+function hasRenderedGeneratedImage(container, eventId) {
+  if (!eventId) return false;
   return Array.from(container.querySelectorAll('.generated-image-card')).some((card) => {
-    const img = card.querySelector('.generated-image');
-    const pathLabel = card.querySelector('.generated-image-path');
-    const renderedPath = pathLabel ? pathLabel.textContent : null;
-    return img && img.src === dataUrl && renderedPath === normalizedPath;
+    return card.dataset.imageEventId === eventId;
   });
 }
 
-function addGeneratedImage(dataUrl, path, shouldScroll = true) {
+function addGeneratedImage(dataUrl, path, eventId, shouldScroll = true) {
   const container = document.getElementById('chat-messages');
-  if (hasRenderedGeneratedImage(container, dataUrl, path || null)) {
+  if (hasRenderedGeneratedImage(container, eventId)) {
     return;
   }
-  const card = createGeneratedImageElement(dataUrl, path);
+  const card = createGeneratedImageElement(dataUrl, path, eventId);
   container.appendChild(card);
   if (shouldScroll) {
     container.scrollTop = container.scrollHeight;
   }
 }
 
-function rememberGeneratedImage(threadId, dataUrl, path) {
-  if (!threadId || !dataUrl) return;
+function rememberGeneratedImage(threadId, eventId, dataUrl, path) {
+  if (!threadId || !eventId || !dataUrl) return;
   const normalizedPath = path || null;
   let images = generatedImagesByThread.get(threadId);
   if (!images) {
@@ -1137,13 +1143,32 @@ function rememberGeneratedImage(threadId, dataUrl, path) {
     generatedImagesByThread.delete(threadId);
     generatedImagesByThread.set(threadId, images);
   }
-  if (images.some(img => img.dataUrl === dataUrl && img.path === normalizedPath)) {
+  if (images.some(img => img.eventId === eventId)) {
     return;
   }
-  images.push({ dataUrl, path: normalizedPath });
+  images.push({ eventId, dataUrl, path: normalizedPath });
   while (images.length > GENERATED_IMAGES_PER_THREAD_CAP) {
     images.shift();
   }
+}
+
+function getRememberedGeneratedImage(threadId, eventId) {
+  if (!threadId || !eventId) return null;
+  const images = generatedImagesByThread.get(threadId);
+  if (!images) return null;
+  return images.find(img => img.eventId === eventId) || null;
+}
+
+function resolveGeneratedImageForRender(threadId, image) {
+  const normalizedPath = image.path || null;
+  if (image.data_url) {
+    return { dataUrl: image.data_url, path: normalizedPath };
+  }
+  const remembered = getRememberedGeneratedImage(threadId, image.event_id);
+  if (remembered) {
+    return { dataUrl: remembered.dataUrl, path: remembered.path };
+  }
+  return { dataUrl: null, path: normalizedPath };
 }
 
 // --- Slash Autocomplete ---
@@ -2203,8 +2228,19 @@ function loadHistory(before) {
         }
         if (turn.generated_images && turn.generated_images.length > 0) {
           for (const image of turn.generated_images) {
-            rememberGeneratedImage(currentThreadId, image.data_url, image.path);
-            addGeneratedImage(image.data_url, image.path, false);
+            const resolvedImage = resolveGeneratedImageForRender(currentThreadId, image);
+            rememberGeneratedImage(
+              currentThreadId,
+              image.event_id,
+              resolvedImage.dataUrl,
+              resolvedImage.path
+            );
+            addGeneratedImage(
+              resolvedImage.dataUrl,
+              resolvedImage.path,
+              image.event_id,
+              false
+            );
           }
         }
         if (turn.response) {
@@ -2254,8 +2290,20 @@ function loadHistory(before) {
         }
         if (turn.generated_images && turn.generated_images.length > 0) {
           for (const image of turn.generated_images) {
-            rememberGeneratedImage(currentThreadId, image.data_url, image.path);
-            fragment.appendChild(createGeneratedImageElement(image.data_url, image.path));
+            const resolvedImage = resolveGeneratedImageForRender(currentThreadId, image);
+            rememberGeneratedImage(
+              currentThreadId,
+              image.event_id,
+              resolvedImage.dataUrl,
+              resolvedImage.path
+            );
+            fragment.appendChild(
+              createGeneratedImageElement(
+                resolvedImage.dataUrl,
+                resolvedImage.path,
+                image.event_id
+              )
+            );
           }
         }
         if (turn.response) {

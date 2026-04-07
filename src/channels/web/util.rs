@@ -5,6 +5,9 @@ use crate::generated_images::GeneratedImageSentinel;
 
 pub use ironclaw_common::truncate_preview;
 
+const MAX_HISTORY_IMAGE_DATA_URL_BYTES_PER_IMAGE: usize = 512 * 1024;
+const MAX_HISTORY_IMAGE_DATA_URL_BYTES_PER_RESPONSE: usize = 1024 * 1024;
+
 /// Convert stored tool errors into plain text suitable for UI display.
 pub fn tool_error_for_display(error: &str) -> String {
     ironclaw_safety::SafetyLayer::unwrap_tool_output(error).unwrap_or_else(|| error.to_string())
@@ -25,8 +28,20 @@ fn parse_tool_call_infos(calls: &[serde_json::Value]) -> Vec<ToolCallInfo> {
         .collect()
 }
 
+fn generated_image_event_id(
+    turn_number: usize,
+    image_index: usize,
+    preferred_id: Option<&str>,
+) -> String {
+    preferred_id
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("turn-{turn_number}-image-{image_index}"))
+}
+
 fn parse_image_generated_sentinel_from_value(
     value: &serde_json::Value,
+    event_id: String,
 ) -> Option<GeneratedImageInfo> {
     let sentinel = GeneratedImageSentinel::from_value(value)?;
     let data_url = sentinel.data_url()?.to_string();
@@ -34,22 +49,32 @@ fn parse_image_generated_sentinel_from_value(
         return None;
     }
     let path = sentinel.path().map(String::from);
-    Some(GeneratedImageInfo { data_url, path })
+    Some(GeneratedImageInfo {
+        event_id,
+        data_url: Some(data_url),
+        path,
+    })
 }
 
 pub fn collect_generated_images_from_tool_results<'a>(
-    tool_results: impl IntoIterator<Item = Option<&'a serde_json::Value>>,
+    turn_number: usize,
+    tool_results: impl IntoIterator<Item = (Option<&'a str>, Option<&'a serde_json::Value>)>,
 ) -> Vec<GeneratedImageInfo> {
     tool_results
         .into_iter()
-        .flatten()
-        .filter_map(parse_image_generated_sentinel_from_value)
+        .enumerate()
+        .filter_map(|(image_index, (event_id, result))| {
+            parse_image_generated_sentinel_from_value(
+                result?,
+                generated_image_event_id(turn_number, image_index, event_id),
+            )
+        })
         .collect()
 }
 
 pub fn tool_result_preview(result: Option<&serde_json::Value>) -> Option<String> {
     let result = result?;
-    if parse_image_generated_sentinel_from_value(result).is_some() {
+    if GeneratedImageSentinel::from_value(result).is_some() {
         return Some("Generated image".to_string());
     }
     let s = match result {
@@ -98,7 +123,15 @@ pub fn build_turns_from_db_messages(
                         // Old format: plain array
                         turn.tool_calls = parse_tool_call_infos(&calls);
                         turn.generated_images = collect_generated_images_from_tool_results(
-                            calls.iter().map(|call| call.get("result")),
+                            turn_number,
+                            calls.iter().map(|call| {
+                                (
+                                    call.get("tool_call_id")
+                                        .or_else(|| call.get("call_id"))
+                                        .and_then(|v| v.as_str()),
+                                    call.get("result"),
+                                )
+                            }),
                         );
                     }
                     Ok(serde_json::Value::Object(obj)) => {
@@ -110,7 +143,15 @@ pub fn build_turns_from_db_messages(
                         if let Some(serde_json::Value::Array(calls)) = obj.get("calls") {
                             turn.tool_calls = parse_tool_call_infos(calls);
                             turn.generated_images = collect_generated_images_from_tool_results(
-                                calls.iter().map(|call| call.get("result")),
+                                turn_number,
+                                calls.iter().map(|call| {
+                                    (
+                                        call.get("tool_call_id")
+                                            .or_else(|| call.get("call_id"))
+                                            .and_then(|v| v.as_str()),
+                                        call.get("result"),
+                                    )
+                                }),
                             );
                         }
                     }
@@ -164,6 +205,25 @@ pub fn build_turns_from_db_messages(
     }
 
     turns
+}
+
+pub fn enforce_generated_image_history_budget(turns: &mut [TurnInfo]) {
+    let mut remaining_bytes = MAX_HISTORY_IMAGE_DATA_URL_BYTES_PER_RESPONSE;
+    for turn in turns.iter_mut().rev() {
+        for image in turn.generated_images.iter_mut().rev() {
+            let Some(data_url) = image.data_url.as_ref() else {
+                continue;
+            };
+            let data_url_bytes = data_url.len();
+            if data_url_bytes > MAX_HISTORY_IMAGE_DATA_URL_BYTES_PER_IMAGE
+                || data_url_bytes > remaining_bytes
+            {
+                image.data_url = None;
+                continue;
+            }
+            remaining_bytes -= data_url_bytes;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -358,10 +418,19 @@ mod tests {
         .to_string();
         let tool_results = [serde_json::Value::String(sentinel)];
 
-        let images = collect_generated_images_from_tool_results(tool_results.iter().map(Some));
+        let images = collect_generated_images_from_tool_results(
+            7,
+            tool_results
+                .iter()
+                .map(|result| (Some("call_img_1"), Some(result))),
+        );
 
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0].data_url, "data:image/jpeg;base64,abc123");
+        assert_eq!(images[0].event_id, "call_img_1");
+        assert_eq!(
+            images[0].data_url.as_deref(),
+            Some("data:image/jpeg;base64,abc123")
+        );
         assert_eq!(images[0].path.as_deref(), Some("/tmp/cat.jpg"));
     }
 
@@ -389,8 +458,8 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].generated_images.len(), 1);
         assert_eq!(
-            turns[0].generated_images[0].data_url,
-            "data:image/jpeg;base64,abc123"
+            turns[0].generated_images[0].data_url.as_deref(),
+            Some("data:image/jpeg;base64,abc123")
         );
     }
 
@@ -404,9 +473,124 @@ mod tests {
         .to_string();
         let double_wrapped = serde_json::Value::String(serde_json::to_string(&sentinel).unwrap());
 
-        let images = collect_generated_images_from_tool_results([Some(&double_wrapped)]);
+        let images = collect_generated_images_from_tool_results(
+            3,
+            [(Some("call_img_2"), Some(&double_wrapped))],
+        );
 
         assert_eq!(images.len(), 1);
-        assert_eq!(images[0].data_url, "data:image/jpeg;base64,abc123");
+        assert_eq!(
+            images[0].data_url.as_deref(),
+            Some("data:image/jpeg;base64,abc123")
+        );
+    }
+
+    #[test]
+    fn test_build_turns_assign_distinct_event_ids_for_identical_generated_images() {
+        let shared_sentinel = serde_json::json!({
+            "type": "image_generated",
+            "data": "data:image/png;base64,shared",
+            "media_type": "image/png"
+        })
+        .to_string();
+        let turn_one_calls = serde_json::json!({
+            "calls": [{
+                "name": "image_generate",
+                "tool_call_id": "call_turn_1",
+                "result_preview": "Generated image",
+                "result": shared_sentinel
+            }]
+        });
+        let turn_two_calls = serde_json::json!({
+            "calls": [{
+                "name": "image_generate",
+                "tool_call_id": "call_turn_2",
+                "result_preview": "Generated image",
+                "result": serde_json::json!({
+                    "type": "image_generated",
+                    "data": "data:image/png;base64,shared",
+                    "media_type": "image/png"
+                }).to_string()
+            }]
+        });
+        let messages = vec![
+            make_msg("user", "Draw one", 0),
+            make_msg("tool_calls", &turn_one_calls.to_string(), 500),
+            make_msg("assistant", "Done", 1000),
+            make_msg("user", "Draw it again", 2000),
+            make_msg("tool_calls", &turn_two_calls.to_string(), 2500),
+            make_msg("assistant", "Done again", 3000),
+        ];
+
+        let turns = build_turns_from_db_messages(&messages);
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].generated_images[0].event_id, "call_turn_1");
+        assert_eq!(turns[1].generated_images[0].event_id, "call_turn_2");
+        assert_ne!(
+            turns[0].generated_images[0].event_id,
+            turns[1].generated_images[0].event_id
+        );
+    }
+
+    #[test]
+    fn test_enforce_generated_image_history_budget_caps_total_bytes() {
+        let oversized_data_url = format!(
+            "data:image/png;base64,{}",
+            "a".repeat(MAX_HISTORY_IMAGE_DATA_URL_BYTES_PER_IMAGE - 4096)
+        );
+        let mut turns = vec![
+            TurnInfo {
+                turn_number: 0,
+                user_input: "older".to_string(),
+                response: Some("done".to_string()),
+                state: "Completed".to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                tool_calls: Vec::new(),
+                generated_images: vec![GeneratedImageInfo {
+                    event_id: "old".to_string(),
+                    data_url: Some(oversized_data_url.clone()),
+                    path: None,
+                }],
+                narrative: None,
+            },
+            TurnInfo {
+                turn_number: 1,
+                user_input: "newer".to_string(),
+                response: Some("done".to_string()),
+                state: "Completed".to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                tool_calls: Vec::new(),
+                generated_images: vec![
+                    GeneratedImageInfo {
+                        event_id: "new-1".to_string(),
+                        data_url: Some(oversized_data_url.clone()),
+                        path: None,
+                    },
+                    GeneratedImageInfo {
+                        event_id: "new-2".to_string(),
+                        data_url: Some(oversized_data_url.clone()),
+                        path: None,
+                    },
+                ],
+                narrative: None,
+            },
+        ];
+
+        enforce_generated_image_history_budget(&mut turns);
+
+        let total_bytes: usize = turns
+            .iter()
+            .flat_map(|turn| turn.generated_images.iter())
+            .filter_map(|image| image.data_url.as_ref())
+            .map(|data_url| data_url.len())
+            .sum();
+
+        assert!(total_bytes <= MAX_HISTORY_IMAGE_DATA_URL_BYTES_PER_RESPONSE);
+        assert!(turns[0].generated_images[0].data_url.is_none());
+        assert!(turns[1].generated_images[0].data_url.is_some());
+        assert!(turns[1].generated_images[1].data_url.is_some());
     }
 }

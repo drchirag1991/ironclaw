@@ -11,7 +11,7 @@ use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
 use crate::channels::web::util::{
     build_turns_from_db_messages, collect_generated_images_from_tool_results,
-    tool_error_for_display, tool_result_preview,
+    enforce_generated_image_history_budget, tool_error_for_display, tool_result_preview,
 };
 use axum::{
     Json,
@@ -159,7 +159,8 @@ pub async fn chat_history_handler(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let oldest_timestamp = messages.first().map(|m| m.created_at.to_rfc3339());
-        let turns = build_turns_from_db_messages(&messages);
+        let mut turns = build_turns_from_db_messages(&messages);
+        enforce_generated_image_history_budget(&mut turns);
         return Ok(Json(HistoryResponse {
             thread_id,
             turns,
@@ -176,7 +177,7 @@ pub async fn chat_history_handler(
         if let Some(thread) = sess.threads.get(&thread_id)
             && (!thread.turns.is_empty() || thread.pending_approval.is_some())
         {
-            let turns: Vec<TurnInfo> = thread
+            let mut turns: Vec<TurnInfo> = thread
                 .turns
                 .iter()
                 .map(|t| TurnInfo {
@@ -199,11 +200,15 @@ pub async fn chat_history_handler(
                         })
                         .collect(),
                     generated_images: collect_generated_images_from_tool_results(
-                        t.tool_calls.iter().map(|tc| tc.result.as_ref()),
+                        t.turn_number,
+                        t.tool_calls
+                            .iter()
+                            .map(|tc| (tc.tool_call_id.as_deref(), tc.result.as_ref())),
                     ),
                     narrative: t.narrative.clone(),
                 })
                 .collect();
+            enforce_generated_image_history_budget(&mut turns);
 
             let pending_gate = thread.pending_approval.as_ref().map(|pa| PendingGateInfo {
                 request_id: pa.request_id.to_string(),
@@ -234,7 +239,8 @@ pub async fn chat_history_handler(
 
         if !messages.is_empty() {
             let oldest_timestamp = messages.first().map(|m| m.created_at.to_rfc3339());
-            let turns = build_turns_from_db_messages(&messages);
+            let mut turns = build_turns_from_db_messages(&messages);
+            enforce_generated_image_history_budget(&mut turns);
             return Ok(Json(HistoryResponse {
                 thread_id,
                 turns,

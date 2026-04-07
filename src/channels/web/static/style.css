@@ -5270,6 +5270,14 @@ input[type="checkbox"]:focus-visible {
   object-fit: contain;
 }
 
+.generated-image-placeholder {
+  padding: 18px 16px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
 /* Language Switcher */
 .language-switcher {
   position: relative;

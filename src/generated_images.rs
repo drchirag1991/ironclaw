@@ -33,6 +33,16 @@ impl GeneratedImageSentinel {
     pub(crate) fn path(&self) -> Option<&str> {
         self.value.get("path").and_then(|v| v.as_str())
     }
+
+    pub(crate) fn summary_for_context(&self) -> String {
+        let media_type = self.media_type().unwrap_or("image");
+        if let Some(path) = self.path()
+            && !path.is_empty()
+        {
+            return format!("Generated image ({media_type}) at {path}");
+        }
+        format!("Generated image ({media_type})")
+    }
 }
 
 fn normalize_embedded_json(value: &serde_json::Value) -> Option<serde_json::Value> {
@@ -69,5 +79,21 @@ mod tests {
         let parsed = GeneratedImageSentinel::from_output(&wrapped).expect("sentinel");
         assert_eq!(parsed.data_url(), Some("data:image/jpeg;base64,abc123"));
         assert_eq!(parsed.media_type(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn summarizes_sentinel_for_context_without_data_url() {
+        let sentinel = GeneratedImageSentinel::from_value(&serde_json::json!({
+            "type": "image_generated",
+            "data": "data:image/png;base64,abc123",
+            "media_type": "image/png",
+            "path": "workspace/out.png",
+        }))
+        .expect("sentinel");
+
+        assert_eq!(
+            sentinel.summary_for_context(),
+            "Generated image (image/png) at workspace/out.png"
+        );
     }
 }

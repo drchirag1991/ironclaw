@@ -86,7 +86,9 @@ pub struct ToolCallInfo {
 
 #[derive(Debug, Serialize)]
 pub struct GeneratedImageInfo {
-    pub data_url: String,
+    pub event_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 }

@@ -1086,7 +1086,11 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                                     .channels
                                     .send_status(
                                         &self.message.channel,
-                                        StatusUpdate::ImageGenerated { data_url, path },
+                                        StatusUpdate::ImageGenerated {
+                                            event_id: tc.id.clone(),
+                                            data_url,
+                                            path,
+                                        },
                                         &self.message.metadata,
                                     )
                                     .await;

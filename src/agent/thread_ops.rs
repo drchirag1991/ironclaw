@@ -26,7 +26,7 @@ use crate::tools::redact_params;
 use ironclaw_common::truncate_preview;
 
 const FORGED_THREAD_ID_ERROR: &str = "Invalid or unauthorized thread ID.";
-const MAX_PERSISTED_IMAGE_SENTINEL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PERSISTED_IMAGE_SENTINEL_BYTES: usize = 512 * 1024;
 
 fn tool_result_preview_for_persistence(result: &serde_json::Value) -> String {
     if GeneratedImageSentinel::from_value(result).is_some() {
@@ -64,13 +64,7 @@ fn tool_result_content_for_rebuild(result: &str) -> String {
     else {
         return result.to_string();
     };
-    let media_type = sentinel.media_type().unwrap_or("image");
-    if let Some(path) = sentinel.path()
-        && !path.is_empty()
-    {
-        return format!("Generated image ({media_type}) at {path}");
-    }
-    format!("Generated image ({media_type})")
+    sentinel.summary_for_context()
 }
 
 fn requires_preexisting_uuid_thread(channel: &str) -> bool {
