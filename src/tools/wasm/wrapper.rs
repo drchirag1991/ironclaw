@@ -1547,15 +1547,21 @@ async fn resolve_host_credentials(
         // No cross-tenant fallback: each user must configure their own credentials.
         let secret = match store.get_decrypted(user_id, &mapping.secret_name).await {
             Ok(s) => s,
+            Err(crate::secrets::SecretError::NotFound(_)) => {
+                return Err(ToolError::NotAuthorized(format!(
+                    "credential '{}' not found for user '{}'; configure it via `ironclaw secrets set`",
+                    mapping.secret_name, user_id
+                )));
+            }
             Err(crate::secrets::SecretError::Expired) => {
                 return Err(ToolError::NotAuthorized(format!(
                     "credential '{}' for user '{}' has expired; refresh or re-set via `ironclaw secrets set`",
                     mapping.secret_name, user_id
                 )));
             }
-            Err(_) => {
-                return Err(ToolError::NotAuthorized(format!(
-                    "credential '{}' not found for user '{}'; configure it via `ironclaw secrets set`",
+            Err(e) => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "failed to resolve credential '{}' for user '{}': {e}",
                     mapping.secret_name, user_id
                 )));
             }
