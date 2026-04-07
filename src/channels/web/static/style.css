@@ -1533,7 +1533,7 @@ body {
 /* Tool calls summary (persisted between user/assistant messages) */
 .tool-calls-summary {
   background: var(--bg-secondary);
-  border-left: 3px solid var(--warning);
+  border-left: 3px solid var(--info);
   padding: 6px 12px;
   margin: 4px 0;
   font-size: 0.85em;

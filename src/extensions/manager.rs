@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 
 use crate::channels::wasm::{
     LoadedChannel, RegisteredEndpoint, SharedWasmChannel, TELEGRAM_CHANNEL_NAME, WasmChannelLoader,
-    WasmChannelRouter, WasmChannelRuntime, bot_username_setting_key,
+    WasmChannelRouter, WasmChannelRuntime, bot_username_setting_key, is_reserved_wasm_channel_name,
 };
 use crate::channels::{ChannelManager, OutgoingResponse};
 use crate::code_challenge::{CodeChallengeFlow, PendingCodeChallenge, VerificationChallenge};
@@ -1490,7 +1490,7 @@ impl ExtensionManager {
             match self.load_mcp_servers(user_id).await {
                 Ok(servers) => {
                     for server in &servers.servers {
-                        let authenticated = is_authenticated(server, &self.secrets, user_id).await;
+                        let authenticated = self.mcp_has_configured_auth(server, user_id).await;
                         let clients = self.mcp_clients.read().await;
                         let active = clients.contains_key(&server.name);
 
@@ -1510,7 +1510,8 @@ impl ExtensionManager {
                             .registry
                             .get_with_kind(&server.name, Some(ExtensionKind::McpServer))
                             .await
-                            .map(|e| e.display_name);
+                            .map(|e| e.display_name)
+                            .or_else(|| Some(server.name.clone()));
                         extensions.push(InstalledExtension {
                             name: server.name.clone(),
                             kind: ExtensionKind::McpServer,
@@ -2680,8 +2681,7 @@ impl ExtensionManager {
         // 100 MB cap on decompressed entry size to prevent decompression bombs
         const MAX_ENTRY_SIZE: u64 = 100 * 1024 * 1024;
 
-        let wasm_filename = format!("{}.wasm", name);
-        let caps_filename = format!("{}.capabilities.json", name);
+        let archive_names = crate::extensions::naming::ArchiveFilenames::new(name);
         let mut found_wasm = false;
 
         let entries = archive
@@ -2712,14 +2712,14 @@ impl ExtensionManager {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
 
-            if filename == wasm_filename {
+            if archive_names.is_wasm(filename) {
                 let mut data = Vec::with_capacity(entry.size() as usize);
                 std::io::Read::read_to_end(&mut entry.by_ref().take(MAX_ENTRY_SIZE), &mut data)
                     .map_err(|e| ExtensionError::InstallFailed(e.to_string()))?;
                 std::fs::write(target_wasm, &data)
                     .map_err(|e| ExtensionError::InstallFailed(e.to_string()))?;
                 found_wasm = true;
-            } else if filename == caps_filename {
+            } else if archive_names.is_caps(filename) {
                 let mut data = Vec::with_capacity(entry.size() as usize);
                 std::io::Read::read_to_end(&mut entry.by_ref().take(MAX_ENTRY_SIZE), &mut data)
                     .map_err(|e| ExtensionError::InstallFailed(e.to_string()))?;
@@ -2729,10 +2729,9 @@ impl ExtensionManager {
         }
 
         if !found_wasm {
-            return Err(ExtensionError::InstallFailed(format!(
-                "tar.gz archive does not contain '{}'",
-                wasm_filename
-            )));
+            return Err(ExtensionError::InstallFailed(
+                archive_names.wasm_not_found_msg(),
+            ));
         }
 
         Ok(())
@@ -2817,6 +2816,10 @@ impl ExtensionManager {
         })
     }
 
+    async fn mcp_has_configured_auth(&self, server: &McpServerConfig, user_id: &str) -> bool {
+        server.has_custom_auth_header() || is_authenticated(server, &self.secrets, user_id).await
+    }
+
     async fn auth_mcp(&self, name: &str, user_id: &str) -> Result<AuthResult, ExtensionError> {
         let server = self
             .get_mcp_server(name, user_id)
@@ -2824,7 +2827,7 @@ impl ExtensionManager {
             .map_err(|e| ExtensionError::NotInstalled(e.to_string()))?;
 
         // Check if already authenticated
-        if is_authenticated(&server, &self.secrets, user_id).await {
+        if self.mcp_has_configured_auth(&server, user_id).await {
             return Ok(AuthResult::authenticated(name, ExtensionKind::McpServer));
         }
 
@@ -2978,9 +2981,16 @@ impl ExtensionManager {
             let mut token_exchange_extra_params = HashMap::new();
             token_exchange_extra_params.insert("resource".to_string(), resource.clone());
 
+            let display_name = self
+                .registry
+                .get_with_kind(&server.name, Some(ExtensionKind::McpServer))
+                .await
+                .map(|e| e.display_name)
+                .unwrap_or_else(|| server.name.clone());
+
             let flow = oauth_defaults::PendingOAuthFlow {
                 extension_name: name.to_string(),
-                display_name: server.name.clone(),
+                display_name,
                 token_url: metadata.token_endpoint,
                 client_id,
                 client_secret,
@@ -4223,13 +4233,15 @@ impl ExtensionManager {
         // is badly formatted" instead of 401 when auth is missing or invalid.
         let mcp_tools = client.list_tools().await.map_err(|e| {
             let msg = e.to_string();
-            let msg_lower = msg.to_ascii_lowercase();
-            if msg_lower.contains("requires authentication")
-                || msg.contains("401")
-                || (msg.contains("400")
-                    && (msg_lower.contains("authorization") || msg_lower.contains("authenticate")))
-            {
-                ExtensionError::AuthRequired
+            if crate::tools::mcp::is_auth_error_message(&msg) {
+                if server.has_custom_auth_header() {
+                    ExtensionError::ActivationFailed(format!(
+                        "MCP server '{}' rejected its configured Authorization header. Update the configured credential and try again.",
+                        name
+                    ))
+                } else {
+                    ExtensionError::AuthRequired
+                }
             } else {
                 ExtensionError::ActivationFailed(msg)
             }
@@ -4479,6 +4491,13 @@ impl ExtensionManager {
         owner_id: Option<i64>,
     ) -> Result<ActivateResult, ExtensionError> {
         let channel_name = loaded.name().to_string();
+        if is_reserved_wasm_channel_name(&channel_name) {
+            return Err(ExtensionError::ActivationFailed(format!(
+                "Channel '{}' uses a reserved name and cannot be activated.",
+                channel_name
+            )));
+        }
+
         let owner_actor_id = owner_id.map(|id| id.to_string());
         let webhook_secret_name = loaded.webhook_secret_name();
         let secret_header = loaded.webhook_secret_header().map(|s| s.to_string());
@@ -7747,6 +7766,58 @@ mod tests {
         if manager.current_channel_owner_id("telegram").await != Some(12345_i64) {
             return Err("expected runtime fast-path owner id precedence".to_string());
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_activate_wasm_channel_rejects_reserved_runtime_name() -> Result<(), String> {
+        let manager = make_manager_with_temp_dirs();
+        let channel_manager = Arc::new(ChannelManager::new());
+        let runtime = Arc::new(
+            WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing())
+                .map_err(|err| format!("runtime: {err}"))?,
+        );
+        let pairing_store = Arc::new(PairingStore::new_noop());
+        let router = Arc::new(WasmChannelRouter::new());
+
+        manager
+            .set_channel_runtime(
+                Arc::clone(&channel_manager),
+                Arc::clone(&runtime),
+                Arc::clone(&pairing_store),
+                Arc::clone(&router),
+                std::collections::HashMap::new(),
+            )
+            .await;
+        manager
+            .set_test_wasm_channel_loader(Arc::new({
+                let runtime = Arc::clone(&runtime);
+                let pairing_store = Arc::clone(&pairing_store);
+                move |_name| {
+                    Ok(make_test_loaded_channel(
+                        Arc::clone(&runtime),
+                        "cli",
+                        Arc::clone(&pairing_store),
+                    ))
+                }
+            }))
+            .await;
+
+        let err = match manager.activate_wasm_channel("anything", "test").await {
+            Ok(_) => return Err("reserved channel activation should fail".to_string()),
+            Err(err) => err,
+        };
+
+        let msg = err.to_string();
+        require(
+            msg.contains("reserved name"),
+            format!("unexpected error message: {msg}"),
+        )?;
+        require(
+            channel_manager.get_channel("cli").await.is_none(),
+            "reserved channel should not be hot-added".to_string(),
+        )?;
 
         Ok(())
     }
