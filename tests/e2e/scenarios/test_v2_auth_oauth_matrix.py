@@ -30,7 +30,7 @@ import httpx
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from helpers import AUTH_TOKEN, SEL, api_get, api_post, wait_for_ready
+from helpers import AUTH_TOKEN, SEL, api_get, api_post, sse_stream, wait_for_ready
 
 
 ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -800,6 +800,52 @@ async def _wait_for_auth_prompt(
     )
 
 
+async def _wait_for_auth_event(
+    base_url: str,
+    thread_id: str,
+    *,
+    timeout: float = 45.0,
+) -> tuple[str, dict, str | None]:
+    async with sse_stream(base_url, timeout=timeout) as response:
+        await _send_chat(base_url, thread_id, "check gmail unread")
+        async with asyncio.timeout(timeout):
+            event_type = None
+            while True:
+                line = await response.content.readline()
+                if not line:
+                    raise AssertionError("SSE stream closed before auth event arrived")
+                decoded = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not decoded:
+                    continue
+                if decoded.startswith("event:"):
+                    event_type = decoded[6:].strip()
+                    continue
+                if not decoded.startswith("data:"):
+                    continue
+
+                try:
+                    payload = json.loads(decoded[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+
+                if payload.get("thread_id") not in (None, thread_id):
+                    continue
+
+                if event_type == "auth_required":
+                    return event_type, payload, payload.get("auth_url")
+
+                if event_type == "gate_required":
+                    resume = payload.get("resume_kind")
+                    if not isinstance(resume, dict):
+                        continue
+                    auth = resume.get("Authentication")
+                    if not isinstance(auth, dict):
+                        continue
+                    return event_type, payload, auth.get("auth_url")
+
+    raise AssertionError(f"Timed out waiting for auth event in thread {thread_id}")
+
+
 async def _wait_for_no_pending_gate(
     base_url: str,
     thread_id: str,
@@ -1220,6 +1266,28 @@ async def test_wasm_tool_oauth_roundtrip(auth_matrix_server):
     assert readiness["phase"] == "ready", readiness
     assert readiness["authenticated"] is True, readiness
     assert readiness["active"] is True, readiness
+
+
+async def test_wasm_tool_first_chat_auth_attempt_emits_auth_url(auth_matrix_server):
+    server = auth_matrix_server
+    await _install_extension(server["base_url"], "gmail")
+    thread_id = await _create_thread(server["base_url"])
+
+    event_type, payload, auth_url = await _wait_for_auth_event(
+        server["base_url"], thread_id, timeout=60
+    )
+
+    assert auth_url, payload
+    assert "accounts.google.com" in auth_url, auth_url
+    if event_type == "auth_required":
+        assert payload.get("extension_name") in {"gmail", "google_oauth_token"}, payload
+    else:
+        auth = payload["resume_kind"]["Authentication"]
+        assert auth.get("credential_name") in {"gmail", "google_oauth_token"}, payload
+
+    history = await _wait_for_auth_prompt(server["base_url"], thread_id, timeout=60)
+    all_text = " ".join(turn.get("response") or "" for turn in history.get("turns", []))
+    assert "authentication required" in all_text.lower(), history
 
 
 async def test_mcp_oauth_roundtrip_via_browser(browser, auth_matrix_server):
