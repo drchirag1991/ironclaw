@@ -2681,8 +2681,9 @@ impl ExtensionManager {
         // 100 MB cap on decompressed entry size to prevent decompression bombs
         const MAX_ENTRY_SIZE: u64 = 100 * 1024 * 1024;
 
-        // Archives may use either underscored (canonical) or hyphenated (legacy)
-        // filenames, so accept both forms.
+        // Canonical extension names always use underscores (enforced by
+        // canonicalize_extension_name). Archives from older releases may use
+        // hyphens, so we accept both forms.
         let alt_name = name.replace('_', "-");
         let wasm_filename = format!("{name}.wasm");
         let alt_wasm_filename = format!("{alt_name}.wasm");
@@ -2736,7 +2737,7 @@ impl ExtensionManager {
 
         if !found_wasm {
             let expected = if wasm_filename == alt_wasm_filename {
-                wasm_filename.clone()
+                format!("'{wasm_filename}'")
             } else {
                 format!("'{wasm_filename}' or '{alt_wasm_filename}'")
             };

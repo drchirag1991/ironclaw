@@ -8,7 +8,7 @@ async def test_page_loads_and_connects(page):
     """After auth, the app shows Connected status and all tabs."""
     # Connection status — verify SSE has connected via the JS flag set in onopen.
     await page.wait_for_function(
-        "() => typeof sseHasConnectedBefore !== 'undefined' && sseHasConnectedBefore",
+        "() => window.sseHasConnectedBefore === true",
         timeout=10000,
     )
 
