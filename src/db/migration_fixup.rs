@@ -65,12 +65,19 @@ struct KnownDivergence {
     name: &'static str,
     /// The current (canonical) SQL content, embedded at compile time.
     sql: &'static str,
+    /// Human-readable explanation of why this divergence exists, surfaced
+    /// in the realignment warning log so future entries are not coupled to
+    /// the V6/#1328 wording.
+    explanation: &'static str,
 }
 
 const KNOWN_DIVERGENCES: &[KnownDivergence] = &[KnownDivergence {
     version: 6,
     name: "routines",
     sql: include_str!("../../migrations/V6__routines.sql"),
+    explanation: "Migration content matches the v0.18.0 release; the schema \
+                  change introduced in PR #1151 is applied incrementally by \
+                  V13__owner_scope_notify_targets.",
 }];
 
 /// Realign `refinery_schema_history` rows whose stored checksum disagrees
@@ -80,9 +87,13 @@ pub async fn realign_diverged_checksums(client: &mut PgClient) -> Result<(), Dat
     // On a fresh install the history table does not yet exist. Refinery
     // will create it during the first `run_async()` call. There is nothing
     // to realign in that case.
+    // Use an unqualified identifier so PostgreSQL resolves the table via
+    // the active `search_path` — matching how refinery itself locates the
+    // history table. Hard-coding `public.` would silently skip the fix-up
+    // on deployments using a non-default schema.
     let history_exists: bool = client
         .query_one(
-            "SELECT to_regclass('public.refinery_schema_history') IS NOT NULL",
+            "SELECT to_regclass('refinery_schema_history') IS NOT NULL",
             &[],
         )
         .await
@@ -106,11 +117,15 @@ pub async fn realign_diverged_checksums(client: &mut PgClient) -> Result<(), Dat
         })?;
         let canonical_checksum = migration.checksum().to_string();
 
+        // `IS DISTINCT FROM` (rather than `<>`) is NULL-safe: refinery's
+        // `checksum` column is `NOT NULL` in practice, but using the
+        // NULL-aware operator means a corrupted row with a NULL checksum
+        // is also picked up for repair instead of being silently skipped.
         let updated = client
             .execute(
                 "UPDATE refinery_schema_history \
                  SET checksum = $1 \
-                 WHERE version = $2 AND name = $3 AND checksum <> $1",
+                 WHERE version = $2 AND name = $3 AND checksum IS DISTINCT FROM $1",
                 &[&canonical_checksum, &divergence.version, &divergence.name],
             )
             .await
@@ -122,10 +137,8 @@ pub async fn realign_diverged_checksums(client: &mut PgClient) -> Result<(), Dat
             tracing::warn!(
                 migration = %migration_label,
                 rows = updated,
-                "Realigned refinery_schema_history checksum (issue #1328 fix-up). \
-                 Migration content matches the v0.18.0 release; the schema \
-                 change introduced in PR #1151 is applied incrementally by \
-                 V13__owner_scope_notify_targets."
+                "Realigned refinery_schema_history checksum: {}",
+                divergence.explanation
             );
         }
     }
