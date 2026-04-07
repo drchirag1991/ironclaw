@@ -4,7 +4,9 @@ use std::sync::Once;
 use secrecy::SecretString;
 
 use crate::bootstrap::ironclaw_base_dir;
-use crate::config::helpers::{optional_env, parse_optional_env, validate_base_url};
+use crate::config::helpers::{
+    db_first_bool, db_first_or_default, optional_env, parse_optional_env, validate_base_url,
+};
 use crate::error::ConfigError;
 use crate::llm::config::*;
 use crate::llm::registry::{ProviderProtocol, ProviderRegistry};
@@ -132,6 +134,35 @@ impl LlmConfig {
             );
         }
 
+        // Always resolve NEAR AI config (used for embeddings even when not the primary backend)
+        // Priority: DB (builtin_overrides) > env > default
+        let nearai_override = settings.llm_builtin_overrides.get("nearai");
+        let nearai_override_has_base_url =
+            nearai_override.and_then(|o| o.base_url.as_ref()).is_some();
+
+        // Check whether NearAI embeddings are enabled.  When they are, the
+        // NearAI base_url and auth_url are reachable code-paths and must pass
+        // SSRF validation even when the primary chat backend is not NearAI.
+        let emb_defaults = crate::settings::EmbeddingsSettings::default();
+        let emb_provider = db_first_or_default(
+            &settings.embeddings.provider,
+            &emb_defaults.provider,
+            "EMBEDDING_PROVIDER",
+        )?;
+        let emb_enabled = db_first_bool(
+            settings.embeddings.enabled,
+            emb_defaults.enabled,
+            "EMBEDDING_ENABLED",
+        )?;
+        let nearai_embeddings_active = emb_enabled && emb_provider.eq_ignore_ascii_case("nearai");
+
+        // Predicate: NearAI URLs must be validated when:
+        //   - NearAI is the primary chat backend, OR
+        //   - the user/DB explicitly supplied the URL, OR
+        //   - NearAI embeddings are enabled (they use the same base/auth URLs), OR
+        //   - the DB builtin_overrides for NearAI include a base_url.
+        let nearai_api_key_env = optional_env("NEARAI_API_KEY")?;
+
         // Session config (used by NearAI provider for OAuth/session-token auth)
         let nearai_auth_url_explicit = optional_env("NEARAI_AUTH_URL")?;
         let nearai_auth_url = nearai_auth_url_explicit
@@ -141,7 +172,11 @@ impl LlmConfig {
         // set the URL.  Default URLs point to private.near.ai which requires DNS
         // resolution — this blocks startup in environments without network access
         // (CI runners, containers) when a different backend is configured.
-        if is_nearai || nearai_auth_url_explicit.is_some() {
+        if is_nearai
+            || nearai_auth_url_explicit.is_some()
+            || nearai_override_has_base_url
+            || nearai_embeddings_active
+        {
             validate_base_url(&nearai_auth_url, "NEARAI_AUTH_URL")?;
         }
         let session = SessionConfig {
@@ -151,13 +186,10 @@ impl LlmConfig {
                 .unwrap_or_else(default_session_path),
         };
 
-        // Always resolve NEAR AI config (used for embeddings even when not the primary backend)
-        // Priority: DB (builtin_overrides) > env > default
-        let nearai_override = settings.llm_builtin_overrides.get("nearai");
         let nearai_api_key = if let Some(key) = nearai_override.and_then(|o| o.api_key.as_ref()) {
             Some(SecretString::from(key.clone()))
         } else {
-            optional_env("NEARAI_API_KEY")?.map(SecretString::from)
+            nearai_api_key_env.map(SecretString::from)
         };
         // Model priority: selected_model (DB) > builtin_overrides (DB) > env > default
         let nearai_model = if let Some(model) = Self::selected_model_override(settings) {
@@ -179,7 +211,12 @@ impl LlmConfig {
         } else {
             "https://private.near.ai".to_string()
         };
-        if is_nearai || nearai_base_url_explicit.is_some() || nearai_api_key.is_some() {
+        if is_nearai
+            || nearai_base_url_explicit.is_some()
+            || nearai_api_key.is_some()
+            || nearai_override_has_base_url
+            || nearai_embeddings_active
+        {
             validate_base_url(&nearai_base_url, "NEARAI_BASE_URL")?;
         }
         let nearai = NearAiConfig {
