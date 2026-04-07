@@ -1253,7 +1253,7 @@ async fn i18n_ko_handler() -> impl IntoResponse {
             (header::CONTENT_TYPE, "application/javascript"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        include_str!("static/i18n/ko.js"),
+        assets::I18N_KO_JS,
     )
 }
 

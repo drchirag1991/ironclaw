@@ -33,5 +33,8 @@ pub const I18N_EN_JS: &str = include_str!("../static/i18n/en.js");
 /// Chinese (Simplified) translations.
 pub const I18N_ZH_CN_JS: &str = include_str!("../static/i18n/zh-CN.js");
 
+/// Korean translations.
+pub const I18N_KO_JS: &str = include_str!("../static/i18n/ko.js");
+
 /// i18n integration with the app.
 pub const I18N_APP_JS: &str = include_str!("../static/i18n-app.js");
