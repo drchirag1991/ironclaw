@@ -321,7 +321,9 @@ impl Agent {
         message: &IncomingMessage,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
-        self.channels.respond(message, response).await?;
+        let respond_result = self.channels.respond(message, response).await;
+        // Always emit Done regardless of whether respond succeeded, so the
+        // client knows the turn is over even when the response delivery fails.
         if let Err(e) = self
             .channels
             .send_status(
@@ -337,7 +339,29 @@ impl Agent {
                 "Failed to send Done status after response"
             );
         }
-        Ok(())
+        respond_result
+    }
+
+    /// Emit the terminal "Done" status without sending a response first.
+    ///
+    /// Used by code paths that suppress the response (hook-blocked, empty
+    /// response) but still need to close the turn for the client.
+    async fn send_done(&self, message: &IncomingMessage) {
+        if let Err(e) = self
+            .channels
+            .send_status(
+                &message.channel,
+                StatusUpdate::Status("Done".into()),
+                &message.metadata,
+            )
+            .await
+        {
+            tracing::warn!(
+                channel = %message.channel,
+                error = %e,
+                "Failed to send Done status"
+            );
+        }
     }
 
     pub(crate) fn llm(&self) -> &Arc<dyn LlmProvider> {
@@ -981,21 +1005,7 @@ impl Agent {
                             tracing::warn!("BeforeOutbound hook blocked response: {}", err);
                             // Still send Done so the client knows the turn is complete
                             // even though the response was suppressed by the hook.
-                            if let Err(e) = self
-                                .channels
-                                .send_status(
-                                    &message.channel,
-                                    StatusUpdate::Status("Done".into()),
-                                    &message.metadata,
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    channel = %message.channel,
-                                    error = %e,
-                                    "Failed to send Done status after hook-blocked response"
-                                );
-                            }
+                            self.send_done(&message).await;
                         }
                         Ok(crate::hooks::HookOutcome::Continue {
                             modified: Some(new_content),
@@ -1034,21 +1044,7 @@ impl Agent {
                         empty_len = empty.len(),
                         "Suppressed empty response (not sent to channel)"
                     );
-                    if let Err(e) = self
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::Status("Done".into()),
-                            &message.metadata,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            channel = %message.channel,
-                            error = %e,
-                            "Failed to send Done status after empty response"
-                        );
-                    }
+                    self.send_done(&message).await;
                 }
                 Ok(None) => {
                     // Shutdown signal received (/quit, /exit, /shutdown)

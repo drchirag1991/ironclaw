@@ -166,6 +166,11 @@ impl TestRig {
         self.channel.tool_timings()
     }
 
+    /// Wait until a `Status("Done")` event has been captured, or `timeout` elapses.
+    pub async fn wait_for_done(&self, timeout: Duration) -> bool {
+        self.channel.wait_for_done(timeout).await
+    }
+
     /// Return a snapshot of all captured status events.
     pub fn captured_status_events(&self) -> Vec<StatusUpdate> {
         self.channel.captured_status_events()

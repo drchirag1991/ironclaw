@@ -66,4 +66,59 @@ mod response_order_tests {
 
         rig.shutdown();
     }
+
+    /// When the LLM returns an empty string, the agent suppresses the response
+    /// but must still emit a `Done` status so the client knows the turn ended.
+    #[tokio::test]
+    async fn done_emitted_for_empty_response() {
+        let empty_response_trace = LlmTrace::new(
+            "trace-empty-response",
+            vec![TraceTurn {
+                user_input: "Do nothing".to_string(),
+                steps: vec![TraceStep {
+                    request_hint: None,
+                    response: TraceResponse::Text {
+                        content: String::new(),
+                        input_tokens: 1,
+                        output_tokens: 0,
+                    },
+                    expected_tool_results: Vec::new(),
+                }],
+                expects: Default::default(),
+            }],
+        );
+
+        let rig = TestRigBuilder::new()
+            .with_trace(empty_response_trace)
+            .build()
+            .await;
+        rig.clear().await;
+
+        rig.send_message("Do nothing").await;
+
+        // No response will arrive, but Done must still be emitted.
+        assert!(
+            rig.wait_for_done(TIMEOUT).await,
+            "Done status must be emitted even when the response is empty"
+        );
+
+        // Verify no response event was emitted (the empty string is suppressed).
+        let events = rig.captured_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, CapturedEvent::Response(_))),
+            "empty response should not produce a Response event"
+        );
+
+        // Verify Done IS present in events.
+        assert!(
+            events.iter().any(
+                |e| matches!(e, CapturedEvent::Status(StatusUpdate::Status(msg)) if msg == "Done")
+            ),
+            "Done status must appear in captured events"
+        );
+
+        rig.shutdown();
+    }
 }

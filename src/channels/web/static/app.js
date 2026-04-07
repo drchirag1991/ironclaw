@@ -111,6 +111,10 @@ let _lastSseEventId = null;
 // Safety net for lost SSE response events (see #2079): tracks whether we
 // received a `response` event for the current turn so that a "Done" status
 // arriving without one can trigger a history reload.
+const DONE_WITHOUT_RESPONSE_TIMEOUT_MS = 1500;
+// Single-thread tracking is intentional: background thread events are already
+// filtered out by `isCurrentThread`, so only the active thread's turn state
+// matters here. Per-thread state is unnecessary.
 let _turnResponseReceived = false;
 let _doneWithoutResponseTimer = null;
 
@@ -798,7 +802,7 @@ function connectSSE(lastEventIdOverride) {
           _doneWithoutResponseTimer = setTimeout(() => {
             _doneWithoutResponseTimer = null;
             if (currentThreadId) loadHistory();
-          }, 1500);
+          }, DONE_WITHOUT_RESPONSE_TIMEOUT_MS);
         }
       }
       _turnResponseReceived = false;
