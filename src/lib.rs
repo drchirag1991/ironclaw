@@ -60,6 +60,7 @@ pub mod hooks;
 #[cfg(feature = "import")]
 pub mod import;
 pub mod llm;
+pub mod media_processing;
 pub mod observability;
 pub mod orchestrator;
 pub mod ownership;

@@ -193,6 +193,10 @@ LLM_MODEL=anthropic/claude-sonnet-4
 
 See [docs/LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) for a full provider guide.
 
+### Deploying to Railway
+
+See [DEPLOY_RAILWAY.md](DEPLOY_RAILWAY.md) for step-by-step Railway deployment instructions.
+
 ## Security
 
 IronClaw implements defense in depth to protect your data and prevent misuse.

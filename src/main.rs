@@ -478,7 +478,9 @@ async fn async_main() -> anyhow::Result<()> {
                 result.wasm_channel_router,
             ));
             for (name, channel) in result.channels {
-                channel_names.push(name);
+                channel_names.push(name.clone());
+                // For WASM/extension channels, we don't have a simple main.rs rebuilder,
+                // but ExtensionManager handles their lifecycle.
                 channels.add(channel).await;
             }
             if let Some(routes) = result.webhook_routes {
@@ -491,13 +493,21 @@ async fn async_main() -> anyhow::Result<()> {
     if !cli.cli_only
         && let Some(ref signal_config) = config.channels.signal
     {
-        let signal_channel = SignalChannel::new(
-            signal_config.clone(),
-            components.db.clone(),
-            Arc::clone(&components.ownership_cache),
-        )?;
+        let db = components.db.clone();
+        let ownership_cache = Arc::clone(&components.ownership_cache);
+        let sc_config = signal_config.clone();
+        let rebuilder = Arc::new(move || {
+            let sc = sc_config.clone();
+            let d = db.clone();
+            let oc = ownership_cache.clone();
+            Box::pin(async move {
+                let sc_inner = crate::channels::signal::SignalChannel::new(sc, d, oc)?;
+                Ok(Box::new(sc_inner) as Box<dyn crate::channels::Channel>)
+            })
+        });
+
         channel_names.push("signal".to_string());
-        channels.add(Box::new(signal_channel)).await;
+        channels.add_with_rebuilder(Box::new(signal_channel), rebuilder).await;
         let safe_url = SignalChannel::redact_url(&signal_config.http_url);
         tracing::debug!(
             url = %safe_url,
@@ -529,8 +539,17 @@ async fn async_main() -> anyhow::Result<()> {
                 .parse()
                 .expect("HttpConfig host:port must be a valid SocketAddr"),
         );
+        let hc_config = http_config.clone();
+        let rebuilder = Arc::new(move || {
+            let hc = hc_config.clone();
+            Box::pin(async move {
+                let hc_inner = crate::channels::http::HttpChannel::new(hc);
+                Ok(Box::new(hc_inner) as Box<dyn crate::channels::Channel>)
+            })
+        });
+
         channel_names.push("http".to_string());
-        channels.add(Box::new(http_channel)).await;
+        channels.add_with_rebuilder(Box::new(http_channel), rebuilder).await;
         tracing::debug!(
             "HTTP channel enabled on {}:{}",
             http_config.host,
@@ -800,8 +819,42 @@ async fn async_main() -> anyhow::Result<()> {
         // IMPORTANT: This must come after all `with_*` calls since `rebuild_state`
         // creates a new SseManager, which would orphan this sender.
         sse_manager = Some(Arc::clone(&gw.state().sse));
+        let gw_config_inner = gw_config.clone();
+        let owner_id_inner = config.owner_id.clone();
+        let llm_inner = Arc::clone(&components.llm);
+        let store_inner = components.store.clone();
+        let db_inner = components.db.clone();
+        let ext_mgr_inner = components.extension_manager.as_ref().map(Arc::clone);
+        let auth_inner = components.auth.clone();
+        let ownership_cache_inner = Arc::clone(&components.ownership_cache);
+
+        let rebuilder = Arc::new(move || {
+            let gwc = gw_config_inner.clone();
+            let owner = owner_id_inner.clone();
+            let l = llm_inner.clone();
+            let s = store_inner.clone();
+            let d = db_inner.clone();
+            let em = ext_mgr_inner.as_ref().map(Arc::clone);
+            let a = auth_inner.clone();
+            let oc = ownership_cache_inner.clone();
+
+            Box::pin(async move {
+                let mut g = crate::channels::web::GatewayChannel::new(gwc, owner);
+                g = g
+                    .with_llm_provider(l)
+                    .with_settings_store(s)
+                    .with_db(d)
+                    .with_auth_provider(a)
+                    .with_ownership_cache(oc);
+                if let Some(mgr) = em {
+                    g = g.with_extension_manager(mgr);
+                }
+                Ok(Box::new(g) as Box<dyn crate::channels::Channel>)
+            })
+        });
+
         channel_names.push("gateway".to_string());
-        channels.add(Box::new(gw)).await;
+        channels.add_with_rebuilder(Box::new(gw), rebuilder).await;
     }
 
     // ── Boot screen ────────────────────────────────────────────────────
@@ -947,6 +1000,12 @@ async fn async_main() -> anyhow::Result<()> {
     // Clone context_manager for the reaper before it's moved into Agent::new()
     let reaper_context_manager = Arc::clone(&components.context_manager);
 
+    // Create swappable LLM providers for hot-reload support.
+    let swappable_llm = Arc::new(ironclaw::llm::swappable::SwappableLlmProvider::new(components.llm));
+    let swappable_cheap_llm = components.cheap_llm.map(|l| {
+        Arc::new(ironclaw::llm::swappable::SwappableLlmProvider::new(l))
+    });
+
     // Capture db reference for SIGHUP handler before it's moved into AgentDeps (Unix only)
     #[cfg(unix)]
     let sighup_settings_store: Option<Arc<dyn ironclaw::db::SettingsStore>> = components
@@ -957,8 +1016,8 @@ async fn async_main() -> anyhow::Result<()> {
     let deps = AgentDeps {
         owner_id: config.owner_id.clone(),
         store: components.db,
-        llm: components.llm,
-        cheap_llm: components.cheap_llm,
+        llm: Arc::clone(&swappable_llm),
+        cheap_llm: swappable_cheap_llm.clone(),
         safety: components.safety,
         tools: components.tools,
         workspace: components.workspace,
@@ -977,6 +1036,9 @@ async fn async_main() -> anyhow::Result<()> {
         }),
         document_extraction: Some(Arc::new(
             ironclaw::document_extraction::DocumentExtractionMiddleware::new(),
+        )),
+        media_processing: Some(Arc::new(
+            ironclaw::media_processing::MediaProcessingMiddleware::new(),
         )),
         sandbox_readiness: if !config.sandbox.enabled {
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig
@@ -1040,6 +1102,9 @@ async fn async_main() -> anyhow::Result<()> {
             secret_updaters.push(Arc::clone(state) as Arc<dyn ChannelSecretUpdater>);
         }
 
+        let sighup_swappable_llm = Arc::clone(&swappable_llm);
+        let sighup_swappable_cheap_llm = swappable_cheap_llm.clone();
+        let sighup_session_mgr = Arc::clone(&components.session_manager);
         let sighup_webhook_server = webhook_server.clone();
         let sighup_settings_store_clone = sighup_settings_store.clone();
         let sighup_secrets_store = components.secrets_store.clone();
@@ -1194,6 +1259,20 @@ async fn async_main() -> anyhow::Result<()> {
                     // Update all channels that support secret swapping
                     for updater in &secret_updaters {
                         updater.update_secret(new_secret.clone()).await;
+                    }
+                }
+
+                // Update LLM providers
+                match ironclaw::llm::build_provider_chain(&new_config.llm, sighup_session_mgr.clone()).await {
+                    Ok((new_llm, new_cheap, _)) => {
+                        sighup_swappable_llm.swap(new_llm).await;
+                        if let (Some(swappable_cheap), Some(new_cheap_inner)) = (sighup_swappable_cheap_llm.as_ref(), new_cheap) {
+                            swappable_cheap.swap(new_cheap_inner).await;
+                        }
+                        tracing::info!("SIGHUP: LLM provider chain reloaded");
+                    }
+                    Err(e) => {
+                        tracing::error!("SIGHUP: LLM reload failed: {}", e);
                     }
                 }
             }

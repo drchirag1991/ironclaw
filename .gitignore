@@ -3,6 +3,8 @@
 .env.local
 .env.*
 !.env.example
+!.env.railway
+!.env.railway.example
 
 # Claude Code worktrees and lock files
 .claude/worktrees/

@@ -1,0 +1,25 @@
+Starting Container
+
+  Γ£ù Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+
+Error: Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+
+  Γ£ù Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+
+Error: Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+
+  Γ£ù Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+
+Error: Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+
+  Γ£ù Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+
+Error: Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+
+
+Error: Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+  Γ£ù Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+
+  Γ£ù Invalid configuration value for GATEWAY_PORT: invalid digit found in string
+
+Error: Invalid configuration value for GATEWAY_PORT: invalid digit found in string

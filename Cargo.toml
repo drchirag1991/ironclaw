@@ -172,6 +172,7 @@ tar = "0.4"
 # Document text extraction
 pdf-extract = "0.7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+image = "0.25"
 
 # HTTP proxy for sandboxed network access
 hyper = { version = "1.5", features = ["server", "http1", "http2"] }

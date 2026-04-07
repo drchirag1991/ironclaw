@@ -1,0 +1,27 @@
+Starting Container
+[2m2026-04-07T10:06:44.343674Z[0m [32m INFO[0m Loaded embedded registry catalog (23 extensions, 3 bundles)
+[2m2026-04-07T10:06:44.593952Z[0m [32m INFO[0m Seeded 9 workspace files
+[2m2026-04-07T10:06:44.603887Z[0m [33m WARN[0m Docker is not installed -- sandbox disabled for this session. Install Docker Engine: https://docs.docker.com/engine/install/
+[2m2026-04-07T10:06:44.604609Z[0m [33m WARN[0m Webhook server is binding to 0.0.0.0 ΓÇö it will be reachable from all network interfaces. Set HTTP_HOST=127.0.0.1 to restrict to localhost.
+[2m2026-04-07T10:06:44.614942Z[0m [32m INFO[0m Bootstrapped admin user from gateway config [3muser_id[0m[2m=[0m"default"
+
+  ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+  ironclaw v0.24.0
+[2m2026-04-07T10:06:44.285540Z[0m [32m INFO[0m libSQL: applied 4 incremental migrations
+[2m2026-04-07T10:06:44.290586Z[0m [32m INFO[0m Resolving LLM backend [3mbackend[0m[2m=[0mopenrouter [3msource[0m[2m=[0menv:LLM_BACKEND [3mdb_llm_backend[0m[2m=[0mNone [3mcustom_providers_count[0m[2m=[0m0
+[2m2026-04-07T10:06:44.310655Z[0m [32m INFO[0m Resolving LLM backend [3mbackend[0m[2m=[0mopenrouter [3msource[0m[2m=[0menv:LLM_BACKEND [3mdb_llm_backend[0m[2m=[0mNone [3mcustom_providers_count[0m[2m=[0m0
+[2m2026-04-07T10:06:44.311425Z[0m [32m INFO[0m Creating LLM provider [3mbackend[0m[2m=[0mopenrouter
+
+  model       qwen/qwen3.6-plus:free  via openrouter
+  gateway     http://0.0.0.0:3000/?token=ironclaw-secure-token-2026
+  features    db:libsql  tools:32  routines  skills  sandbox:unavail
+
+  ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  ready in 535ms
+  Run `ironclaw status` for full system details.
+
+ΓùÅ notification
+Warning: Sandbox is enabled but Docker is not installed -- full_job routines 
+will fail until Docker is available.
+

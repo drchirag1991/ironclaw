@@ -34,6 +34,7 @@ pub mod retry;
 mod rig_adapter;
 pub mod session;
 pub mod smart_routing;
+pub mod swappable;
 mod token_refreshing;
 pub mod transcription;
 

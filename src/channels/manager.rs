@@ -3,11 +3,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::stream;
+use futures::{stream, Future};
 use tokio::sync::{RwLock, mpsc};
 
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 use crate::error::ChannelError;
+use std::pin::Pin;
+use chrono::{DateTime, Utc};
+use std::time::Duration;
+
+/// Rebuilder for a channel to support automatic restarts.
+pub type ChannelRebuilder = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<Box<dyn Channel>, ChannelError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Manages multiple input channels and merges their message streams.
 ///
@@ -15,6 +25,7 @@ use crate::error::ChannelError;
 /// push messages into the agent loop without being a full `Channel` impl.
 pub struct ChannelManager {
     channels: Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>,
+    rebuilders: Arc<RwLock<HashMap<String, ChannelRebuilder>>>,
     inject_tx: mpsc::Sender<IncomingMessage>,
     /// Taken once in `start_all()` and merged into the stream.
     inject_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingMessage>>>,
@@ -26,6 +37,7 @@ impl ChannelManager {
         let (inject_tx, inject_rx) = mpsc::channel(64);
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
+            rebuilders: Arc::new(RwLock::new(HashMap::new())),
             inject_tx,
             inject_rx: tokio::sync::Mutex::new(Some(inject_rx)),
         }
@@ -47,6 +59,13 @@ impl ChannelManager {
             .await
             .insert(name.clone(), Arc::from(channel));
         tracing::debug!("Added channel: {}", name);
+    }
+
+    /// Add a channel with a rebuilder for automatic health-based restart.
+    pub async fn add_with_rebuilder(&self, channel: Box<dyn Channel>, rebuilder: ChannelRebuilder) {
+        let name = channel.name().to_string();
+        self.rebuilders.write().await.insert(name.clone(), rebuilder);
+        self.add(channel).await;
     }
 
     /// Hot-add a channel to a running agent.
@@ -242,7 +261,63 @@ impl ChannelManager {
 
     /// Remove a channel from the manager.
     pub async fn remove(&self, name: &str) -> Option<Arc<dyn Channel>> {
+        self.rebuilders.write().await.remove(name);
         self.channels.write().await.remove(name)
+    }
+
+    /// Spawn a background health monitor task.
+    ///
+    /// Checks all registered channels periodically and attempts to restart
+    /// those with rebuilders if they are unhealthy.
+    pub fn spawn_health_monitor(self: Arc<Self>, interval: Duration) {
+        let manager = Arc::clone(&self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                if let Err(e) = manager.check_health_and_restart().await {
+                    tracing::error!("Channel health monitor error: {}", e);
+                }
+            }
+        });
+    }
+
+    /// Manually trigger a health check and restart unhealthy channels.
+    pub async fn check_health_and_restart(&self) -> Result<(), ChannelError> {
+        let names = self.channel_names().await;
+        for name in names {
+            let (is_healthy, has_rebuilder) = {
+                let channels = self.channels.read().await;
+                let rebuilders = self.rebuilders.read().await;
+                let channel = channels.get(&name);
+                let is_healthy = if let Some(ch) = channel {
+                    ch.health_check().await.is_ok()
+                } else {
+                    false
+                };
+                (is_healthy, rebuilders.contains_key(&name))
+            };
+
+            if !is_healthy && has_rebuilder {
+                tracing::warn!(channel = %name, "Channel unhealthy, attempting automatic restart");
+                let rebuilder = self.rebuilders.read().await.get(&name).cloned();
+                if let Some(rebuilder) = rebuilder {
+                    match rebuilder().await {
+                        Ok(new_channel) => {
+                            if let Err(e) = self.hot_add(new_channel).await {
+                                tracing::error!(channel = %name, error = %e, "Failed to hot-add restarted channel");
+                            } else {
+                                tracing::info!(channel = %name, "Successfully restarted channel");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(channel = %name, error = %e, "Failed to rebuild channel during restart");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

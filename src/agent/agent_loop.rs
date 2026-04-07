@@ -148,10 +148,10 @@ pub struct AgentDeps {
     /// Resolved durable owner scope for the instance.
     pub owner_id: String,
     pub store: Option<Arc<dyn Database>>,
-    pub llm: Arc<dyn LlmProvider>,
+    pub llm: Arc<crate::llm::swappable::SwappableLlmProvider>,
     /// Cheap/fast LLM for lightweight tasks (heartbeat, routing, evaluation).
     /// Falls back to the main `llm` if None.
-    pub cheap_llm: Option<Arc<dyn LlmProvider>>,
+    pub cheap_llm: Option<Arc<crate::llm::swappable::SwappableLlmProvider>>,
     pub safety: Arc<SafetyLayer>,
     pub tools: Arc<ToolRegistry>,
     pub workspace: Option<Arc<Workspace>>,
@@ -170,6 +170,9 @@ pub struct AgentDeps {
     pub transcription: Option<Arc<crate::llm::transcription::TranscriptionMiddleware>>,
     /// Document text extraction middleware for PDF, DOCX, PPTX, etc.
     pub document_extraction: Option<Arc<crate::document_extraction::DocumentExtractionMiddleware>>,
+    /// Media processing middleware for image resizing/conversion.
+    pub media_processing: Option<Arc<crate::media_processing::MediaProcessingMiddleware>>,
+
     /// Sandbox readiness state for full-job routine dispatch.
     pub sandbox_readiness: crate::agent::routine_engine::SandboxReadiness,
     /// Software builder for self-repair tool rebuilding.
@@ -904,7 +907,8 @@ impl Agent {
         // The greeting was already persisted to DB before start_all(), so
         // clients that connect after this point will see it via history.
         // Main message loop
-        tracing::debug!("Agent {} ready and listening", self.config.name);
+        // Start the channel health monitor (checks every 60 seconds).
+        self.channels.clone().spawn_health_monitor(tokio::time::Duration::from_secs(60));
 
         loop {
             let message = tokio::select! {
@@ -933,6 +937,11 @@ impl Agent {
             // Apply document extraction middleware to document attachments
             if let Some(ref doc_extraction) = self.deps.document_extraction {
                 doc_extraction.process(&mut message).await;
+            }
+            
+            // Apply media processing middleware to image attachments
+            if let Some(ref media_processing) = self.deps.media_processing {
+                media_processing.process(&mut message).await;
             }
 
             // Store successfully extracted document text in workspace for indexing
