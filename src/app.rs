@@ -351,7 +351,6 @@ impl AppBuilder {
                 );
             }
             ws = ws.with_memory_layers(self.config.workspace.memory_layers.clone());
-            let ws = Arc::new(ws);
 
             // Detect multi-tenant mode: when the database has registered users,
             // each authenticated user needs their own workspace scope. Use
@@ -359,6 +358,14 @@ impl AppBuilder {
             // per-user workspaces on demand instead of sharing the startup
             // workspace across all users.
             let is_multi_tenant = db.has_any_users().await.unwrap_or(false);
+
+            // In multi-tenant mode, enable admin system prompt on the owner
+            // workspace so the dispatcher reads SYSTEM.md from __admin__ scope.
+            if is_multi_tenant {
+                ws = ws.with_admin_prompt();
+            }
+
+            let ws = Arc::new(ws);
 
             if is_multi_tenant {
                 let pool = Arc::new(crate::channels::web::server::WorkspacePool::new(
