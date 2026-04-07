@@ -46,6 +46,14 @@ pub mod paths {
 /// prefix prevents collision with real user IDs.
 pub const ADMIN_SCOPE: &str = "__admin__";
 
+/// Check if a scope identifier is reserved for system use.
+///
+/// Reserved scopes must never be assigned as a user ID.
+/// Currently only `__admin__` is reserved (used for the admin system prompt).
+pub fn is_reserved_scope(scope: &str) -> bool {
+    scope == ADMIN_SCOPE
+}
+
 /// Paths treated as identity documents for multi-scope isolation.
 ///
 /// These files are always read from the primary scope only — never from
@@ -260,6 +268,16 @@ mod tests {
 
         doc.content = "Hello world, this is a test.".to_string();
         assert_eq!(doc.word_count(), 6);
+    }
+
+    #[test]
+    fn test_is_reserved_scope() {
+        assert!(is_reserved_scope("__admin__"));
+        assert!(!is_reserved_scope("alice"));
+        assert!(!is_reserved_scope(""));
+        assert!(!is_reserved_scope("admin"));
+        // UUIDs should never collide with reserved scopes
+        assert!(!is_reserved_scope("550e8400-e29b-41d4-a716-446655440000"));
     }
 
     #[test]

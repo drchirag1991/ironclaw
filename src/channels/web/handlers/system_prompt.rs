@@ -12,6 +12,12 @@ use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::{SystemPromptRequest, SystemPromptResponse};
 use crate::workspace::{ADMIN_SCOPE, Workspace, paths};
 
+/// Maximum size for the admin system prompt (64 KB).
+///
+/// The admin prompt is injected into every user's system prompt on every
+/// message, so a large value directly impacts token budgets and latency.
+const MAX_SYSTEM_PROMPT_SIZE: usize = 64 * 1024;
+
 /// `GET /api/admin/system-prompt` — read the admin system prompt.
 pub async fn get_handler(
     State(state): State<Arc<GatewayState>>,
@@ -58,6 +64,17 @@ pub async fn put_handler(
         return Err((
             StatusCode::NOT_FOUND,
             "System prompt management requires multi-tenant mode".to_string(),
+        ));
+    }
+
+    if req.content.len() > MAX_SYSTEM_PROMPT_SIZE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "System prompt exceeds maximum size ({} bytes, limit {})",
+                req.content.len(),
+                MAX_SYSTEM_PROMPT_SIZE
+            ),
         ));
     }
 

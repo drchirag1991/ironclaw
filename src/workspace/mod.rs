@@ -54,7 +54,7 @@ mod search;
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{
     ADMIN_SCOPE, IDENTITY_PATHS, MemoryChunk, MemoryDocument, WorkspaceEntry, is_identity_path,
-    merge_workspace_entries, paths,
+    is_reserved_scope, merge_workspace_entries, paths,
 };
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 pub use embeddings::{
