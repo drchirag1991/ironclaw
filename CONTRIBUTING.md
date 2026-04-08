@@ -81,6 +81,7 @@ Before asking for review:
 - Fill out the PR template with a clear summary, validation notes, and impact assessment
 - If your change affects tracked behavior, update `FEATURE_PARITY.md` in the same branch
 - If onboarding or setup behavior changes, update the relevant setup docs in the same branch
+- If you are working from a fork or using agents/skills, follow the local Git workflow in `LOCAL_GIT_GUIDE.md`
 - If you are using a coding agent and it supports them, run `review-pr` or `pr-shepherd --fix` before opening or updating the PR
 - `codex review --base origin/main` is also encouraged before requesting review
 
